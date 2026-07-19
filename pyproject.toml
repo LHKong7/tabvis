@@ -1,0 +1,57 @@
+[project]
+name = "tabvis"
+description = "Tabvis — headless coding agent CLI with Playwright browser automation."
+readme = "README.md"
+requires-python = ">=3.10"
+dynamic = ["version"]
+dependencies = [
+    "anthropic>=0.40",
+    "httpx>=0.27",
+    "httpcore>=1.0",
+    "markdown-it-py>=3.0",
+    "mcp>=1.0",
+    "pathspec>=0.12",
+    "playwright>=1.48",
+    "pydantic>=2.5",
+    "python-dotenv>=1.0",
+    "pyyaml>=6.0",
+    "sse-starlette>=2.1",
+    "starlette>=0.37",
+    "uvicorn>=0.30",
+    "wcwidth>=0.2",
+]
+
+[project.optional-dependencies]
+# The stealth browser engine (TABVIS_BROWSER_ENGINE=cloak): `uv sync --extra cloak`.
+# Optional because it pulls its own patched Chromium (~140MB, downloaded on first launch) that most
+# runs never need — tabvis drives stock Playwright Chromium without it.
+cloak = ["cloakbrowser>=0.4.10"]
+# The Firefox-kernel stealth engine (TABVIS_BROWSER_ENGINE=camoufox): `uv sync --extra camoufox`.
+# Same rationale as cloak — it downloads its own patched Firefox on first launch.
+camoufox = ["camoufox>=0.4"]
+# Non-Anthropic model providers (TABVIS_MODEL_PROVIDER=openai|gemini). Optional because the default
+# provider is Anthropic and most runs never need these SDKs. The provider raises a clear install
+# hint if its package is missing rather than silently downgrading.
+openai = ["openai>=1.40"]
+gemini = ["google-genai>=0.3"]
+
+[project.scripts]
+tabvis = "tabvis.bootstrap_entry:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.version]
+path = "tabvis/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["tabvis"]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
