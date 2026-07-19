@@ -1,0 +1,1030 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>tabvis · agent console</title>
+<style>
+  :root {
+    --bg:#0e1116; --panel:#161b22; --panel2:#1c2230; --line:#2a313c;
+    --fg:#e6edf3; --dim:#8b949e; --dim2:#6e7681;
+    --accent:#58a6ff; --ok:#3fb950; --warn:#d29922; --err:#f85149; --cancel:#a371f7;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  }
+  @media (prefers-color-scheme: light) {
+    :root { --bg:#f6f8fa; --panel:#fff; --panel2:#f0f3f6; --line:#d0d7de;
+            --fg:#1f2328; --dim:#59636e; --dim2:#818b98; --accent:#0969da; }
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:14px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif; }
+  header { display:flex; align-items:center; gap:12px; padding:12px 18px; border-bottom:1px solid var(--line); background:var(--panel); position:sticky; top:0; z-index:5; }
+  header h1 { margin:0; font-size:15px; font-weight:650; letter-spacing:-.01em; }
+  header .sub { color:var(--dim); font-size:12px; }
+  .spacer { flex:1; }
+  .pill { font:11px/1 var(--mono); padding:5px 9px; border-radius:999px; border:1px solid var(--line); background:var(--panel2); color:var(--dim); white-space:nowrap; }
+  .pill b { color:var(--fg); font-weight:600; }
+
+  main { display:grid; grid-template-columns: 380px 1fr; gap:16px; padding:16px; align-items:start; max-width:1500px; margin:0 auto; }
+  @media (max-width: 940px) { main { grid-template-columns:1fr; } }
+
+  .card { background:var(--panel); border:1px solid var(--line); border-radius:10px; overflow:hidden; }
+  .card > h2 { margin:0; padding:10px 14px; font-size:12px; font-weight:600; text-transform:uppercase;
+               letter-spacing:.06em; color:var(--dim); border-bottom:1px solid var(--line); background:var(--panel2); }
+  .card .body { padding:14px; }
+  .stack { display:flex; flex-direction:column; gap:16px; }
+
+  label { display:block; font-size:11px; text-transform:uppercase; letter-spacing:.05em; color:var(--dim); margin:0 0 5px; }
+  textarea, input, select {
+    width:100%; padding:8px 10px; border-radius:7px; border:1px solid var(--line);
+    background:var(--bg); color:var(--fg); font:13px/1.45 inherit; outline:none;
+  }
+  textarea { font-family:inherit; resize:vertical; min-height:76px; }
+  textarea:focus, input:focus, select:focus { border-color:var(--accent); }
+  .row { display:flex; gap:10px; }
+  .row > div { flex:1; min-width:0; }
+  button {
+    border:1px solid var(--line); background:var(--panel2); color:var(--fg);
+    padding:8px 13px; border-radius:7px; font:13px/1 inherit; font-weight:550; cursor:pointer;
+  }
+  button:hover:not(:disabled) { border-color:var(--accent); color:var(--accent); }
+  button:disabled { opacity:.45; cursor:not-allowed; }
+  button.primary { background:var(--accent); border-color:var(--accent); color:#fff; }
+  button.primary:hover:not(:disabled) { filter:brightness(1.12); color:#fff; }
+  button.danger:hover:not(:disabled) { border-color:var(--err); color:var(--err); }
+
+  .err { margin-top:10px; padding:8px 10px; border-radius:7px; font-size:12.5px;
+         background:color-mix(in srgb, var(--err) 12%, transparent); border:1px solid var(--err); color:var(--err); }
+
+  /* agent list */
+  .agents { max-height:46vh; overflow:auto; }
+  .agent { display:block; width:100%; text-align:left; padding:10px 14px; border:0; border-bottom:1px solid var(--line);
+           background:transparent; border-radius:0; cursor:pointer; }
+  .agent:hover { background:var(--panel2); }
+  .agent[aria-selected="true"] { background:color-mix(in srgb, var(--accent) 12%, transparent); box-shadow:inset 2px 0 0 var(--accent); }
+  .agent .top { display:flex; align-items:center; gap:8px; }
+  .agent .id { font:11px var(--mono); color:var(--dim); }
+  .agent .p { margin:4px 0 0; font-size:12.5px; color:var(--fg); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .agent .meta { margin-top:3px; font:10.5px var(--mono); color:var(--dim2); }
+  .empty { padding:22px 14px; text-align:center; color:var(--dim2); font-size:12.5px; }
+
+  .status { font:10px/1 var(--mono); text-transform:uppercase; letter-spacing:.05em; padding:3px 6px; border-radius:4px;
+            border:1px solid currentColor; white-space:nowrap; }
+  .s-running{color:var(--accent)} .s-completed{color:var(--ok)} .s-failed{color:var(--err)}
+  .s-cancelled{color:var(--cancel)} .s-queued{color:var(--warn)}
+
+  /* detail */
+  dl { display:grid; grid-template-columns:auto 1fr; gap:5px 14px; margin:0; font-size:12.5px; }
+  dt { color:var(--dim); }
+  dd { margin:0; font-family:var(--mono); font-size:11.5px; overflow-wrap:anywhere; }
+
+  /* stream */
+  .stream { height:44vh; overflow:auto; padding:10px 12px; font:11.5px/1.55 var(--mono); background:var(--bg); }
+  .ev { display:flex; gap:8px; padding:2.5px 0; border-bottom:1px solid color-mix(in srgb, var(--line) 45%, transparent); }
+  .ev .k { flex:0 0 82px; color:var(--dim2); }
+  .ev .v { flex:1; min-width:0; white-space:pre-wrap; overflow-wrap:anywhere; color:var(--fg); }
+  .e-tool_use .k, .e-tool_use .v { color:var(--warn); }
+  .e-tool_result .k { color:var(--ok); } .e-tool_result .v { color:var(--dim); }
+  .e-assistant .v { color:var(--fg); }
+  .e-result .k, .e-result .v { color:var(--ok); }
+  .e-error .k, .e-error .v, .e-cancelled .k, .e-cancelled .v { color:var(--err); }
+  .e-agent .k, .e-agent .v, .e-system .k, .e-system .v { color:var(--dim2); }
+
+  .hist { max-height:170px; overflow:auto; font:11.5px var(--mono); }
+  .hist a { display:block; padding:4px 0; color:var(--accent); text-decoration:none; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .hist a:hover { text-decoration:underline; }
+
+  /* setup / banner */
+  .banner { display:flex; gap:11px; align-items:flex-start; padding:11px 13px; border-radius:9px; margin-bottom:16px;
+            background:color-mix(in srgb, var(--err) 10%, transparent); border:1px solid var(--err); }
+  .banner .ico { font-size:15px; line-height:1.25; }
+  .banner b { color:var(--err); }
+  .banner p { margin:3px 0 0; font-size:12.5px; color:var(--fg); }
+  .banner code { font:11.5px var(--mono); background:var(--panel2); padding:1px 5px; border-radius:4px; }
+  .full { grid-column:1 / -1; }
+
+  .steps { counter-reset:step; }
+  .step { position:relative; padding:0 0 15px 27px; }
+  .step:last-child { padding-bottom:0; }
+  .step::before { counter-increment:step; content:counter(step); position:absolute; left:0; top:1px;
+                  width:18px; height:18px; border-radius:50%; background:var(--panel2); border:1px solid var(--line);
+                  color:var(--dim); font:10px/17px var(--mono); text-align:center; }
+  .step h3 { margin:0 0 5px; font-size:12.5px; font-weight:600; }
+  .step p { margin:0 0 7px; font-size:12.5px; color:var(--dim); }
+  .code { position:relative; background:var(--bg); border:1px solid var(--line); border-radius:7px;
+          padding:8px 40px 8px 10px; font:11.5px/1.6 var(--mono); white-space:pre; overflow-x:auto; color:var(--fg); }
+  .code + .code { margin-top:6px; }
+  .code button { position:absolute; top:5px; right:5px; padding:3px 7px; font-size:10px; border-radius:5px; }
+  .facts { display:grid; grid-template-columns:auto 1fr; gap:4px 14px; font-size:12px; margin-top:4px; }
+  .facts dt { color:var(--dim); } .facts dd { margin:0; font:11.5px var(--mono); overflow-wrap:anywhere; }
+  .ok  { color:var(--ok); } .bad { color:var(--err); }
+
+  /* settings */
+  .grp { border-top:1px solid var(--line); padding-top:12px; margin-top:12px; }
+  .grp:first-child { border-top:0; padding-top:0; margin-top:0; }
+  .grp h3 { margin:0 0 10px; font-size:11px; text-transform:uppercase; letter-spacing:.06em; color:var(--dim); }
+  .fld { margin-bottom:11px; }
+  .fld .lbl { display:flex; align-items:center; gap:7px; margin-bottom:4px; }
+  .fld .lbl label { margin:0; text-transform:none; letter-spacing:0; font-size:12.5px; color:var(--fg); font-weight:550; }
+  .fld .key { font:10px var(--mono); color:var(--dim2); }
+  .fld .hlp { margin:4px 0 0; font-size:11.5px; color:var(--dim2); }
+  .isset { font:10px var(--mono); color:var(--ok); border:1px solid var(--ok); border-radius:4px; padding:1px 5px; }
+  .sw { display:flex; align-items:center; gap:8px; }
+  .sw input { width:auto; }
+  .saved { color:var(--ok); font-size:12px; }
+  .ro { padding:9px 11px; border-radius:7px; background:var(--panel2); border:1px solid var(--line);
+        color:var(--dim); font-size:12.5px; margin-bottom:12px; }
+
+  /* utilities — React's `style` prop needs an object, so inline style strings are out */
+  .mt12 { margin-top:12px; }
+  .actions { margin-top:14px; display:flex; gap:8px; align-items:center; }
+  .hint { font-size:11.5px; color:var(--dim2); }
+  .detail-head { display:flex; align-items:center; gap:10px; margin-bottom:12px; }
+  .errtext { color:var(--err); }
+  .muted { color:var(--dim2); font-size:12.5px; }
+
+  /* browser driver */
+  .seg { display:flex; border:1px solid var(--line); border-radius:9px; overflow:hidden; }
+  .seg button { flex:1; border:0; border-right:1px solid var(--line); border-radius:0; background:var(--panel2);
+                text-align:left; padding:12px 14px; cursor:pointer; }
+  .seg button:last-child { border-right:0; }
+  .seg button:hover:not(:disabled) { color:var(--fg); background:color-mix(in srgb, var(--accent) 7%, var(--panel2)); }
+  .seg button.active { background:color-mix(in srgb, var(--accent) 14%, transparent); box-shadow:inset 0 -2px 0 var(--accent); }
+  .seg button.active.stealth { background:color-mix(in srgb, var(--cancel) 14%, transparent); box-shadow:inset 0 -2px 0 var(--cancel); }
+  .seg .t { display:flex; align-items:center; gap:7px; font-size:13px; font-weight:600; color:var(--fg); }
+  .seg .d { margin-top:3px; font-size:11px; color:var(--dim2); line-height:1.4; }
+  .seg button.active .t { color:var(--accent); }
+  .seg button.active.stealth .t { color:var(--cancel); }
+
+  .badge { font:9.5px/1 var(--mono); text-transform:uppercase; letter-spacing:.05em; padding:3px 6px;
+           border-radius:4px; border:1px solid currentColor; white-space:nowrap; }
+  .b-cloak { color:var(--cancel); } .b-chromium { color:var(--accent); }
+
+  .wslist { display:flex; flex-direction:column; gap:8px; }
+  .ws { display:flex; align-items:center; gap:10px; padding:10px 12px; border:1px solid var(--line);
+        border-radius:8px; background:var(--panel2); }
+  .ws .wsmain { flex:1; min-width:0; }
+  .ws .wstop { display:flex; align-items:center; gap:8px; }
+  .ws .wsname { font-size:12.5px; font-weight:600; color:var(--fg); }
+  .ws .wsmeta { margin-top:3px; font:10.5px var(--mono); color:var(--dim2); overflow-wrap:anywhere; }
+  .ws .drv { font:10px var(--mono); color:var(--warn); border:1px solid var(--warn); border-radius:4px; padding:1px 5px; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<!-- React 18 + htm, vendored locally: no CDN at runtime, no build step, works offline. -->
+<script src="/ui/react.min.js"></script>
+<script src="/ui/react-dom.min.js"></script>
+<script src="/ui/htm.umd.js"></script>
+
+<script>
+const { useState, useEffect, useRef, useCallback, Fragment } = React;
+const html = htm.bind(React.createElement);   // tagged templates instead of JSX -> no transpile
+
+/* ---------- api ---------- */
+const api = {
+  health:  () => fetch('/health').then(r => r.json()),
+  list:    () => fetch('/agents').then(r => r.json()),
+  get:     id => fetch(`/agents/${id}`).then(r => r.ok ? r.json() : null),
+  browser: id => fetch(`/agents/${id}/browser`).then(r => r.ok ? r.json() : null),
+  cancel:  id => fetch(`/agents/${id}/cancel`, { method:'POST' }).then(async r => ({ ok:r.ok, body:await r.json() })),
+  quit:    id => fetch(`/agents/${id}/quit`, { method:'POST' }).then(async r => ({ ok:r.ok, body:await r.json() })),
+  config:  () => fetch('/config').then(r => r.json()),
+  saveConfig: values => fetch('/config', {
+    method:'POST', headers:{ 'content-type':'application/json' }, body:JSON.stringify({ values }),
+  }).then(async r => ({ ok:r.ok, body:await r.json() })),
+  browsers: () => fetch('/browsers').then(r => r.json()),
+  closeBrowser: body => fetch('/browsers/close', {
+    method:'POST', headers:{ 'content-type':'application/json' }, body:JSON.stringify(body),
+  }).then(async r => ({ ok:r.ok, body:await r.json() })),
+};
+
+/* POST /agent streams SSE. EventSource is GET-only, so read the body stream and parse frames. */
+async function runAgent(body, onFrame, signal) {
+  const res = await fetch('/agent', {
+    method: 'POST', signal,
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) {
+    const e = await res.json().catch(() => ({}));
+    const err = new Error(e.error || `HTTP ${res.status}`);
+    err.status = res.status; err.held_by = e.held_by;
+    throw err;
+  }
+  onFrame({ event: '_id', data: { agent_id: res.headers.get('X-Agent-Id') } });
+
+  const reader = res.body.getReader();
+  const dec = new TextDecoder();
+  let buf = '';
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buf += dec.decode(value, { stream: true });
+    // sse-starlette terminates lines with CRLF, so frames are separated by \r\n\r\n.
+    // Splitting on '\n\n' alone matches nothing and you silently get an empty stream.
+    const parts = buf.split(/\r?\n\r?\n/);
+    buf = parts.pop();                      // keep the incomplete tail
+    for (const part of parts) {
+      let ev = 'message', data = '';
+      for (const raw of part.split(/\r?\n/)) {
+        const line = raw.trimEnd();
+        if (line.startsWith('event:')) ev = line.slice(6).trim();
+        else if (line.startsWith('data:')) data += line.slice(5).trim();
+        // lines starting with ':' are keep-alive pings — ignore
+      }
+      if (!data) continue;
+      try { onFrame({ event: ev, data: JSON.parse(data) }); } catch { /* skip bad frame */ }
+    }
+  }
+}
+
+/* ---------- helpers ---------- */
+const ms = n => n == null ? '—' : n < 1000 ? `${n}ms` : `${(n/1000).toFixed(1)}s`;
+const clock = t => t ? new Date(t).toLocaleTimeString() : '—';
+
+function summarize(ev, d) {
+  switch (ev) {
+    case '_id':        return `agent ${d.agent_id}`;
+    case 'agent':      return `${d.agent_id} · ${d.model ?? 'default model'}`;
+    case 'system':     return `session ${String(d.session_id ?? '').slice(0,8)}… · ${(d.tools||[]).length} tools`;
+    case 'assistant':  return (d.message?.content || [])
+                          .filter(b => b.type === 'text' && b.text?.trim())
+                          .map(b => b.text).join('\n') || null;   // null => hide empty turns
+    case 'tool_use':   return `${d.name}(${JSON.stringify(d.input ?? {}).slice(0,110)})`;
+    case 'tool_result':return (d.is_error ? '✗ ' : '') + String(d.content ?? '').split('\n').slice(0,4).join('  ');
+    case 'result':     return { text: `${d.is_error ? '✗ ' : '✓ '}${d.result ?? ''}`,
+                                cls: d.is_error ? 'error' : 'result' };
+    case 'error':      return d.message;
+    case 'cancelled':  return 'cancelled';
+    case 'done':       return `stream closed (${d.status ?? 'done'})`;
+    case 'user':       return null;   // duplicate of tool_result — hide
+    case 'delta':      return null;
+    default:           return JSON.stringify(d).slice(0, 140);
+  }
+}
+
+/* ---------- components ---------- */
+function Code({ children }) {
+  const [copied, setCopied] = useState(false);
+  const copy = async () => {
+    // navigator.clipboard needs a secure context AND a permission grant — it rejects silently on
+    // plain http (e.g. --host 0.0.0.0) and in some embedded views. Fall back to execCommand.
+    const done = () => { setCopied(true); setTimeout(() => setCopied(false), 1200); };
+    try {
+      await navigator.clipboard.writeText(children);
+      return done();
+    } catch { /* fall through */ }
+    const ta = document.createElement('textarea');
+    ta.value = children;
+    ta.setAttribute('readonly', '');
+    ta.style.position = 'fixed';
+    ta.style.opacity = '0';
+    document.body.appendChild(ta);
+    ta.select();
+    try { document.execCommand('copy'); done(); } catch { /* give up quietly */ }
+    document.body.removeChild(ta);
+  };
+  return html`
+    <div className="code">${children}<button onClick=${copy}>${copied ? 'copied' : 'copy'}</button></div>`;
+}
+
+/* Tells you the server can't reach a model BEFORE you hit Run, instead of every run dying with an
+   opaque API error. `missing` comes from GET /health -> config. */
+function Banner({ config, onConfigure }) {
+  if (!config || config.ready) return null;
+  return html`
+    <div className="banner full">
+      <span className="ico">⚠</span>
+      <div>
+        <b>This server can't reach a model yet.</b>
+        <p>
+          Missing ${config.missing.map((m, i) => html`${i ? ', ' : ''}<code key=${m}>${m}</code>`)} —
+          every run will fail until they're set. Set them here and they apply immediately, no restart.
+        </p>
+        <div className="actions">
+          <button className="primary" onClick=${onConfigure}>Configure now</button>
+        </div>
+      </div>
+    </div>`;
+}
+
+function Settings({ open, onSaved }) {
+  const [spec, setSpec]   = useState(null);
+  const [vals, setVals]   = useState({});
+  const [base, setBase]   = useState({});   // values as loaded — anything equal to these is UNCHANGED
+  const [err, setErr]     = useState(null);
+  const [saved, setSaved] = useState(false);
+  const [saving, setSav]  = useState(false);
+
+  // Load the spec whenever the panel opens, so it reflects the server's real current values.
+  useEffect(() => {
+    if (!open) return;
+    fetch('/config').then(r => r.json()).then(d => {
+      setSpec(d);
+      const v = {};
+      // Secrets are write-only: start blank. Blank on save == "leave unchanged".
+      for (const s of d.settings) v[s.key] = s.kind === 'secret' ? '' : (s.value ?? '');
+      setVals(v);
+      setBase(v);
+    }).catch(() => setErr('could not load settings'));
+  }, [open]);
+
+  if (!open) return null;
+  if (!spec) return html`<div className="card full"><h2>Settings</h2><div className="empty">Loading…</div></div>`;
+
+  const set = (k, v) => { setVals(o => ({ ...o, [k]: v })); setSaved(false); };
+
+  const save = async e => {
+    e.preventDefault();
+    setSav(true); setErr(null);
+    try {
+      // Send ONLY what actually changed. Submitting every field would silently pin settings the
+      // user never touched — e.g. saving an API key would write out the *displayed* default for
+      // Headless, turning "unset, follow the default" into "explicitly set" and freezing it.
+      const changed = {};
+      for (const k of Object.keys(vals)) {
+        if (vals[k] !== base[k]) changed[k] = vals[k];
+      }
+      if (Object.keys(changed).length === 0) {
+        setSaved(true); setSav(false); return;
+      }
+      const res = await fetch('/config', {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ values: changed }),
+      });
+      const body = await res.json();
+      if (!res.ok) throw new Error(body.error || `HTTP ${res.status}`);
+      setSaved(true);
+      // re-read so a just-saved secret flips to "set", and clear the typed value
+      const fresh = await fetch('/config').then(r => r.json());
+      setSpec(fresh);
+      const v = {};
+      for (const s of fresh.settings) v[s.key] = s.kind === 'secret' ? '' : (s.value ?? '');
+      setVals(v);
+      setBase(v);
+      onSaved?.();
+    } catch (e2) { setErr(e2.message); }
+    setSav(false);
+  };
+
+  const groups = [...new Set(spec.settings.map(s => s.group))];
+  return html`
+    <form className="card full" onSubmit=${save}>
+      <h2>Settings</h2>
+      <div className="body">
+        ${!spec.writable && html`
+          <div className="ro">
+            Read-only — config changes are accepted from <b>localhost only</b>, because this server has
+            no authentication. Set <code>TABVIS_SERVER_ALLOW_REMOTE_CONFIG=1</code> to override.
+          </div>`}
+
+        ${groups.map(g => html`
+          <div className="grp" key=${g}>
+            <h3>${g}</h3>
+            ${spec.settings.filter(s => s.group === g).map(s => html`
+              <div className="fld" key=${s.key}>
+                <div className="lbl">
+                  <label htmlFor=${s.key}>${s.label}</label>
+                  <span className="key">${s.key}</span>
+                  ${s.kind === 'secret' && s.set && html`<span className="isset">set ${s.hint}</span>`}
+                </div>
+                ${s.kind === 'bool'
+                  ? html`<div className="sw">
+                      <input id=${s.key} type="checkbox" disabled=${!spec.writable}
+                             checked=${['1','true','on','yes'].includes(String(vals[s.key]).toLowerCase())}
+                             onChange=${e => set(s.key, e.target.checked ? '1' : '0')} />
+                      <span className="hint">${['1','true','on','yes'].includes(String(vals[s.key]).toLowerCase()) ? 'on' : 'off'}</span>
+                    </div>`
+                  : html`<input id=${s.key} disabled=${!spec.writable}
+                           type=${s.kind === 'secret' ? 'password' : s.kind === 'number' ? 'number' : 'text'}
+                           value=${vals[s.key] ?? ''} placeholder=${s.kind === 'secret' && s.set ? 'unchanged — type to replace' : s.placeholder}
+                           onChange=${e => set(s.key, e.target.value)} />`}
+                ${s.help && html`<p className="hlp">${s.help}</p>`}
+              </div>`)}
+          </div>`)}
+
+        <div className="actions">
+          <button className="primary" type="submit" disabled=${!spec.writable || saving}>
+            ${saving ? 'Saving…' : 'Save & apply'}
+          </button>
+          ${saved && html`<span className="saved">✓ applied live — no restart needed</span>`}
+          <span className="spacer"></span>
+          <span className="hint">writes ${spec.env_file}</span>
+        </div>
+        ${err && html`<div className="err">${err}</div>`}
+      </div>
+    </form>`;
+}
+
+/* The browser-driver page: pick the engine (stock Chromium vs CloakBrowser stealth), tune the
+   stealth knobs, and see/close the live browser workspaces. The engine is just TABVIS_BROWSER_ENGINE
+   under the hood, written via POST /config, so it takes effect on the NEXT run — hence the "close
+   the current browser to start fresh" loop that the workspace list below closes. */
+function Driver({ open, config, onChanged }) {
+  const [cfg, setCfg]     = useState(null);   // GET /config — writable flag + the stealth fields
+  const [sv, setSv]       = useState({});     // stealth form values
+  const [sbase, setSbase] = useState({});     // as-loaded baseline (send only what changed)
+  const [ws, setWs]       = useState(null);   // live workspaces (GET /browsers)
+  const [err, setErr]     = useState(null);
+  const [note, setNote]   = useState(null);   // transient success line
+  const [busy, setBusy]   = useState(false);
+
+  const engine = config?.browser_engine || 'chromium';
+  const writable = cfg?.writable !== false;
+
+  const loadCfg = useCallback(() => {
+    api.config().then(d => {
+      setCfg(d);
+      const v = {};
+      for (const s of d.settings)
+        if (s.group === 'Stealth') v[s.key] = s.kind === 'secret' ? '' : (s.value ?? '');
+      setSv(v); setSbase(v);
+    }).catch(() => setErr('could not load driver config'));
+  }, []);
+
+  useEffect(() => { if (open) loadCfg(); }, [open, loadCfg]);
+
+  // Poll the live workspaces only while the panel is open.
+  useEffect(() => {
+    if (!open) return;
+    let stop = false;
+    const tick = () => api.browsers().then(d => { if (!stop) setWs(d.browsers || []); }).catch(() => {});
+    tick();
+    const t = setInterval(tick, 2000);
+    return () => { stop = true; clearInterval(t); };
+  }, [open]);
+
+  if (!open) return null;
+
+  const flash = m => { setNote(m); setTimeout(() => setNote(null), 3000); };
+  const isOn = v => ['1','true','on','yes'].includes(String(v).toLowerCase());
+
+  const switchEngine = async next => {
+    if (next === engine || busy) return;
+    setBusy(true); setErr(null);
+    const { ok, body } = await api.saveConfig({ TABVIS_BROWSER_ENGINE: next });
+    setBusy(false);
+    if (!ok) return setErr(body.error || 'could not switch engine');
+    flash(`Driver set to ${next}. It applies to the next run — close the current browser below to start fresh on it.`);
+    onChanged?.();   // refresh health so readiness + the profile dir update
+    loadCfg();
+  };
+
+  const saveStealth = async () => {
+    const changed = {};
+    for (const k of Object.keys(sv)) if (sv[k] !== sbase[k]) changed[k] = sv[k];
+    if (!Object.keys(changed).length) return flash('No changes to save.');
+    setBusy(true); setErr(null);
+    const { ok, body } = await api.saveConfig(changed);
+    setBusy(false);
+    if (!ok) return setErr(body.error || 'could not save');
+    flash('Stealth options applied — effective on the next run.');
+    onChanged?.(); loadCfg();
+  };
+
+  const closeWs = async w => {
+    setErr(null);
+    const { ok, body } = await api.closeBrowser({ user_data_dir: w.user_data_dir, profile: w.profile });
+    if (!ok) return setErr(body.error || 'could not close browser');
+    api.browsers().then(d => setWs(d.browsers || [])).catch(() => {});
+  };
+
+  const stealth = (cfg?.settings || []).filter(s => s.group === 'Stealth');
+
+  return html`
+    <div className="card full">
+      <h2>Browser driver</h2>
+      <div className="body">
+        ${!writable && html`
+          <div className="ro">
+            Read-only — the driver can only be changed from <b>localhost</b> (this server has no auth).
+            Set <code>TABVIS_SERVER_ALLOW_REMOTE_CONFIG=1</code> to override.
+          </div>`}
+
+        ${(() => {
+          const engines = config?.browser_engines || [];
+          const cur = engines.find(e => e.key === engine) || {};
+          const MODE_LABEL = { launch: 'Native launch', plugin: 'Stealth (plugin SDK)', cdp: 'Attach over CDP', connect: 'Attach to Playwright server' };
+          const groups = ['launch', 'plugin', 'cdp', 'connect'];
+          const pkgReady = config?.engine_package_ready !== false;
+          const epReady = config?.engine_endpoint_ready !== false;
+          return html`
+        <label htmlFor="drv-engine">Engine <span className="hint">— which browser the agent drives (TABVIS_BROWSER_ENGINE)</span></label>
+        <select id="drv-engine" disabled=${!writable || busy} value=${engine}
+                onChange=${e => switchEngine(e.target.value)}>
+          ${groups.map(g => {
+            const items = engines.filter(e => e.mode === g);
+            if (!items.length) return null;
+            return html`<optgroup key=${g} label=${MODE_LABEL[g] || g}>
+              ${items.map(e => html`<option key=${e.key} value=${e.key}>
+                ${e.label}${e.stealth ? ' · stealth' : ''} (${e.kernel})
+              </option>`)}
+            </optgroup>`;
+          })}
+        </select>
+        ${cur.notes && html`<p className="hlp">${cur.notes}</p>`}
+        ${note && html`<p className="saved mt12">✓ ${note}</p>`}
+
+        ${cur.requires && !pkgReady && html`
+          <div className="banner mt12">
+            <span className="ico">⚠</span>
+            <div>
+              <b>${cur.label} is selected, but the ${cur.requires} package isn't installed.</b>
+              <p>Runs refuse to launch until you install the optional extra, then retry:</p>
+              <${Code}>uv sync --extra ${cur.requires === 'cloakbrowser' ? 'cloak' : cur.requires}<//>
+            </div>
+          </div>`}
+        ${cur.mode === 'cdp' && !epReady && html`
+          <div className="banner mt12">
+            <span className="ico">⚠</span>
+            <div>
+              <b>${cur.label} attaches over CDP, but no endpoint is set.</b>
+              <p>Start the browser/profile, then set its DevTools address:</p>
+              <${Code}>TABVIS_BROWSER_CDP_ENDPOINT=http://127.0.0.1:9222<//>
+            </div>
+          </div>`}
+        ${cur.mode === 'connect' && !epReady && html`
+          <div className="banner mt12">
+            <span className="ico">⚠</span>
+            <div>
+              <b>${cur.label} attaches to a Playwright server, but no endpoint is set.</b>
+              <p>Set the connect URL (it may carry a ?token=):</p>
+              <${Code}>TABVIS_BROWSER_WS_ENDPOINT=wss://…<//>
+            </div>
+          </div>`}
+
+        <div className="grp">
+          <h3>Status</h3>
+          <dl className="facts">
+            <dt>active engine</dt>
+            <dd>${cur.label || engine} <span className=${config?.engine_ready ? 'ok' : 'bad'}>${config?.engine_ready ? '· ready' : '· not ready'}</span></dd>
+            <dt>kernel · driver</dt><dd>${(cur.kernel || config?.browser_kernel || '—')} · ${(cur.browser_type || config?.browser_type || '—')}</dd>
+            <dt>connection</dt><dd>${MODE_LABEL[cur.mode] || cur.mode || config?.browser_mode || '—'}${cur.stealth ? html` <span className="badge b-cloak">stealth</span>` : ''}</dd>
+            ${cur.requires && html`<${Fragment}><dt>package</dt>
+              <dd className=${pkgReady ? 'ok' : 'bad'}>${cur.requires} ${pkgReady ? 'installed' : 'not installed'}</dd><//>`}
+            ${cur.mode === 'cdp' && html`<${Fragment}><dt>CDP endpoint</dt>
+              <dd className=${config?.browser_cdp_endpoint_set ? 'ok' : 'bad'}>${config?.browser_cdp_endpoint_set ? 'set' : 'not set'}</dd><//>`}
+            ${cur.mode === 'connect' && html`<${Fragment}><dt>ws endpoint</dt>
+              <dd className=${config?.browser_ws_endpoint_set ? 'ok' : 'bad'}>${config?.browser_ws_endpoint_set ? 'set' : 'not set'}</dd><//>`}
+            ${engine === 'cloak' && html`<${Fragment}><dt>license</dt>
+              <dd>${config?.cloak_licensed ? html`<span className="ok">Pro key set</span>` : 'free tier'}</dd><//>`}
+            <dt>profile dir</dt><dd>${cur.mode === 'cdp' || cur.mode === 'connect' ? html`<span className="hint">— remote (no local profile)</span>` : (config?.browser_profile_dir ?? '—')}</dd>
+            <dt>window</dt><dd>${cur.mode === 'cdp' || cur.mode === 'connect' ? html`<span className="hint">— controlled by the remote browser</span>` : (config?.browser_headless ? 'headless' : 'headed')}</dd>
+          </dl>
+        </div>`;
+        })()}
+
+        <div className="grp">
+          <h3>Stealth options${engine !== 'cloak' ? html` <span className="hint">— apply when Cloak is the engine</span>` : ''}</h3>
+          ${stealth.map(s => html`
+            <div className="fld" key=${s.key}>
+              <div className="lbl">
+                <label htmlFor=${'drv-' + s.key}>${s.label}</label>
+                <span className="key">${s.key}</span>
+                ${s.kind === 'secret' && s.set && html`<span className="isset">set ${s.hint}</span>`}
+              </div>
+              ${s.kind === 'bool'
+                ? html`<div className="sw">
+                    <input id=${'drv-' + s.key} type="checkbox" disabled=${!writable}
+                           checked=${isOn(sv[s.key])}
+                           onChange=${e => setSv(o => ({ ...o, [s.key]: e.target.checked ? '1' : '0' }))} />
+                    <span className="hint">${isOn(sv[s.key]) ? 'on' : 'off'}</span>
+                  </div>`
+                : s.key === 'TABVIS_BROWSER_HUMAN_PRESET'
+                ? html`<select id=${'drv-' + s.key} disabled=${!writable}
+                         value=${sv[s.key] || 'default'}
+                         onChange=${e => setSv(o => ({ ...o, [s.key]: e.target.value }))}>
+                      <option value="default">default</option>
+                      <option value="careful">careful</option>
+                    </select>`
+                : html`<input id=${'drv-' + s.key} disabled=${!writable}
+                         type=${s.kind === 'secret' ? 'password' : 'text'}
+                         value=${sv[s.key] ?? ''}
+                         placeholder=${s.kind === 'secret' && s.set ? 'unchanged — type to replace' : s.placeholder}
+                         onChange=${e => setSv(o => ({ ...o, [s.key]: e.target.value }))} />`}
+              ${s.help && html`<p className="hlp">${s.help}</p>`}
+            </div>`)}
+          <div className="actions">
+            <button className="primary" type="button" disabled=${!writable || busy} onClick=${saveStealth}>
+              ${busy ? 'Saving…' : 'Save stealth options'}
+            </button>
+            <span className="hint">effective on the next run</span>
+          </div>
+        </div>
+
+        <div className="grp">
+          <h3>Open browsers${ws ? ` (${ws.length})` : ''}</h3>
+          ${ws == null
+            ? html`<div className="muted">Loading…</div>`
+            : ws.length === 0
+            ? html`<div className="muted">No browser open right now — one launches when the next run starts.</div>`
+            : html`<div className="wslist">
+                ${ws.map(w => {
+                  const bi = w.browser || {};
+                  const eng = bi.engine || '?';
+                  const tabs = (w.tabs || []).length;
+                  return html`
+                    <div className="ws" key=${w.user_data_dir}>
+                      <div className="wsmain">
+                        <div className="wstop">
+                          <span className="wsname">${w.profile}</span>
+                          <span className=${'badge ' + (eng === 'cloak' ? 'b-cloak' : 'b-chromium')}>
+                            ${eng}${bi.stealth ? ' · stealth' : ''}</span>
+                          ${w.busy_agent && html`<span className="drv">driving: ${w.busy_agent}</span>`}
+                        </div>
+                        <div className="wsmeta">
+                          ${bi.version ? 'v' + bi.version + ' · ' : ''}${bi.headless ? 'headless' : 'headed'} ·
+                          ${tabs} tab${tabs === 1 ? '' : 's'} ·
+                          ${w.busy_agent ? 'busy' : `idle ${Math.round(w.idle_seconds || 0)}s`}
+                        </div>
+                      </div>
+                      <button className="danger" type="button" disabled=${!!w.busy_agent}
+                              title=${w.busy_agent ? 'an agent is driving this browser' : 'close this browser'}
+                              onClick=${() => closeWs(w)}>Close</button>
+                    </div>`;
+                })}
+              </div>`}
+        </div>
+
+        ${err && html`<div className="err">${err}</div>`}
+      </div>
+    </div>`;
+}
+
+function Setup({ config, open, onToggle }) {
+  const origin = window.location.origin;
+  if (!open) return null;
+  return html`
+    <div className="card full">
+      <h2>Run as a web server</h2>
+      <div className="body">
+        <div className="steps">
+
+          <div className="step">
+            <h3>Install</h3>
+            <p>Once, from the repo root. The second line fetches the Chromium the browser tools drive.</p>
+            <${Code}>uv sync
+uv run playwright install chromium<//>
+          </div>
+
+          <div className="step">
+            <h3>Configure the model endpoint</h3>
+            <p>
+              Create a <code>.env</code> in the directory you launch from. Both are required — there is
+              no default endpoint, and it must be spelled <code>TABVIS_*</code> (a plain
+              <code>ANTHROPIC_API_KEY</code> is deleted at startup).
+            </p>
+            <${Code}>TABVIS_BASE_URL=https://api.anthropic.com
+TABVIS_API_KEY=sk-ant-...<//>
+          </div>
+
+          <div className="step">
+            <h3>Start the server</h3>
+            <p>Serves this console at <code>/</code> and the JSON/SSE API alongside it.</p>
+            <${Code}>uv run tabvis --serve<//>
+            <${Code}>uv run tabvis --serve --host 0.0.0.0 --port 9000</${Code}>
+            <p className="hint" style=${{ marginTop: '7px' }}>
+              🔒 No authentication — anyone who can reach the port can run an agent with full shell,
+              file and browser access as you. Keep it on 127.0.0.1 unless you put an auth proxy in front.
+            </p>
+          </div>
+
+          <div className="step">
+            <h3>Or drive it from the terminal</h3>
+            <p>Same API this console uses. <code>-N</code> keeps the SSE stream unbuffered.</p>
+            <${Code}>${`curl -N -X POST ${origin}/agent \\
+  -H 'content-type: application/json' \\
+  -d '{"prompt": "open example.com and tell me the heading"}'`}<//>
+            <${Code}>${`curl ${origin}/agents            # list runs
+curl ${origin}/agents/<id>       # one record
+curl -X POST ${origin}/agents/<id>/cancel`}<//>
+          </div>
+
+          <div className="step">
+            <h3>Useful knobs</h3>
+            <${Code}>${`TABVIS_SERVER_PORT=9000          # or --port
+TABVIS_SERVER_MAX_AGENTS=4       # each agent = one real Chromium
+TABVIS_BROWSER_HEADLESS=0        # watch the browser drive
+TABVIS_BROWSER_EAGER=0           # don't pre-launch a browser`}<//>
+          </div>
+
+        </div>
+
+        <h3 className="mt12" style=${{ fontSize: '12.5px' }}>This server</h3>
+        <dl className="facts">
+          <dt>model endpoint</dt>
+          <dd className=${config?.base_url ? 'ok' : 'bad'}>${config?.base_url ? 'configured' : 'MISSING (TABVIS_BASE_URL)'}</dd>
+          <dt>credential</dt>
+          <dd className=${config?.credential ? 'ok' : 'bad'}>${config?.credential ? 'configured' : 'MISSING (TABVIS_API_KEY)'}</dd>
+          <dt>model</dt><dd>${config?.model ?? '—'}</dd>
+          <dt>playwright</dt>
+          <dd className=${config?.playwright ? 'ok' : 'bad'}>${config?.playwright ? 'installed' : 'not installed'}</dd>
+          <dt>browser</dt><dd>${config?.browser_headless ? 'headless' : 'headed'} · max ${config?.max_agents} agents</dd>
+          <dt>profile dir</dt><dd>${config?.browser_profile_dir ?? '—'}</dd>
+        </dl>
+      </div>
+    </div>`;
+}
+
+function Health({ h: hp }) {
+  if (!hp) return html`<span className="pill">connecting…</span>`;
+  return html`<span className="pill">running <b>${hp.running}</b> / ${hp.max_agents} · capacity <b>${hp.capacity}</b> · total <b>${hp.agents}</b></span>`;
+}
+
+function NewRun({ onLaunched, busy, ready }) {
+  const [prompt, setPrompt] = useState('open example.com and tell me the heading');
+  const [model, setModel] = useState('');
+  const [profile, setProfile] = useState('');
+  const [maxTurns, setMaxTurns] = useState('');
+  const [err, setErr] = useState(null);
+
+  const submit = e => {
+    e.preventDefault();
+    setErr(null);
+    if (!prompt.trim()) return;
+    const body = { prompt };
+    if (model.trim()) body.model = model.trim();
+    if (profile) body.profile = profile;
+    if (maxTurns) body.max_turns = Number(maxTurns);
+    onLaunched(body, setErr);
+  };
+
+  return html`
+    <form className="card" onSubmit=${submit}>
+      <h2>New run</h2>
+      <div className="body">
+        <label>Prompt</label>
+        <textarea value=${prompt} onChange=${e => setPrompt(e.target.value)}
+                  placeholder="what should the agent do?"></textarea>
+
+        <div className="row mt12">
+          <div>
+            <label>Browser profile</label>
+            <select value=${profile} onChange=${e => setProfile(e.target.value)}>
+              <option value="">isolated (parallel)</option>
+              <option value="default">default (logged-in, exclusive)</option>
+            </select>
+          </div>
+          <div>
+            <label>Max turns</label>
+            <input type="number" min="1" value=${maxTurns} placeholder="∞"
+                   onChange=${e => setMaxTurns(e.target.value)} />
+          </div>
+        </div>
+
+        <div className="mt12">
+          <label>Model</label>
+          <input value=${model} placeholder="default" onChange=${e => setModel(e.target.value)} />
+        </div>
+
+        <div className="actions">
+          <button className="primary" type="submit" disabled=${busy || !prompt.trim() || !ready}
+                  title=${ready ? '' : 'server has no model endpoint configured'}>
+            ${busy ? 'Starting…' : 'Run agent'}
+          </button>
+          <span className="hint">
+            ${!ready
+              ? 'model endpoint not configured'
+              : profile === 'default' ? 'uses your logged-in browser' : 'gets its own browser'}
+          </span>
+        </div>
+        ${err && html`<div className="err">${err}</div>`}
+      </div>
+    </form>`;
+}
+
+function AgentList({ agents, selected, onSelect }) {
+  return html`
+    <div className="card">
+      <h2>Agents (${agents.length})</h2>
+      <div className="agents">
+        ${agents.length === 0
+          ? html`<div className="empty">No runs yet.</div>`
+          : agents.map(a => html`
+            <button className="agent" key=${a.agent_id} aria-selected=${a.agent_id === selected}
+                    onClick=${() => onSelect(a.agent_id)}>
+              <div className="top">
+                <span className="status s-${a.status}">${a.status}</span>
+                <span className="id">${a.agent_id}</span>
+              </div>
+              <p className="p">${a.prompt}</p>
+              <div className="meta">
+                ${a.turns} turns · ${a.tool_calls} tools · ${ms(a.duration_ms)}
+                ${a.profile ? ` · ${a.profile}` : ' · isolated'}
+              </div>
+            </button>`)}
+      </div>
+    </div>`;
+}
+
+function Detail({ agent, browser, onCancel, onQuit, cancelling }) {
+  if (!agent) return html`
+    <div className="card"><h2>Agent</h2><div className="empty">Select an agent, or start a new run.</div></div>`;
+
+  const b = browser?.browser || {};
+  const live = !['completed','failed','cancelled'].includes(agent.status);
+  // The bundled browser outlives the run: even a finished agent may still hold one open, so Quit
+  // (end the agent + close its browser, freeing the profile) stays enabled after Cancel does not.
+  const hasBrowser = !!(browser && browser.browser && Object.keys(browser.browser).length);
+  return html`
+    <div className="card">
+      <h2>Agent · ${agent.agent_id}</h2>
+      <div className="body">
+        <div className="detail-head">
+          <span className="status s-${agent.status}">${agent.status}</span>
+          <span className="spacer"></span>
+          <button disabled=${!live || cancelling} onClick=${() => onCancel(agent.agent_id)}>
+            ${cancelling ? 'Cancelling…' : 'Cancel'}
+          </button>
+          <button className="danger" disabled=${cancelling || (!live && !hasBrowser)}
+                  title="End this agent and close its bundled browser"
+                  onClick=${() => onQuit(agent.agent_id)}>
+            Quit
+          </button>
+        </div>
+        <dl>
+          <dt>agent_id</dt><dd>${agent.agent_id}</dd>
+          <dt>session_id</dt><dd>${agent.session_id || '—'}</dd>
+          <dt>model</dt><dd>${agent.model || 'default'}</dd>
+          <dt>profile</dt><dd>${agent.profile || 'isolated'}</dd>
+          <dt>turns / tools</dt><dd>${agent.turns} / ${agent.tool_calls}</dd>
+          <dt>started</dt><dd>${clock(agent.started_at)} · ${ms(agent.duration_ms)}</dd>
+          ${agent.result && html`<dt>result</dt><dd>${agent.result}</dd>`}
+          ${agent.error && html`<dt>error</dt><dd className="errtext">${agent.error}</dd>`}
+        </dl>
+      </div>
+    </div>
+
+    <div className="card">
+      <h2>Browser ${b.status ? `· ${b.status}` : ''}</h2>
+      <div className="body">
+        ${!browser || !browser.browser
+          ? html`<div className="muted">No browser for this agent yet.</div>`
+          : html`
+            <dl>
+              <dt>engine</dt><dd>${b.engine || '—'} ${b.version || ''}</dd>
+              <dt>headless</dt><dd>${String(b.headless)}</dd>
+              <dt>profile dir</dt><dd>${b.profile_dir || '—'}</dd>
+              <dt>tabs</dt><dd>${(browser.tabs || []).length}</dd>
+            </dl>
+            ${(browser.history || []).length > 0 && html`
+              <div className="mt12">
+                <label>Visited (${browser.history.length})</label>
+                <div className="hist">
+                  ${browser.history.slice().reverse().map((v,i) => html`
+                    <a key=${i} href=${v.url} target="_blank" rel="noreferrer"
+                       title=${v.url}>${v.title || v.url}</a>`)}
+                </div>
+              </div>`}`}
+      </div>
+    </div>`;
+}
+
+function Stream({ frames }) {
+  const box = useRef(null);
+  useEffect(() => { if (box.current) box.current.scrollTop = box.current.scrollHeight; }, [frames.length]);
+  return html`
+    <div className="card">
+      <h2>Live stream</h2>
+      <div className="stream" ref=${box}>
+        ${frames.length === 0
+          ? html`<div className="muted">Events appear here while an agent runs.</div>`
+          : frames.map((f, i) => html`
+              <div className="ev e-${f.cls || f.event}" key=${i}>
+                <span className="k">${f.event}</span><span className="v">${f.text}</span>
+              </div>`)}
+      </div>
+    </div>`;
+}
+
+/* ---------- app ---------- */
+function App() {
+  const [health, setHealth]     = useState(null);
+  const [agents, setAgents]     = useState([]);
+  const [selected, setSelected] = useState(null);
+  const [agent, setAgent]       = useState(null);
+  const [browser, setBrowser]   = useState(null);
+  const [frames, setFrames]     = useState([]);
+  const [busy, setBusy]         = useState(false);
+  const [cancelling, setCancel] = useState(false);
+  const [setupOpen, setSetup]   = useState(false);
+  const [cfgOpen, setCfgOpen]   = useState(false);
+  const [driverOpen, setDriver] = useState(false);
+  const streamFor = useRef(null);   // agent_id whose stream we're rendering
+
+  // poll fleet + list
+  useEffect(() => {
+    let stop = false;
+    let firstLoad = true;
+    const tick = async () => {
+      try {
+        const [hp, ls] = await Promise.all([api.health(), api.list()]);
+        if (stop) return;
+        setHealth(hp);
+        setAgents(ls.agents || []);
+        // Nothing works without a model endpoint — show the how-to-run panel unprompted.
+        if (firstLoad && hp?.config && !hp.config.ready) setCfgOpen(true);
+        firstLoad = false;
+      } catch { /* server down; keep last */ }
+    };
+    tick();
+    const t = setInterval(tick, 1500);
+    return () => { stop = true; clearInterval(t); };
+  }, []);
+
+  // poll the selected agent + its browser
+  useEffect(() => {
+    if (!selected) { setAgent(null); setBrowser(null); return; }
+    let stop = false;
+    const tick = async () => {
+      const [a, b] = await Promise.all([api.get(selected), api.browser(selected)]);
+      if (!stop) { setAgent(a); setBrowser(b); }
+    };
+    tick();
+    const t = setInterval(tick, 1500);
+    return () => { stop = true; clearInterval(t); };
+  }, [selected]);
+
+  const push = useCallback((event, data) => {
+    const out = summarize(event, data);
+    if (out == null) return;                        // noise (empty turn, user dupe, delta)
+    // A failed run reports itself via `result` with is_error — colour it as the error it is.
+    const text = typeof out === 'string' ? out : out.text;
+    const cls  = typeof out === 'string' ? event : out.cls;
+    setFrames(f => [...f, { event, cls, text }]);
+  }, []);
+
+  const launch = useCallback((body, setErr) => {
+    setBusy(true);
+    setFrames([]);
+    runAgent(body, ({ event, data }) => {
+      if (event === '_id' || event === 'agent') {
+        const id = data.agent_id;
+        if (id && streamFor.current !== id) { streamFor.current = id; setSelected(id); }
+      }
+      push(event, data);
+    })
+      .catch(e => {
+        const extra = e.status === 409 ? ` (held by ${e.held_by})` : '';
+        setErr(`${e.message}${extra}`);
+      })
+      .finally(() => setBusy(false));
+  }, [push]);
+
+  const refreshHealth = useCallback(async () => {
+    try { setHealth(await api.health()); } catch { /* ignore */ }
+  }, []);
+
+  const cancel = useCallback(async id => {
+    setCancel(true);
+    const { ok, body } = await api.cancel(id);
+    if (!ok) push('error', { message: body.error });
+    setCancel(false);
+  }, [push]);
+
+  // Quit an agent: end it AND close its bundled browser, freeing the profile. Works on a finished
+  // agent too (its browser outlives the run until quit).
+  const quit = useCallback(async id => {
+    setCancel(true);
+    const { ok, body } = await api.quit(id);
+    if (!ok) push('error', { message: body.error });
+    setCancel(false);
+  }, [push]);
+
+  return html`
+    <header>
+      <h1>tabvis</h1>
+      <span className="sub">agent console</span>
+      <span className="spacer"></span>
+      <${Health} h=${health} />
+      <button onClick=${() => setDriver(v => !v)}>
+        ${driverOpen ? 'Hide driver' : `Driver · ${health?.config?.browser_engine || 'chromium'}`}
+      </button>
+      <button onClick=${() => setCfgOpen(v => !v)}>
+        ${cfgOpen ? 'Hide settings' : 'Settings'}
+      </button>
+      <button onClick=${() => setSetup(v => !v)}>
+        ${setupOpen ? 'Hide setup' : 'Run as a web server'}
+      </button>
+    </header>
+    <main>
+      <${Banner} config=${health?.config} onConfigure=${() => setCfgOpen(true)} />
+      <${Driver} open=${driverOpen} config=${health?.config} onChanged=${refreshHealth} />
+      <${Settings} open=${cfgOpen} onSaved=${refreshHealth} />
+      <${Setup} config=${health?.config} open=${setupOpen} onToggle=${() => setSetup(v => !v)} />
+      <div className="stack">
+        <${NewRun} onLaunched=${launch} busy=${busy} ready=${health?.config?.ready !== false} />
+        <${AgentList} agents=${agents} selected=${selected} onSelect=${setSelected} />
+      </div>
+      <div className="stack">
+        <${Stream} frames=${frames} />
+        <${Detail} agent=${agent} browser=${browser} onCancel=${cancel} onQuit=${quit} cancelling=${cancelling} />
+      </div>
+    </main>`;
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(html`<${App} />`);
+</script>
+</body>
+</html>
