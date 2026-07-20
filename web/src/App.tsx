@@ -152,7 +152,7 @@ export function App() {
       <main>
         <Banner config={health?.config} onConfigure={() => setCfgOpen(true)} />
         <Driver open={driverOpen} config={health?.config} onChanged={refreshHealth} />
-        <Settings open={cfgOpen} onSaved={refreshHealth} />
+        <Settings open={cfgOpen} config={health?.config} onSaved={refreshHealth} />
         <Setup config={health?.config} open={setupOpen} />
         <div className="stack">
           <NewRun onLaunched={launch} busy={busy} ready={health?.config?.ready !== false} />

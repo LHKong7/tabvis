@@ -116,6 +116,10 @@ dd { margin:0; font-family:var(--mono); font-size:11.5px; overflow-wrap:anywhere
 .grp:first-child { border-top:0; padding-top:0; margin-top:0; }
 .grp h3 { margin:0 0 10px; font-size:11px; text-transform:uppercase; letter-spacing:.06em; color:var(--dim); }
 .fld { margin-bottom:11px; }
+.fld.na { opacity:.5; }                        /* a setting the active browser engine ignores */
+.fld.na:focus-within { opacity:1; }            /* un-dim while you edit it anyway */
+.na-note { font:10px var(--mono); color:var(--dim2); }
+.req-note { font:10px var(--mono); color:var(--warn); }
 .fld .lbl { display:flex; align-items:center; gap:7px; margin-bottom:4px; }
 .fld .lbl label { margin:0; text-transform:none; letter-spacing:0; font-size:12.5px; color:var(--fg); font-weight:550; }
 .fld .key { font:10px var(--mono); color:var(--dim2); }

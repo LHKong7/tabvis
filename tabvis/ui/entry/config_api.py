@@ -39,8 +39,13 @@ class Setting:
     default: str = ""
 
 
-# The knobs worth exposing. Deliberately NOT everything — TABVIS_CONFIG_DIR, TABVIS_DOTENV etc. change
-# where config itself comes from, and editing them from the console would be a foot-gun.
+# The knobs worth exposing — kept in PARITY with .env.example so the console can edit the whole
+# configuration surface live (changes apply on the next call/run and are merged into .env).
+# Deliberately EXCLUDED (editing these from the console would be a foot-gun): TABVIS_CONFIG_DIR /
+# TABVIS_DOTENV / TABVIS_DISABLE_DOTENV (they change where config itself comes from); TABVIS_DEBUG /
+# TABVIS_SIMPLE / TABVIS_LOG (presence-checked debug flags that don't fit the form model); and
+# TABVIS_SERVER_HOST / TABVIS_SERVER_PORT / TABVIS_SERVER_ALLOW_REMOTE_CONFIG (bind at launch / gate
+# config writes themselves). Everything else in .env.example lives below.
 SETTINGS: tuple[Setting, ...] = (
     Setting("TABVIS_BASE_URL", "Model endpoint", "Model", "text",
             "Required. No default — tabvis refuses to run without it.",
@@ -142,6 +147,80 @@ SETTINGS: tuple[Setting, ...] = (
             "traineddata installed (macOS `brew install tesseract-lang`, Ubuntu "
             "`apt install tesseract-ocr-chi-sim`). Unavailable languages fall back to an installed one.",
             "eng", default="eng"),
+    Setting("TABVIS_OCR_ENGINE", "OCR engine", "Vision / OCR", "text",
+            "auto (default) | tesserocr | pytesseract | binary — force one OCR engine instead of "
+            "auto-detecting.", "auto", default="auto"),
+
+    # =========================================================================================
+    # .env.example parity — the rest of the documented configuration surface, editable live.
+    # =========================================================================================
+
+    # --- Model (provider, tier repointing, non-Anthropic endpoints) ---
+    Setting("TABVIS_MODEL_PROVIDER", "Model provider", "Model", "text",
+            "anthropic (default) | openai | gemini. Blank = inferred from the model id.", "openai"),
+    Setting("TABVIS_DEFAULT_SONNET_MODEL", "Sonnet-tier model", "Model", "text",
+            "Repoint the Balanced/Sonnet tier to your endpoint's model id.", ""),
+    Setting("TABVIS_DEFAULT_OPUS_MODEL", "Opus-tier model", "Model", "text",
+            "Repoint the Max/Opus tier to your endpoint's model id.", ""),
+    Setting("TABVIS_DEFAULT_HAIKU_MODEL", "Haiku-tier model", "Model", "text",
+            "Repoint the Fast/Haiku tier to your endpoint's model id.", ""),
+    Setting("TABVIS_MAX_OUTPUT_TOKENS", "Max output tokens", "Model", "number",
+            "max_tokens per request. Blank = 8192.", "8192"),
+    Setting("TABVIS_OPENAI_API_KEY", "OpenAI API key", "Model", "secret",
+            "OpenAI-compatible provider key (or OPENAI_API_KEY). Write-only: never sent back.", "sk-…"),
+    Setting("TABVIS_OPENAI_BASE_URL", "OpenAI base URL", "Model", "text",
+            "OpenAI-compatible endpoint (vLLM / Groq / a gateway).", "https://api.openai.com/v1"),
+    Setting("TABVIS_GEMINI_API_KEY", "Gemini API key", "Model", "secret",
+            "Gemini provider key (or GEMINI_API_KEY / GOOGLE_API_KEY). Write-only: never sent back.", ""),
+    Setting("TABVIS_GEMINI_BASE_URL", "Gemini base URL", "Model", "text",
+            "Gemini endpoint override.", ""),
+    Setting("TABVIS_CUSTOM_HEADERS", "Custom headers", "Model", "text",
+            "Extra request headers, one 'Name: Value' per line (gateways/proxies).", ""),
+
+    # --- Browser (launch/profile knobs; apply on the next run) ---
+    Setting("TABVIS_BROWSER_VIEWPORT", "Viewport", "Browser", "text",
+            "WIDTHxHEIGHT (lowercase x).", "1280x720"),
+    Setting("TABVIS_BROWSER_CHANNEL", "Channel", "Browser", "text",
+            "chromium (bundled) | chrome | msedge. Launch-mode Chromium only.", "chromium"),
+    Setting("TABVIS_BROWSER_EXECUTABLE_PATH", "Executable path", "Browser", "text",
+            "Explicit browser binary — skips `playwright install` / auto-detect.", "/path/to/chrome"),
+    Setting("TABVIS_BROWSER_USER_DATA_DIR", "Profile dir", "Browser", "text",
+            "Chromium profile (cookies/logins). Blank = the per-engine default under the config home.",
+            "~/.tabvis/browser"),
+    Setting("TABVIS_BROWSER_AUTO_VISUAL", "Auto visual", "Browser", "bool",
+            "Attach a screenshot + trimmed HTML when the accessibility tree is too sparse to reason "
+            "from. Off = text-only snapshots.", default="1"),
+    Setting("TABVIS_BROWSER_IDLE_TIMEOUT_MS", "Idle reap (ms)", "Browser", "number",
+            "Reap an UNOWNED browser workspace after this idle time. 0 = never.", "1800000"),
+    Setting("TABVIS_BROWSER_ARGS", "Extra Chromium args", "Browser", "text",
+            "Comma-separated, e.g. --no-sandbox.", "--no-sandbox"),
+    Setting("TABVIS_BROWSER_SNAPSHOT_MODE", "Snapshot mode", "Browser", "text",
+            "'data' forces the injected-attribute snapshot path (else the public aria tree).", "data"),
+    Setting("TABVIS_BROWSER_CDP_ENDPOINT", "CDP endpoint", "Browser", "text",
+            "DevTools address for cdp-mode engines.", "http://127.0.0.1:9222"),
+    Setting("TABVIS_BROWSER_WS_ENDPOINT", "WS endpoint", "Browser", "text",
+            "Playwright-server ws:// URL for connect-mode engines (may carry ?token=; redacted in logs).",
+            "wss://chrome.browserless.io?token=…"),
+    Setting("TABVIS_BROWSER_MAX_PACING_WAIT_MS", "Max pacing wait (ms)", "Browser", "number",
+            "Safety cap on a single request-pacing wait.", "60000"),
+
+    # --- Browsing artifacts (the durable trail under the per-session dir) ---
+    Setting("TABVIS_BROWSER_ARTIFACTS", "Record artifacts", "Artifacts", "bool",
+            "Record the browsing trail (navigation, page metadata, interactions, DOM).", default="1"),
+    Setting("TABVIS_BROWSER_ARTIFACTS_DOM", "Capture DOM", "Artifacts", "bool",
+            "Capture the page DOM with each artifact event.", default="1"),
+    Setting("TABVIS_BROWSER_ARTIFACTS_MAX_DOM_BYTES", "Max DOM bytes", "Artifacts", "number",
+            "Cap per captured DOM blob.", "1000000"),
+    Setting("TABVIS_BROWSER_ARTIFACTS_REDACT_INPUT", "Redact typed input", "Artifacts", "bool",
+            "Store typed text as length-only (hides passwords).", default="0"),
+
+    # --- Stealth (cloak engine) ---
+    Setting("TABVIS_BROWSER_CLOAK_VERSION", "CloakBrowser version", "Stealth", "text",
+            "Pin a CloakBrowser build (default: whatever ships). cloak engine only.", ""),
+
+    # --- Project instructions ---
+    Setting("TABVIS_DISABLE_TABVIS_MDS", "Ignore TABVIS.md", "Project", "bool",
+            "Ignore all TABVIS.md project-instruction files.", default="0"),
 )
 
 BY_KEY = {s.key: s for s in SETTINGS}
