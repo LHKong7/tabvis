@@ -16,6 +16,7 @@ export function App() {
   const [health, setHealth] = useState<HealthT | null>(null)
   const [agents, setAgents] = useState<AgentSummary[]>([])
   const [selected, setSelected] = useState<string | null>(null)
+  const [runOn, setRunOn] = useState<string>('') // '' = new agent; else an agent_id to continue
   const [agent, setAgent] = useState<AgentRecord | null>(null)
   const [browser, setBrowser] = useState<BrowserView | null>(null)
   const [frames, setFrames] = useState<Frame[]>([])
@@ -87,12 +88,15 @@ export function App() {
     (body: Record<string, unknown>, setErr: (e: string) => void) => {
       setBusy(true)
       setFrames([])
+      const continuing = !!body.agent_id
       runAgent(body, ({ event, data }) => {
         if (event === '_id' || event === 'agent') {
           const id = data.agent_id
           if (id && streamFor.current !== id) {
             streamFor.current = id
             setSelected(id)
+            // Chat continuation: after launching a NEW agent, aim follow-ups at it.
+            if (!continuing) setRunOn(id)
           }
         }
         push(event, data)
@@ -155,12 +159,28 @@ export function App() {
         <Settings open={cfgOpen} config={health?.config} onSaved={refreshHealth} />
         <Setup config={health?.config} open={setupOpen} />
         <div className="stack">
-          <NewRun onLaunched={launch} busy={busy} ready={health?.config?.ready !== false} />
+          <NewRun
+            onLaunched={launch}
+            busy={busy}
+            ready={health?.config?.ready !== false}
+            agents={agents}
+            config={health?.config}
+            runOn={runOn}
+            onRunOn={setRunOn}
+            onEngineChanged={refreshHealth}
+          />
           <AgentList agents={agents} selected={selected} onSelect={setSelected} />
         </div>
         <div className="stack">
           <Stream frames={frames} />
-          <Detail agent={agent} browser={browser} onCancel={cancel} onQuit={quit} cancelling={cancelling} />
+          <Detail
+            agent={agent}
+            browser={browser}
+            onCancel={cancel}
+            onQuit={quit}
+            cancelling={cancelling}
+            onContinue={setRunOn}
+          />
         </div>
       </main>
     </>

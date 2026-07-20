@@ -6,10 +6,11 @@ interface Props {
   browser: BrowserView | null
   onCancel: (id: string) => void
   onQuit: (id: string) => void
+  onContinue: (id: string) => void
   cancelling: boolean
 }
 
-export function Detail({ agent, browser, onCancel, onQuit, cancelling }: Props) {
+export function Detail({ agent, browser, onCancel, onQuit, onContinue, cancelling }: Props) {
   if (!agent)
     return (
       <div className="card">
@@ -31,6 +32,12 @@ export function Detail({ agent, browser, onCancel, onQuit, cancelling }: Props) 
           <div className="detail-head">
             <span className={`status s-${agent.status}`}>{agent.status}</span>
             <span className="spacer"></span>
+            <button
+              title="Send a new prompt to this agent — continues its session, browser & profile"
+              onClick={() => onContinue(agent.agent_id)}
+            >
+              Continue
+            </button>
             <button disabled={!live || cancelling} onClick={() => onCancel(agent.agent_id)}>
               {cancelling ? 'Cancelling…' : 'Cancel'}
             </button>

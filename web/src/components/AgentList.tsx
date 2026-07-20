@@ -1,3 +1,4 @@
+import { useState } from 'react'
 import type { AgentSummary } from '../types'
 import { ms } from '../format'
 
@@ -7,15 +8,33 @@ interface Props {
   onSelect: (id: string) => void
 }
 
+const FILTERS = ['all', 'running', 'completed', 'failed', 'cancelled', 'queued']
+
 export function AgentList({ agents, selected, onSelect }: Props) {
+  const [filter, setFilter] = useState('all')
+  const shown = filter === 'all' ? agents : agents.filter((a) => a.status === filter)
+
   return (
     <div className="card">
-      <h2>Agents ({agents.length})</h2>
+      <h2>Sessions ({shown.length})</h2>
+      <div className="filters">
+        {FILTERS.map((f) => (
+          <button
+            key={f}
+            type="button"
+            className={f === filter ? 'chip active' : 'chip'}
+            onClick={() => setFilter(f)}
+          >
+            {f}
+            {f !== 'all' ? ` ${agents.filter((a) => a.status === f).length}` : ''}
+          </button>
+        ))}
+      </div>
       <div className="agents">
-        {agents.length === 0 ? (
-          <div className="empty">No runs yet.</div>
+        {shown.length === 0 ? (
+          <div className="empty">{filter === 'all' ? 'No runs yet.' : `No ${filter} runs.`}</div>
         ) : (
-          agents.map((a) => (
+          shown.map((a) => (
             <button
               className="agent"
               key={a.agent_id}
