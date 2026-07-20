@@ -1,44 +1,58 @@
 # Tabvis agent console (React front-end)
 
-The source for the web console served at `/` by `tabvis --serve`. It is a **Vite + React +
-TypeScript** app that builds to a single self-contained `tabvis/browser/static/index.html`
-(all JS + CSS inlined) — so the Python server needs no extra routes and the console keeps working
-offline with no CDN.
+A **Vite + React + TypeScript** console for the tabvis HTTP/SSE API. tabvis itself is **headless —
+it ships no built-in UI**. You get a console one of two ways: run it live in dev, or build it and
+host the static bundle yourself (pointing it at the tabvis API).
 
 ## Develop
 
+Install once:
+
+```bash
+cd web && npm install
+```
+
+### Option A — one command (recommended)
+
+```bash
+uv run tabvis --serve --dev        # or TABVIS_WEB_DEV=1 uv run tabvis --serve
+```
+
+The Python server starts Vite (`npm run dev`) for you and **reverse-proxies the console to it**, so
+the whole app is live at `http://127.0.0.1:8765/` on one origin — edit `web/src/*` and the browser
+hot-reloads. API routes are served by the Python server directly; the HMR websocket goes straight to
+Vite on `:5173`. `--dev` needs Node/npm and `web/node_modules`; without them it fails loud.
+
+### Option B — Vite standalone
+
+```bash
+npm run dev                        # Vite + HMR on http://localhost:5173
+```
+
+Here Vite proxies the API (`/health`, `/config`, `/agents`, `/agent` SSE, `/browsers`, …) to a
+tabvis server you run separately (`uv run tabvis --serve` on `:8765`). Point the proxy elsewhere with
+`TABVIS_SERVER=http://host:port npm run dev`; move Vite's port with `TABVIS_WEB_DEV_PORT=…`.
+
+## Build & host it yourself
+
 ```bash
 cd web
-npm install
-npm run dev          # Vite dev server + HMR on http://localhost:5173
+npm run build        # tsc --noEmit, then a standard bundle in web/dist/
 ```
 
-The dev server proxies the API (`/health`, `/config`, `/agents`, `/agent` SSE, `/browsers`, …) to a
-running tabvis server on `http://127.0.0.1:8765`. Start one in another terminal:
-
-```bash
-uv run tabvis --serve
-```
-
-Point the proxy elsewhere with `TABVIS_SERVER=http://host:port npm run dev`.
-
-## Build (what ships)
-
-```bash
-cd web
-npm run build        # tsc --noEmit, then emit ../tabvis/browser/static/index.html
-```
-
-`npm run build` **overwrites** `tabvis/browser/static/index.html` — that generated file is the
-console the server serves, and it is committed so `uv`-only users need no Node toolchain. Re-run the
-build and commit the result whenever you change anything under `web/src/`.
+`web/dist/` is a plain static bundle — serve it from any static host / CDN / your own reverse proxy,
+and make sure its API calls (`/health`, `/config`, `/agents`, `/agent` SSE, `/browsers`, …) reach a
+running tabvis server. Simplest: host `web/dist` and the tabvis API under the **same origin** (a
+reverse proxy that sends `/health`, `/config`, `/agent*`, `/browsers*`, `/workspaces*`, `/executions*`
+to tabvis and everything else to the static bundle) so no CORS is needed. `web/dist/` is **not**
+committed and **not** bundled into the Python package — tabvis serves no UI.
 
 ## Layout
 
 ```
 web/
-  index.html            Vite entry (dev only)
-  vite.config.ts        single-file build + dev API proxy
+  index.html            Vite entry / bundle entry
+  vite.config.ts        standard build (-> web/dist) + dev API proxy + HMR
   src/
     main.tsx            React root
     App.tsx             layout + polling + run lifecycle
@@ -48,6 +62,3 @@ web/
     index.css           all styles
     components/         NewRun, AgentList, Stream, Detail, Settings, Driver, Setup, Health, Banner, Code
 ```
-
-The API contract is unchanged from the previous single-file console; only the front-end
-implementation moved to a real React build.

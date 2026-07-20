@@ -75,10 +75,6 @@ DEFAULT_PORT = 8765
 # Each running agent owns a real Chromium, so cap the fleet. Override: TABVIS_SERVER_MAX_AGENTS.
 DEFAULT_MAX_AGENTS = 4
 
-# The single-file agent console served at GET / .
-UI_DIR = os.path.join(os.path.dirname(__file__), "static")
-UI_INDEX = os.path.join(UI_DIR, "index.html")
-
 # Stand-in for base64 image bytes stripped out of the stream (see _redact_images).
 _ELIDED = "<elided:image-bytes>"
 
@@ -402,20 +398,23 @@ def max_concurrent_agents() -> int:
         return DEFAULT_MAX_AGENTS
 
 
-def create_app(auth_required: bool = False) -> Any:
+def create_app(auth_required: bool = False, dev: bool = False) -> Any:
     """Build the Starlette app (imports are local so importing this module stays cheap).
 
     ``auth_required`` (set by :func:`serve_async` for a non-loopback bind) makes the management face
     reject unauthenticated requests and enforce per-agent isolation. The default (False) preserves the
     open loopback/dev posture — an unauthenticated caller is the local admin.
+
+    ``dev`` (``--serve --dev``) starts the Vite dev server from ``web/`` and reverse-proxies the
+    console to it (live HMR from source). Without ``--dev`` tabvis serves NO built-in UI — it is a
+    headless JSON/SSE API and ``/`` returns a pointer to the two ways to get a console. API routes
+    are unaffected; under ``--dev`` only ``/`` and unmatched frontend asset paths proxy to Vite.
     """
     from sse_starlette.sse import EventSourceResponse
     from starlette.applications import Starlette
     from starlette.requests import Request
     from starlette.responses import JSONResponse
     from starlette.routing import Route, WebSocketRoute
-
-    from starlette.staticfiles import StaticFiles
 
     from tabvis.browser.server_auth import SecurityMiddleware, resolve_principal
     from tabvis.policy.runtime_adapter import authorize_agent, filter_visible_agents
@@ -445,12 +444,24 @@ def create_app(auth_required: bool = False) -> Any:
         return None
 
     async def console(_request: Request) -> Any:
-        """The agent console — a single-file front-end, served same-origin so it needs no CORS."""
-        from starlette.responses import FileResponse, PlainTextResponse
+        """GET / — tabvis serves NO built-in web UI; this is a JSON/SSE API. Point the user at the
+        two supported ways to get a console. (Under ``--dev`` this handler is replaced by a live-Vite
+        reverse proxy; see create_app.)"""
+        from starlette.responses import JSONResponse as _JSONResponse
 
-        if not os.path.exists(UI_INDEX):
-            return PlainTextResponse("agent console not installed", status_code=404)
-        return FileResponse(UI_INDEX, media_type="text/html")
+        return _JSONResponse(
+            {
+                "service": "tabvis",
+                "ui": "none — this is a headless JSON/SSE API",
+                "get_a_console": [
+                    "run `tabvis --serve --dev` for the live React console (Vite HMR from web/)",
+                    "or build web/ (`cd web && npm run build`) and host web/dist behind your own "
+                    "server, pointing it at this API",
+                ],
+                "api": ["GET /health", "GET/POST /config", "POST /agent (SSE)", "GET /agents"],
+            },
+            status_code=404,
+        )
 
     async def health(_request: Request) -> JSONResponse:
         running = registry.running_count()
@@ -928,17 +939,30 @@ def create_app(auth_required: bool = False) -> Any:
             _agent_events(record), headers={"X-Agent-Id": record.agent_id}
         )
 
+    # --dev: the Vite dev server subprocess, started/stopped by the lifespan below.
+    _dev_server = None
+    if dev:
+        from tabvis.browser.dev_server import ViteDevServer
+
+        _dev_server = ViteDevServer()
+
     @contextlib.asynccontextmanager
     async def lifespan(_app: Any) -> Any:
-        yield
-        # Drain the cleanup registry ONCE, at process exit — this is what closes the browser and
-        # finalizes the session record. Per-request runs pass teardown=False to stay warm.
         try:
-            from tabvis.utils.cleanup_registry import run_cleanup_functions
+            if _dev_server is not None:
+                await _dev_server.start()  # fail loud if npm/web deps are missing
+            yield
+        finally:
+            if _dev_server is not None:
+                await _dev_server.stop()
+            # Drain the cleanup registry ONCE, at process exit — this is what closes the browser and
+            # finalizes the session record. Per-request runs pass teardown=False to stay warm.
+            try:
+                from tabvis.utils.cleanup_registry import run_cleanup_functions
 
-            await asyncio.wait_for(run_cleanup_functions(), timeout=10.0)
-        except Exception:  # noqa: BLE001 - best-effort
-            pass
+                await asyncio.wait_for(run_cleanup_functions(), timeout=10.0)
+            except Exception:  # noqa: BLE001 - best-effort
+                pass
 
     # RT-1: one declarative table of API routes, each mounted at BOTH its legacy path and a ``/v1``
     # alias (same handler, byte-identical response), so the versioned Runtime API surface can grow
@@ -973,20 +997,26 @@ def create_app(auth_required: bool = False) -> Any:
         ("/browsers/close", close_browser_route, ["POST"]),
         ("/browser/session", browser_session, ["GET"]),
     ]
-    routes = [Route("/", console, methods=["GET"])]  # the console UI (unversioned)
+    # The console at `/`: served from the built bundle, or (--dev) reverse-proxied to Vite.
+    if dev:
+        from tabvis.browser.dev_server import proxy_to_vite
+
+        console_route = Route("/", proxy_to_vite, methods=["GET", "HEAD"])
+    else:
+        console_route = Route("/", console, methods=["GET"])
+    routes = [console_route]  # the console UI (unversioned)
     for path, handler, methods in api_routes:
         routes.append(Route(path, handler, methods=methods))
         routes.append(Route("/v1" + path, handler, methods=methods))
     routes.append(WebSocketRoute("/v1/events", events_ws))  # RT-2: observation event channel
+    if dev:
+        # Catch-all LAST so API routes win; forwards Vite's module graph (/src/*, /@vite/*, …) to it.
+        routes.append(Route("/{path:path}", proxy_to_vite, methods=["GET", "HEAD"]))
 
     app = Starlette(routes=routes, lifespan=lifespan)
     # P0-2: transport hardening (security headers, body cap, default-deny CORS) — pure ASGI, so the
     # SSE/streaming routes are untouched.
     app.add_middleware(SecurityMiddleware)
-    # Vendored React/htm for the console (no CDN at runtime).
-    vendor = os.path.join(UI_DIR, "vendor")
-    if os.path.isdir(vendor):
-        app.mount("/ui", StaticFiles(directory=vendor), name="ui")
     return app
 
 
@@ -1000,12 +1030,14 @@ def _resolve(host: str | None, port: int | None) -> tuple[str, int]:
     return host, port
 
 
-async def serve_async(host: str | None = None, port: int | None = None) -> None:
+async def serve_async(host: str | None = None, port: int | None = None, dev: bool = False) -> None:
     """Run the SSE server on the CALLER's event loop.
 
     ``uvicorn.run()`` calls ``asyncio.run()`` internally, which explodes here — the whole CLI
     already runs inside ``asyncio.run(cli.main())`` (bootstrap_entry). So drive uvicorn's Server
     directly and await it on the loop we are already on.
+
+    ``dev`` reverse-proxies the console to a live Vite dev server started from ``web/``.
     """
     import uvicorn
 
@@ -1033,14 +1065,18 @@ async def serve_async(host: str | None = None, port: int | None = None) -> None:
 
     print(f"tabvis agent console -> http://{host}:{port}/", flush=True)
     print(f"  POST http://{host}:{port}/agent   (SSE)   GET /agents  (manage)", flush=True)
+    if dev:
+        print("  --dev: console served live from web/ via Vite (HMR); edits reload in the browser", flush=True)
 
-    config = uvicorn.Config(create_app(auth_required=auth_required), host=host, port=port, log_level="warning")
+    config = uvicorn.Config(
+        create_app(auth_required=auth_required, dev=dev), host=host, port=port, log_level="warning"
+    )
     await uvicorn.Server(config).serve()
 
 
-def serve(host: str | None = None, port: int | None = None) -> None:
+def serve(host: str | None = None, port: int | None = None, dev: bool = False) -> None:
     """Blocking entry for contexts with no running loop (``python -m tabvis.browser.server``)."""
-    asyncio.run(serve_async(host, port))
+    asyncio.run(serve_async(host, port, dev=dev))
 
 
 if __name__ == "__main__":  # `python -m tabvis.browser.server`

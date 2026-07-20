@@ -27,7 +27,8 @@ async def main() -> None:
     profile_checkpoint("cli_entry")
 
     # Fast-path for --serve: run the HTTP/SSE agent server instead of a one-shot turn.
-    #   tabvis --serve [--host H] [--port N]
+    #   tabvis --serve [--host H] [--port N] [--dev]
+    #   --dev serves the console live from web/ via Vite (HMR); default serves the built bundle.
     if args and args[0] == "--serve":
         from tabvis.utils.config import enable_configs
 
@@ -43,8 +44,12 @@ async def main() -> None:
         # await on the loop we're already on — uvicorn.run() would try to open a second one.
         from tabvis.browser.server import serve_async
 
+        from tabvis.utils.env_utils import is_env_truthy
+
         port_raw = _flag("--port")
-        await serve_async(host=_flag("--host"), port=int(port_raw) if port_raw else None)
+        # --dev (or TABVIS_WEB_DEV=1): serve the console live from web/ via Vite (HMR), not the build.
+        dev = "--dev" in args or is_env_truthy(os.environ.get("TABVIS_WEB_DEV"))
+        await serve_async(host=_flag("--host"), port=int(port_raw) if port_raw else None, dev=dev)
         return
 
     # Fast-path for --dump-system-prompt: output the rendered system prompt and exit.
