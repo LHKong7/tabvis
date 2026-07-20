@@ -113,6 +113,25 @@ export interface Workspace {
   idle_seconds?: number
 }
 
+export interface DriverInfo {
+  key: string
+  label: string
+  kernel: string
+  browser_type: string
+  mode: string
+  stealth: boolean
+  requires?: string | null
+  category: 'playwright' | 'system' | 'stealth' | 'remote'
+  installable: boolean
+  installed: boolean | null
+  hint: string
+}
+
+export interface DriversResponse {
+  playwright_installed: boolean
+  drivers: DriverInfo[]
+}
+
 // A rendered line in the live stream panel.
 export interface Frame {
   event: string

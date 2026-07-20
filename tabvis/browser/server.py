@@ -527,6 +527,55 @@ def create_app(auth_required: bool = False, dev: bool = False) -> Any:
         # Hand back the new readiness so the console can clear its warning immediately.
         return JSONResponse({**result, "config": config_readiness()})
 
+    async def list_drivers_route(_request: Request) -> JSONResponse:
+        """The browser-driver catalog with per-driver install state (for the console's driver picker)."""
+        from tabvis.browser.drivers import list_drivers
+
+        return JSONResponse(await list_drivers())
+
+    async def install_driver_route(request: Request) -> Any:
+        """Download a Playwright browser (chromium/firefox/webkit) via `playwright install`, streaming
+        progress back as SSE (event: progress | result | done).
+
+        Loopback-only, like config writes: running an install subprocess is a privileged action, so a
+        remote unauthenticated client must not be able to trigger it.
+        """
+        host = request.client.host if request.client else None
+        if not config_api.writes_allowed(host):
+            return JSONResponse(
+                {"error": "driver install is only allowed from localhost."}, status_code=403
+            )
+        try:
+            payload = await request.json()
+        except Exception:  # noqa: BLE001
+            return JSONResponse({"error": "body must be JSON"}, status_code=400)
+
+        from tabvis.browser.drivers import INSTALLABLE, install_browser_stream
+
+        browser = (payload.get("browser") or "").strip().lower()
+        if browser not in INSTALLABLE:  # clean 400 before switching to the event stream
+            return JSONResponse(
+                {
+                    "error": f"'{browser}' is not a downloadable Playwright browser "
+                    f"(choose one of {', '.join(INSTALLABLE)})."
+                },
+                status_code=400,
+            )
+
+        async def events() -> Any:
+            async for ev in install_browser_stream(browser):
+                kind = ev.get("type")
+                if kind == "progress":
+                    yield _sse("progress", {"text": ev.get("text", "")})
+                elif kind == "result":
+                    yield _sse(
+                        "result",
+                        {k: ev.get(k) for k in ("ok", "browser", "installed", "message")},
+                    )
+            yield _sse("done", {})
+
+        return EventSourceResponse(events())
+
     async def list_browsers(_request: Request) -> JSONResponse:
         """Every persistent browser workspace still open (they outlive the runs that used them)."""
         ws = list_workspaces()
@@ -994,6 +1043,8 @@ def create_app(auth_required: bool = False, dev: bool = False) -> Any:
         ("/agents/{agent_id}/identity", agent_identity, ["GET"]),
         # Persistent browser workspaces — they outlive individual runs.
         ("/browsers", list_browsers, ["GET"]),
+        ("/browsers/drivers", list_drivers_route, ["GET"]),
+        ("/browsers/install", install_driver_route, ["POST"]),
         ("/browsers/close", close_browser_route, ["POST"]),
         ("/browser/session", browser_session, ["GET"]),
     ]

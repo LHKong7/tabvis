@@ -3,6 +3,7 @@ import type {
   AgentSummary,
   BrowserView,
   ConfigResponse,
+  DriversResponse,
   Health,
   Workspace,
 } from './types'
@@ -34,6 +35,7 @@ export const api = {
       body: JSON.stringify({ values }),
     }).then(asResult),
   browsers: (): Promise<{ browsers: Workspace[] }> => fetch('/browsers').then((r) => r.json()),
+  drivers: (): Promise<DriversResponse> => fetch('/browsers/drivers').then((r) => r.json()),
   closeBrowser: (body: Record<string, unknown>): Promise<Result> =>
     fetch('/browsers/close', {
       method: 'POST',
@@ -101,4 +103,60 @@ export async function runAgent(
       }
     }
   }
+}
+
+
+// --- driver install progress (SSE over POST, read like runAgent) ---
+
+export interface DriverInstallResult {
+  ok: boolean
+  browser: string
+  installed: boolean
+  message: string
+}
+
+// Stream `playwright install <browser>`: onEvent('progress'|'result'|'done', data) fires per SSE
+// frame; resolves with the final result (or null if none arrived).
+export async function installDriverStream(
+  browser: string,
+  onEvent: (event: string, data: any) => void,
+): Promise<DriverInstallResult | null> {
+  const res = await fetch('/browsers/install', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ browser }),
+  })
+  if (!res.ok) {
+    const e = await res.json().catch(() => ({}))
+    throw new Error(e.error || `HTTP ${res.status}`)
+  }
+  const reader = res.body!.getReader()
+  const dec = new TextDecoder()
+  let buf = ''
+  let result: DriverInstallResult | null = null
+  for (;;) {
+    const { done, value } = await reader.read()
+    if (done) break
+    buf += dec.decode(value, { stream: true })
+    const parts = buf.split(/\r?\n\r?\n/)
+    buf = parts.pop() ?? ''
+    for (const part of parts) {
+      let ev = 'message'
+      let data = ''
+      for (const raw of part.split(/\r?\n/)) {
+        const line = raw.trimEnd()
+        if (line.startsWith('event:')) ev = line.slice(6).trim()
+        else if (line.startsWith('data:')) data += line.slice(5).trim()
+      }
+      if (!data) continue
+      try {
+        const d = JSON.parse(data)
+        if (ev === 'result') result = d
+        onEvent(ev, d)
+      } catch {
+        /* skip bad frame */
+      }
+    }
+  }
+  return result
 }

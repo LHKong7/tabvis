@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from 'react'
-import type { EngineInfo, HealthConfig, Setting, Workspace } from '../types'
-import { api } from '../api'
+import type { DriverInfo, EngineInfo, HealthConfig, Setting, Workspace } from '../types'
+import { api, installDriverStream } from '../api'
 import { Code } from './Code'
 
 const MODE_LABEL: Record<string, string> = {
@@ -28,6 +28,10 @@ export function Driver({ open, config, onChanged }: Props) {
   const [err, setErr] = useState<string | null>(null)
   const [note, setNote] = useState<string | null>(null) // transient success line
   const [busy, setBusy] = useState(false)
+  const [drivers, setDrivers] = useState<DriverInfo[] | null>(null) // GET /browsers/drivers
+  const [installing, setInstalling] = useState<string | null>(null) // browser being downloaded
+  const [installProgress, setInstallProgress] = useState<string | null>(null) // latest SSE line
+  const [driverNote, setDriverNote] = useState<string | null>(null)
 
   const engine = config?.browser_engine || 'chromium'
   const writable = cfg?.writable !== false
@@ -45,9 +49,19 @@ export function Driver({ open, config, onChanged }: Props) {
       .catch(() => setErr('could not load driver config'))
   }, [])
 
+  const loadDrivers = useCallback(() => {
+    api
+      .drivers()
+      .then((d) => setDrivers(d.drivers || []))
+      .catch(() => {})
+  }, [])
+
   useEffect(() => {
-    if (open) loadCfg()
-  }, [open, loadCfg])
+    if (open) {
+      loadCfg()
+      loadDrivers()
+    }
+  }, [open, loadCfg, loadDrivers])
 
   // Poll the live workspaces only while the panel is open.
   useEffect(() => {
@@ -110,6 +124,34 @@ export function Driver({ open, config, onChanged }: Props) {
       .browsers()
       .then((d) => setWs(d.browsers || []))
       .catch(() => {})
+  }
+
+  // Download a Playwright browser (chromium/firefox/webkit) via the server (`playwright install`),
+  // streaming progress lines over SSE as it downloads.
+  const installDriver = async (browser: string) => {
+    setInstalling(browser)
+    setInstallProgress(null)
+    setDriverNote(null)
+    setErr(null)
+    try {
+      const result = await installDriverStream(browser, (event, d) => {
+        if (event === 'progress') setInstallProgress(d.text)
+      })
+      setInstalling(null)
+      setInstallProgress(null)
+      if (result?.ok) {
+        setDriverNote(`${browser} installed.`)
+        setTimeout(() => setDriverNote(null), 4000)
+        loadDrivers()
+        onChanged?.()
+      } else {
+        setErr(result?.message || `could not install ${browser}`)
+      }
+    } catch (e: any) {
+      setInstalling(null)
+      setInstallProgress(null)
+      setErr(e.message || `could not install ${browser}`)
+    }
   }
 
   const stealth = (cfg?.settings || []).filter((s) => s.group === 'Stealth')
@@ -265,6 +307,47 @@ export function Driver({ open, config, onChanged }: Props) {
             </>
           )
         })()}
+
+        <div className="grp">
+          <h3>Browser drivers{drivers ? ` (${drivers.length})` : ''}</h3>
+          {driverNote && <p className="saved mt12">✓ {driverNote}</p>}
+          {installing && (
+            <p className="hint mt12">
+              ⏳ downloading {installing}: {installProgress || 'starting…'}
+            </p>
+          )}
+          {drivers == null ? (
+            <div className="muted">Loading…</div>
+          ) : (
+            <div className="wslist">
+              {drivers.map((d) => (
+                <div className="ws" key={d.key}>
+                  <div className="wsmain">
+                    <div className="wstop">
+                      <span className="wsname">{d.label}</span>
+                      <span className="badge">{d.category}</span>
+                      {d.installed === true && <span className="isset">installed</span>}
+                      {d.installed === false && <span className="drv">not installed</span>}
+                      {d.key === engine && <span className="badge b-chromium">active</span>}
+                    </div>
+                    <div className="wsmeta">{d.hint}</div>
+                  </div>
+                  {d.installable && d.installed !== true && (
+                    <button
+                      className="primary"
+                      type="button"
+                      disabled={!!installing || !writable}
+                      title={writable ? 'Download this browser' : 'read-only (localhost only)'}
+                      onClick={() => installDriver(d.browser_type)}
+                    >
+                      {installing === d.browser_type ? 'Downloading…' : 'Download'}
+                    </button>
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
 
         <div className="grp">
           <h3>
