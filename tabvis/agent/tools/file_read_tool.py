@@ -305,10 +305,66 @@ async def _read_image_data(resolved_file_path: str) -> dict[str, Any]:
     return {"type": "image_unavailable", "file": {"filePath": resolved_file_path}}
 
 
-def _read_pdf_stub(resolved_file_path: str, pages: str | None) -> Any:
-    raise NotImplementedError(
-        "PDF reading is not yet implemented (requires PDF text extraction support)."
-    )
+async def _read_pdf_data(resolved_file_path: str, pages: str | None) -> dict[str, Any]:  # noqa: ARG001
+    """Read a PDF for the active model.
+
+    - Anthropic vision model → the PDF as a native ``document`` block (best fidelity; no poppler).
+    - Any other vision model → pages rasterized to images (needs poppler ``pdftoppm``).
+    - Text-only model → pages rasterized then OCR'd (needs poppler + an OCR engine).
+    - Otherwise → a clear 'unavailable' note (the file is still saved in the workspace).
+    """
+    import base64 as _b64
+    import glob as _glob
+
+    from tabvis.agent.api.providers import resolve_provider_name
+    from tabvis.utils.model.model import get_main_loop_model, get_model_supports_vision
+    from tabvis.utils.pdf import extract_pdf_pages, read_pdf
+
+    model = get_main_loop_model()
+    provider = resolve_provider_name(model)
+    vision = get_model_supports_vision(model, provider)
+
+    # Anthropic vision + native PDF support → send the validated PDF as a document block (no poppler).
+    if vision and provider == "anthropic" and is_pdf_supported():
+        res = await read_pdf(resolved_file_path)
+        if res.get("success"):
+            return {"type": "pdf_document", "file": res["data"]["file"]}
+        err = res.get("error") or {}
+        if err.get("reason") in ("empty", "invalid", "too_large", "corrupted", "password_protected"):
+            return {"type": "pdf_unavailable", "file": {"filePath": resolved_file_path, "reason": err.get("message")}}
+        # else (e.g. transient) fall through to rasterization
+
+    # Rasterize the pages to JPEGs (needs poppler pdftoppm).
+    res = await extract_pdf_pages(resolved_file_path, None)
+    if res.get("success"):
+        out = res["data"]["file"]
+        page_paths = sorted(_glob.glob(os.path.join(out["outputDir"], "*.jpg")))
+        if vision:
+            images = []
+            for p in page_paths:
+                with open(p, "rb") as fh:
+                    images.append({"data": _b64.b64encode(fh.read()).decode("ascii"), "media_type": "image/jpeg"})
+            return {"type": "pdf_images", "file": {"filePath": resolved_file_path, "count": out["count"], "images": images}}
+        from tabvis.utils import ocr
+
+        if ocr.ocr_enabled() and ocr.ocr_available():
+            chunks = []
+            for i, p in enumerate(page_paths, 1):
+                with open(p, "rb") as fh:
+                    txt = await asyncio.to_thread(ocr.ocr_image_bytes, fh.read(), "image/jpeg")
+                chunks.append(f"--- page {i} ---\n{(txt or '').strip()}")
+            return {"type": "pdf_ocr", "file": {"filePath": resolved_file_path, "count": out["count"], "text": "\n\n".join(chunks)}}
+        return {
+            "type": "pdf_unavailable",
+            "file": {
+                "filePath": resolved_file_path,
+                "reason": "the active model has no vision and no OCR engine is installed "
+                "(uv sync --extra ocr, or a tesseract binary)",
+            },
+        }
+
+    reason = (res.get("error") or {}).get("message", "the PDF could not be processed")
+    return {"type": "pdf_unavailable", "file": {"filePath": resolved_file_path, "reason": reason}}
 
 
 def _create_user_message(content: Any, *, is_meta: bool = False) -> dict[str, Any]:
@@ -839,6 +895,57 @@ class FileReadTool(Tool):
                 "content": f"Notebook read: {data['file']['filePath']} ({len(cells)} cells)",
             }
 
+        if data_type == "pdf_document":
+            # Anthropic-native PDF: hand the model the document block directly.
+            return {
+                "tool_use_id": tool_use_id,
+                "type": "tool_result",
+                "content": [
+                    {
+                        "type": "document",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "application/pdf",
+                            "data": data["file"]["base64"],
+                        },
+                    }
+                ],
+            }
+
+        if data_type == "pdf_images":
+            file = data["file"]
+            blocks: list[dict[str, Any]] = [
+                {"type": "text", "text": f"[PDF {file['filePath']} — {file['count']} page(s) rendered to images]"}
+            ]
+            for img in file["images"]:
+                blocks.append(
+                    {"type": "image", "source": {"type": "base64", "media_type": img["media_type"], "data": img["data"]}}
+                )
+            return {"tool_use_id": tool_use_id, "type": "tool_result", "content": blocks}
+
+        if data_type == "pdf_ocr":
+            file = data["file"]
+            body = (file.get("text") or "").strip()
+            content_str = (
+                f"[PDF {file['filePath']} — {file['count']} page(s), OCR'd because the active model "
+                f"has no vision]\n\n{body}"
+                if body
+                else f"[PDF {file['filePath']} — OCR found no machine-readable text.]"
+            )
+            return {"tool_use_id": tool_use_id, "type": "tool_result", "content": content_str}
+
+        if data_type == "pdf_unavailable":
+            file = data["file"]
+            return {
+                "tool_use_id": tool_use_id,
+                "type": "tool_result",
+                "content": (
+                    f"Cannot read PDF {file['filePath']}: {file.get('reason', '')}. Use an Anthropic "
+                    f"vision model, or install poppler (`brew install poppler` / `apt install "
+                    f"poppler-utils`) to render pages for image/OCR reading."
+                ),
+            }
+
         if data_type == "pdf":
             return {
                 "tool_use_id": tool_use_id,
@@ -923,7 +1030,7 @@ async def _call_inner(
 
     # --- PDF ---
     if is_pdf_extension(ext):
-        _read_pdf_stub(resolved_file_path, pages)  # raises NotImplementedError
+        return ToolResult(data=await _read_pdf_data(resolved_file_path, pages))
 
     # --- Text file (single async read via read_file_in_range) ---
     line_offset = 0 if offset == 0 else offset - 1

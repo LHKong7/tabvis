@@ -72,6 +72,12 @@ SETTINGS: tuple[Setting, ...] = (
     Setting("TABVIS_BROWSER_TIMEOUT_MS", "Timeout (ms)", "Browser", "number",
             "Per browser operation.", "30000"),
 
+    Setting("TABVIS_WORKSPACE_DIR", "Download workspace", "Browser", "text",
+            "Where browser downloads and fetched web PDFs are saved so the agent can Read them. "
+            "Blank = per-session default (<config-home>/projects/<cwd>/<session-id>/workspace/). "
+            "Set an absolute path to use one fixed folder for every run.",
+            "~/tabvis-downloads"),
+
     # Request pacing — keep the agent a polite client so a rapid navigate/click loop can't burst or
     # DoS a server. Only navigations and clicks to a REAL remote host are paced; localhost and
     # host-less URLs (data:, about:blank) are exempt.

@@ -57,6 +57,7 @@ BROWSER_SNAPSHOT_TOOL_NAME = "BrowserSnapshot"  # tabvis.agent.tools.browser_sna
 BROWSER_CLICK_TOOL_NAME = "BrowserClick"  # tabvis.agent.tools.browser_click_tool
 BROWSER_TYPE_TOOL_NAME = "BrowserType"  # tabvis.agent.tools.browser_type_tool
 BROWSER_WAIT_TOOL_NAME = "BrowserWait"  # tabvis.agent.tools.browser_wait_tool
+BROWSER_DOWNLOAD_TOOL_NAME = "BrowserDownload"  # tabvis.agent.tools.browser_download_tool
 BROWSER_INTENT_TOOL_NAME = "BrowserIntent"  # tabvis.agent.tools.browser_intent_tool (flag-gated: TABVIS_BROWSER_INTENTS)
 
 # ``SHELL_TOOL_NAMES`` (utils/shell/shellToolUtils): [BASH_TOOL_NAME, POWERSHELL_TOOL_NAME].

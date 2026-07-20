@@ -38,6 +38,7 @@ import re
 import sys
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any
+from urllib.parse import urlparse
 
 from tabvis.browser.rate_limiter import get_request_pacer, host_of
 from tabvis.browser.session import utc_now
@@ -225,6 +226,11 @@ class BrowserService:
         self._resolved_executable: str | None = None
         # cloak engine only: the patched Chromium we resolved (and, on first run, downloaded).
         self._cloak_binary: str | None = None
+        # Files saved into the download workspace (browser downloads + fetched web PDFs). Surfaced to
+        # the agent via observe() so it knows where to Read them. _downloads_reported tracks how many
+        # have already been announced so each is reported once.
+        self._downloads: list[dict[str, Any]] = []
+        self._downloads_reported = 0
 
     # ------------------------------------------------------------------ lifecycle
 
@@ -410,6 +416,7 @@ class BrowserService:
             "executable_path": cfg.executable_path or None,
             "viewport": {"width": cfg.viewport[0], "height": cfg.viewport[1]},
             "args": cfg.launch_args or None,
+            "accept_downloads": True,  # captured to the workspace via _on_download
         }
         # A ``channel`` is a Chromium-only concept, and channel="chromium" is the sentinel for "the
         # bundled build", selected by passing NO channel. Firefox/WebKit have no channels at all.
@@ -628,6 +635,8 @@ class BrowserService:
         # A popup / target=_blank / window.open — make it the active page and de-register on close.
         self._active_page = page
         page.on("close", lambda: self._on_page_close(page))
+        # Capture every browser download into the workspace (see downloads.py).
+        page.on("download", self._on_download)
         # OBS-6: attach observation producers (download / console). No-op unless the bus is on;
         # fully best-effort so it can never affect page tracking.
         try:
@@ -637,6 +646,70 @@ class BrowserService:
             attach_page_producers(page, agent_id=current_agent_id())
         except Exception:  # noqa: BLE001
             pass
+
+    # ------------------------------------------------------------------ downloads / workspace
+
+    def _record_download(self, path: str, url: str | None, kind: str) -> dict[str, Any]:
+        entry = {"path": path, "url": url, "filename": os.path.basename(path), "kind": kind}
+        self._downloads.append(entry)
+        log_for_debugging(f"[BROWSER] saved {kind} to workspace: {path}")
+        return entry
+
+    def _on_download(self, download: Any) -> None:
+        """Playwright download event — save the file into the workspace off the event loop."""
+        task = asyncio.ensure_future(self._save_download(download))
+        # Keep a reference so the task isn't GC'd mid-flight; drop it when done.
+        self._download_tasks = getattr(self, "_download_tasks", set())
+        self._download_tasks.add(task)
+        task.add_done_callback(self._download_tasks.discard)
+
+    async def _save_download(self, download: Any) -> None:
+        from tabvis.browser.downloads import get_workspace_dir, unique_path
+
+        try:
+            dest = unique_path(get_workspace_dir(), getattr(download, "suggested_filename", None))
+            await download.save_as(dest)
+            self._record_download(dest, getattr(download, "url", None), "download")
+        except Exception as e:  # noqa: BLE001 - a failed download must never break the run
+            log_for_debugging(f"[BROWSER] download save failed: {e}")
+
+    async def _capture_pdf_navigation(self, response: Any, url: str) -> None:
+        """If a navigation landed on a PDF, save its bytes to the workspace (Chromium would only
+        render it in the built-in viewer, which the accessibility snapshot can't read)."""
+        if response is None:
+            return
+        try:
+            ctype = (response.headers or {}).get("content-type", "") if hasattr(response, "headers") else ""
+            is_pdf = "application/pdf" in ctype.lower() or urlparse(url).path.lower().endswith(".pdf")
+            if not is_pdf:
+                return
+            body = await response.body()
+            from tabvis.browser.downloads import filename_from_url, get_workspace_dir, unique_path
+
+            dest = unique_path(get_workspace_dir(), filename_from_url(url, "page.pdf"))
+            with open(dest, "wb") as fh:
+                fh.write(body)
+            self._record_download(dest, url, "pdf")
+        except Exception as e:  # noqa: BLE001 - best-effort; the page still rendered
+            log_for_debugging(f"[BROWSER] pdf capture failed: {e}")
+
+    async def download(self, url: str, *, filename: str | None = None) -> dict[str, Any]:
+        """Fetch ``url`` through the browser context (so cookies/auth apply) into the workspace."""
+        from tabvis.browser.downloads import filename_from_url, get_workspace_dir, unique_path
+
+        async with self._action_lock:
+            if self._context is None:
+                raise BrowserError("Browser is not running.")
+            await get_request_pacer().pace(host_of(url), counts_as_request=True)
+            resp = await self._context.request.get(url)
+            if not resp.ok:
+                raise BrowserError(f"Download failed: HTTP {resp.status} for {url}")
+            body = await resp.body()
+            dest = unique_path(get_workspace_dir(), filename or filename_from_url(url))
+            with open(dest, "wb") as fh:
+                fh.write(body)
+            entry = self._record_download(dest, url, "download")
+            return {"downloaded": entry, "workspace": get_workspace_dir()}
 
     def _on_page_close(self, page: Page) -> None:
         if self._active_page is page:
@@ -713,6 +786,19 @@ class BrowserService:
             "title": await _safe_title(page),
             "tab_count": len([p for p in self._pages() if not p.is_closed()]),
         }
+
+        # Announce any files saved to the workspace since the last observation, and tell the agent to
+        # Read them — this is how "download the file, then evaluate it" surfaces (downloads.py).
+        new_downloads = self._downloads[self._downloads_reported :]
+        if new_downloads:
+            self._downloads_reported = len(self._downloads)
+            data["downloads"] = new_downloads
+            lines = "\n".join(f"  - {d['path']}" for d in new_downloads)
+            data["snapshot"] = (
+                f"<system-reminder>Saved {len(new_downloads)} file(s) to the download workspace. "
+                f"Use the Read tool on a path to evaluate its contents:\n{lines}</system-reminder>\n"
+                + text
+            )
 
         # Decide whether the aria tree carried enough on its own.
         thin = _aria_is_thin(text) and is_browser_auto_visual()
@@ -894,9 +980,11 @@ class BrowserService:
             await get_request_pacer().pace(nav_host, counts_as_request=True)
             timeout = self._timeout_s()
             if action == "goto":
-                await asyncio.wait_for(
+                response = await asyncio.wait_for(
                     page.goto(url, wait_until=wait_until), timeout=timeout
                 )
+                # A PDF renders in Chromium's viewer (unreadable via aria) — grab it to the workspace.
+                await self._capture_pdf_navigation(response, url)
             elif action == "back":
                 await asyncio.wait_for(page.go_back(wait_until=wait_until), timeout=timeout)
             elif action == "forward":

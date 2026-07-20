@@ -18,6 +18,7 @@ from tabvis.tool import Tool, Tools
 from tabvis.agent.tools.ask_user_question_tool import ask_user_question_tool as _ask_user_question_tool
 from tabvis.agent.tools.bash_tool import bash_tool as _bash_tool
 from tabvis.agent.tools.browser_click_tool import browser_click_tool as _browser_click_tool
+from tabvis.agent.tools.browser_download_tool import browser_download_tool as _browser_download_tool
 from tabvis.agent.tools.browser_intent_tool import browser_intent_tool as _browser_intent_tool
 from tabvis.agent.tools.browser_navigate_tool import browser_navigate_tool as _browser_navigate_tool
 from tabvis.agent.tools.browser_snapshot_tool import browser_snapshot_tool as _browser_snapshot_tool
@@ -68,6 +69,7 @@ def get_all_base_tools() -> list[Tool]:
         _browser_click_tool,
         _browser_type_tool,
         _browser_wait_tool,
+        _browser_download_tool,
         _browser_intent_tool,  # flag-gated (TABVIS_BROWSER_INTENTS); is_enabled() filters it off by default
         _todo_write_tool,
         _ask_user_question_tool,

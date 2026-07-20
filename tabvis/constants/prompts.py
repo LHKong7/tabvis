@@ -368,6 +368,22 @@ async def compute_simple_env_info(
     cwd = get_cwd()
     is_worktree = False
 
+    # The download workspace: where browser downloads + fetched web PDFs are saved. Tell the agent
+    # the path so it can read/manipulate/reference those files (it is an allowed working directory).
+    try:
+        from tabvis.browser.downloads import get_workspace_dir
+
+        _workspace_dir: str | None = get_workspace_dir()
+    except Exception:  # noqa: BLE001 - env info must never fail to render
+        _workspace_dir = None
+    workspace_line = (
+        f"Download workspace: {_workspace_dir} — browser downloads and web PDFs the browser fetches "
+        f"are saved here. Read, edit, move, or reference these files with the file tools; it is an "
+        f"allowed working directory."
+        if _workspace_dir
+        else None
+    )
+
     env_items: list[str | list[str] | None] = [
         f"Primary working directory: {cwd}",
         (
@@ -383,6 +399,7 @@ async def compute_simple_env_info(
             else None
         ),
         (additional_working_directories if additional_working_directories else None),
+        workspace_line,
         f"Platform: {sys.platform}",
         _get_shell_info_line(),
         f"OS Version: {uname_sr}",

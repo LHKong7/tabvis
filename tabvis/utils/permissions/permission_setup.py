@@ -727,6 +727,21 @@ async def initialize_tool_permission_context(
             "source": "session",
         }
 
+    # Grant the file tools access to the download workspace (browser downloads + fetched web PDFs
+    # land here; the agent reads/manipulates/references them). The per-session default lives outside
+    # the cwd, so it must be registered as an allowed working directory. Best-effort — never block
+    # setup, and never let a browser-layer import failure break permission setup.
+    try:
+        from tabvis.browser.downloads import get_workspace_dir
+
+        workspace_dir = get_workspace_dir(create=True)
+        additional_working_directories[workspace_dir] = {
+            "path": workspace_dir,
+            "source": "session",
+        }
+    except Exception:  # noqa: BLE001
+        pass
+
     # Check if bypassPermissions mode is available (not disabled by Statsig gate or settings).
     # Use cached values to avoid blocking on startup.
     growth_book_disable_bypass_permissions_mode = False
