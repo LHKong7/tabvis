@@ -30,3 +30,10 @@ htmlcov/
 *.swp
 .idea/
 .vscode/
+
+# Node / web console (source in web/, builds to tabvis/browser/static/index.html)
+node_modules/
+web/dist/
+*.tsbuildinfo
+# NOTE: web/package-lock.json IS committed (locks JS deps, like uv.lock);
+#       tabvis/browser/static/index.html IS committed (the built console the server ships).
