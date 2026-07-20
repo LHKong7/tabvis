@@ -72,6 +72,23 @@ SETTINGS: tuple[Setting, ...] = (
     Setting("TABVIS_BROWSER_TIMEOUT_MS", "Timeout (ms)", "Browser", "number",
             "Per browser operation.", "30000"),
 
+    # Request pacing — keep the agent a polite client so a rapid navigate/click loop can't burst or
+    # DoS a server. Only navigations and clicks to a REAL remote host are paced; localhost and
+    # host-less URLs (data:, about:blank) are exempt.
+    Setting("TABVIS_BROWSER_MIN_REQUEST_INTERVAL_MS", "Min request interval (ms)", "Browser", "number",
+            "Minimum gap between navigations/clicks to the SAME host. 0 disables per-host pacing.",
+            "1000", default="1000"),
+    Setting("TABVIS_BROWSER_MAX_REQUESTS_PER_MINUTE", "Max requests/min per host", "Browser", "number",
+            "Hard per-host burst ceiling (a token bucket over a 60s window). 0 = no ceiling.",
+            "0", default="0"),
+    Setting("TABVIS_BROWSER_MIN_ACTION_INTERVAL_MS", "Min action interval (ms)", "Browser", "number",
+            "Minimum gap between ANY two browser actions (navigate/click/type), across all agents. "
+            "0 disables. Use this to stop machine-gun clicking regardless of host.",
+            "0", default="0"),
+    Setting("TABVIS_BROWSER_REQUEST_JITTER_MS", "Request jitter (ms)", "Browser", "number",
+            "Random 0..N ms added to each paced slot so concurrent agents don't fire in lockstep.",
+            "0", default="0"),
+
     # Stealth — read only when the engine is 'cloak'. The license key is a `secret`: like the API
     # key it is write-only, so the console can set it but no endpoint ever reads it back.
     Setting("TABVIS_BROWSER_CLOAK_LICENSE_KEY", "CloakBrowser Pro key", "Stealth", "secret",
@@ -102,6 +119,23 @@ SETTINGS: tuple[Setting, ...] = (
 
     Setting("TABVIS_SERVER_MAX_AGENTS", "Max agents", "Server", "number",
             "Each running agent is one real Chromium process.", "4"),
+
+    # Vision / OCR — how images reach the model. Multimodal models get native image input; a
+    # text-only model can't, so tabvis OCRs images to text when an OCR engine is available.
+    Setting("TABVIS_MODEL_SUPPORTS_VISION", "Force vision support", "Vision / OCR", "text",
+            "Blank = auto-detect from the model id. Set 1 to force native image input (a custom "
+            "multimodal endpoint whose id can't reveal it), or 0 to force the OCR/text path.",
+            "1"),
+    Setting("TABVIS_OCR_ENABLED", "OCR fallback", "Vision / OCR", "bool",
+            "For NON-vision models, extract text from images with Tesseract and send that instead. "
+            "Off = images are dropped with a short note. Needs an OCR engine: `uv sync --extra ocr`, "
+            "or a tesseract binary on PATH.",
+            default="1"),
+    Setting("TABVIS_OCR_LANG", "OCR language(s)", "Vision / OCR", "text",
+            "Tesseract language code(s), e.g. eng or eng+chi_sim. Extra languages need their "
+            "traineddata installed (macOS `brew install tesseract-lang`, Ubuntu "
+            "`apt install tesseract-ocr-chi-sim`). Unavailable languages fall back to an installed one.",
+            "eng", default="eng"),
 )
 
 BY_KEY = {s.key: s for s in SETTINGS}

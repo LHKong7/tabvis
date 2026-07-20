@@ -39,6 +39,7 @@ import sys
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any
 
+from tabvis.browser.rate_limiter import get_request_pacer, host_of
 from tabvis.browser.session import utc_now
 from tabvis.utils.browser_config import (
     BrowserLaunchConfig,
@@ -876,11 +877,21 @@ class BrowserService:
 
     # ------------------------------------------------------------------ actions
 
+    def _current_url(self) -> str | None:
+        page = self._active_page
+        try:
+            return page.url if page is not None and not page.is_closed() else None
+        except Exception:  # noqa: BLE001 — url access on a torn-down page
+            return None
+
     async def navigate(
         self, url: str, *, action: str = "goto", wait_until: str = "load"
     ) -> dict[str, Any]:
         async with self._action_lock:
             page = self.active_page
+            # Pace requests so a rapid navigation loop can't burst / DoS a host.
+            nav_host = host_of(url) if action == "goto" else host_of(page.url)
+            await get_request_pacer().pace(nav_host, counts_as_request=True)
             timeout = self._timeout_s()
             if action == "goto":
                 await asyncio.wait_for(
@@ -967,6 +978,8 @@ class BrowserService:
     async def click(self, ref: str, *, double: bool = False) -> dict[str, Any]:
         async with self._action_lock:
             locator = await self._resolve_visible(ref)
+            # A click frequently triggers a request (link/submit/XHR); pace it per host too.
+            await get_request_pacer().pace(host_of(self._current_url()), counts_as_request=True)
             timeout = self._action_timeout_s()
             if double:
                 await asyncio.wait_for(locator.dblclick(), timeout=timeout)
@@ -979,6 +992,8 @@ class BrowserService:
     ) -> dict[str, Any]:
         async with self._action_lock:
             locator = await self._resolve_visible(ref)
+            # Typing itself is no request; submitting (Enter) navigates, so pace that per host.
+            await get_request_pacer().pace(host_of(self._current_url()), counts_as_request=submit)
             # Scales with len(text) — a humanized keystroke-by-keystroke fill takes far longer than
             # a plain one, and a flat cap would cancel it mid-word (see _action_timeout_s).
             timeout = self._action_timeout_s(len(text))

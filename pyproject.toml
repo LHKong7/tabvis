@@ -34,6 +34,14 @@ camoufox = ["camoufox>=0.4"]
 # hint if its package is missing rather than silently downgrading.
 openai = ["openai>=1.40"]
 gemini = ["google-genai>=0.3"]
+# OCR fallback for NON-multimodal models (a text-only LLM can't see an image, so image blocks are
+# OCR'd to text before the request — see tabvis/utils/ocr.py). Optional because vision-capable models
+# don't need it, and the layered engine also runs with just a `tesseract` binary on PATH; the Python
+# binding is only the fast in-process path. Needs the tesseract engine installed per OS (macOS `brew
+# install tesseract`, Debian/Ubuntu `apt install tesseract-ocr`, Windows `choco install tesseract`).
+# `tesserocr` builds against libtesseract/leptonica; on Windows `pip install pytesseract pillow` +
+# the binary is the easier route (the OCR layer auto-detects whichever is present).
+ocr = ["tesserocr>=2.6"]
 
 [project.scripts]
 tabvis = "tabvis.bootstrap_entry:main"

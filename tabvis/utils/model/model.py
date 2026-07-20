@@ -11,6 +11,8 @@ from __future__ import annotations
 import os
 import re
 
+from tabvis.utils.env_utils import is_env_truthy
+
 ModelName = str
 ModelShortName = str
 ModelAlias = str
@@ -165,3 +167,41 @@ def get_marketing_name_for_model(model_id: str) -> str | None:
     if "claude-3-5-haiku" in canonical:
         return "TABVIS Fast 3.5"
     return None
+
+
+# Substrings that mark a KNOWN text-only model (checked before the per-provider branches).
+_TEXT_ONLY_MARKERS = ("gpt-3.5", "gpt-35-turbo", "claude-instant", "claude-2", "claude-1", "text-embedding")
+# OpenAI ids that DO accept image input (the family is a mix, so it must be an allowlist).
+_OPENAI_VISION_MARKERS = (
+    "gpt-4o", "gpt-4.1", "gpt-4-turbo", "gpt-4-vision", "gpt-5", "chatgpt-4o", "o1", "o3", "o4", "omni",
+)
+
+
+def get_model_supports_vision(model: str, provider: str) -> bool:
+    """Whether ``model`` (driven by ``provider``: anthropic|openai|gemini) accepts image input.
+
+    There is no capability API for arbitrary / OpenAI-compatible endpoints, so this is a curated
+    heuristic with an explicit escape hatch: ``TABVIS_MODEL_SUPPORTS_VISION=1|0`` forces it — needed
+    for a custom multimodal endpoint (or a text-only one) whose id can't reveal its modality. Mirrors
+    the model-gated-fallback shape of :func:`tabvis.utils.pdf_utils.is_pdf_supported`.
+
+    ``provider`` is passed in (never inferred here) so this module keeps its zero dependency on the
+    agent/provider layer; callers already hold it via ``resolve_provider_name(model)``.
+    """
+    override = os.environ.get("TABVIS_MODEL_SUPPORTS_VISION")
+    if override is not None and override.strip() != "":
+        return is_env_truthy(override)
+
+    m = (model or "").strip().lower()
+    if any(t in m for t in _TEXT_ONLY_MARKERS):
+        return False
+    if provider == "openai":
+        return any(k in m for k in _OPENAI_VISION_MARKERS)
+    if provider == "gemini":
+        # gemini 1.5 / 2.x are multimodal; only the original text-only gemini(-1.0)-pro is not.
+        return not (m in ("gemini-pro", "gemini-1.0-pro") or "gemini-1.0-pro" in m)
+    if provider == "anthropic":
+        # Vision arrived with claude-3; claude-1/2/instant are handled above, so modern claude = yes.
+        return True
+    # Unknown provider -> assume text-only and route images through the OCR fallback.
+    return False

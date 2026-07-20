@@ -21,6 +21,7 @@ Casing: Python identifiers snake_case; the ``data``/``file`` payload dicts and t
 # ruff: noqa: E501
 from __future__ import annotations
 
+import asyncio
 import math
 import ntpath
 import os
@@ -264,10 +265,44 @@ def _read_notebook_stub(resolved_file_path: str) -> Any:
     )
 
 
-def _read_image_stub(resolved_file_path: str, max_tokens: int) -> Any:
-    raise NotImplementedError(
-        "Image reading is not yet implemented (requires native image processing support)."
-    )
+async def _read_image_data(resolved_file_path: str) -> dict[str, Any]:
+    """Read an image file for the active model.
+
+    Multimodal model  -> a native image block (the ``image`` result the mapper already understands).
+    Text-only model   -> OCR text if an OCR engine is available (``image_ocr``), else a clear
+                         'unavailable' note (``image_unavailable``). Image understanding is gated on
+                         vision-OR-OCR: with neither, the capability is simply not offered.
+    """
+    import base64
+
+    from tabvis.agent.api.providers import resolve_provider_name
+    from tabvis.utils.image_resizer import detect_image_format_from_buffer
+    from tabvis.utils.model.model import get_main_loop_model, get_model_supports_vision
+
+    def _read_bytes() -> bytes:
+        with open(resolved_file_path, "rb") as fh:
+            return fh.read()
+
+    raw = await asyncio.to_thread(_read_bytes)
+    media_type = detect_image_format_from_buffer(raw)
+
+    model = get_main_loop_model()
+    if get_model_supports_vision(model, resolve_provider_name(model)):
+        return {
+            "type": "image",
+            "file": {"base64": base64.b64encode(raw).decode("ascii"), "type": media_type},
+        }
+
+    from tabvis.utils import ocr
+
+    if ocr.ocr_enabled() and ocr.ocr_available():
+        text = await asyncio.to_thread(ocr.ocr_image_bytes, raw, media_type)
+        return {
+            "type": "image_ocr",
+            "file": {"filePath": resolved_file_path, "text": text or "", "mediaType": media_type},
+        }
+    ocr.warn_ocr_unavailable_once()
+    return {"type": "image_unavailable", "file": {"filePath": resolved_file_path}}
 
 
 def _read_pdf_stub(resolved_file_path: str, pages: str | None) -> Any:
@@ -768,6 +803,33 @@ class FileReadTool(Tool):
                 ],
             }
 
+        if data_type == "image_ocr":
+            # A non-vision model: the image was OCR'd to text (see _read_image_data).
+            file = data["file"]
+            text = (file.get("text") or "").strip()
+            if text:
+                content_str = (
+                    f"[Image read via OCR — the active model is not multimodal, so text was "
+                    f"extracted from {file['filePath']}]\n\n{text}"
+                )
+            else:
+                content_str = (
+                    f"[Image {file['filePath']} read via OCR — no machine-readable text was found. "
+                    f"The active model has no vision, so purely visual content cannot be described.]"
+                )
+            return {"tool_use_id": tool_use_id, "type": "tool_result", "content": content_str}
+
+        if data_type == "image_unavailable":
+            return {
+                "tool_use_id": tool_use_id,
+                "type": "tool_result",
+                "content": (
+                    f"Cannot read image {data['file']['filePath']}: the active model is not "
+                    f"multimodal and no OCR engine is installed. Install OCR (`uv sync --extra ocr`, "
+                    f"plus a tesseract binary) or switch to a vision-capable model."
+                ),
+            }
+
         if data_type == "notebook":
             # a minimal text result referencing the cell count so the block stays well-formed.
             cells = data["file"].get("cells", [])
@@ -857,7 +919,7 @@ async def _call_inner(
 
     # --- Image ---
     if ext in IMAGE_EXTENSIONS:
-        _read_image_stub(resolved_file_path, max_tokens)  # raises NotImplementedError
+        return ToolResult(data=await _read_image_data(resolved_file_path))
 
     # --- PDF ---
     if is_pdf_extension(ext):

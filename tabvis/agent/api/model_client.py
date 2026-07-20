@@ -28,7 +28,7 @@ from typing import Any
 import httpx
 
 from tabvis.agent.api.empty_usage import empty_usage
-from tabvis.agent.api.providers import get_model_gateway
+from tabvis.agent.api.providers import get_model_gateway, resolve_provider_name
 from tabvis.agent.api.errors import (
     API_ERROR_MESSAGE_PREFIX,
     get_assistant_message_from_error,
@@ -53,7 +53,7 @@ from tabvis.utils.messages import (
     normalize_content_from_api,
     normalize_messages_for_api,
 )
-from tabvis.utils.model.model import normalize_model_string_for_api
+from tabvis.utils.model.model import get_model_supports_vision, normalize_model_string_for_api
 from tabvis.utils.system_prompt_type import SystemPrompt
 from tabvis.utils.thinking import DISABLED_THINKING, ThinkingConfig
 
@@ -273,6 +273,94 @@ def build_system_prompt_blocks(
     return out
 
 
+def _blocks_have_image(blocks: list[Any]) -> bool:
+    for b in blocks:
+        if not isinstance(b, dict):
+            continue
+        if b.get("type") == "image":
+            return True
+        if b.get("type") == "tool_result" and isinstance(b.get("content"), list):
+            if _blocks_have_image(b["content"]):
+                return True
+    return False
+
+
+def _messages_have_image(api_messages: list[dict[str, Any]]) -> bool:
+    return any(
+        isinstance(m.get("content"), list) and _blocks_have_image(m["content"]) for m in api_messages
+    )
+
+
+async def _replace_images_for_nonvision_model(
+    api_messages: list[dict[str, Any]], model: str
+) -> list[dict[str, Any]]:
+    """When ``model`` has no vision, swap every image block for OCR text (or a short note).
+
+    Runs ONCE per request, before the retry loop — a vision model's messages pass through untouched.
+    Covers every image producer (browser screenshots, MCP results, pastes) because they all funnel
+    into this canonical, Anthropic-shaped ``api_messages`` before the provider adapters. Only the
+    affected messages/blocks are copied, so the shared conversation history is never mutated — a
+    later switch to a vision-capable model still has the original images.
+    """
+    provider = resolve_provider_name(model)
+    if get_model_supports_vision(model, provider):
+        return api_messages
+    if not _messages_have_image(api_messages):
+        return api_messages
+
+    from tabvis.utils import ocr
+
+    use_ocr = ocr.ocr_enabled() and ocr.ocr_available()
+
+    async def _replace_image(img: dict[str, Any]) -> dict[str, Any]:
+        if use_ocr:
+            src = img.get("source") or {}
+            data = src.get("data") if src.get("type") == "base64" else None
+            media_type = src.get("media_type", "image/png")
+            text = await asyncio.to_thread(ocr.ocr_image_base64, data, media_type) if data else None
+            new: dict[str, Any] = {
+                "type": "text",
+                "text": ocr.ocr_marker(text) if text else ocr.OCR_EMPTY_NOTE,
+            }
+        else:
+            ocr.warn_ocr_unavailable_once()
+            new = {"type": "text", "text": ocr.OCR_UNAVAILABLE_NOTE}
+        if "cache_control" in img:  # keep the cache breakpoint if it landed on this block
+            new["cache_control"] = img["cache_control"]
+        return new
+
+    async def _walk(blocks: list[Any]) -> list[Any]:
+        changed = False
+        out: list[Any] = []
+        for b in blocks:
+            if isinstance(b, dict) and b.get("type") == "image":
+                out.append(await _replace_image(b))
+                changed = True
+            elif (
+                isinstance(b, dict)
+                and b.get("type") == "tool_result"
+                and isinstance(b.get("content"), list)
+            ):
+                nested = await _walk(b["content"])
+                if nested is not b["content"]:
+                    b = {**b, "content": nested}
+                    changed = True
+                out.append(b)
+            else:
+                out.append(b)
+        return out if changed else blocks
+
+    new_messages: list[dict[str, Any]] = []
+    for m in api_messages:
+        content = m.get("content")
+        if isinstance(content, list):
+            new_content = await _walk(content)
+            if new_content is not content:
+                m = {**m, "content": new_content}
+        new_messages.append(m)
+    return new_messages
+
+
 def _messages_to_api_params(
     messages: list[dict[str, Any]],
     tools: Tools,
@@ -347,6 +435,10 @@ async def query_model_with_streaming(
     recoverable error AssistantMessages / retry-heartbeat system sentinels."""
     enable_caching = options.enable_prompt_caching
     api_messages = _messages_to_api_params(messages, tools, enable_caching, options.query_source)
+    # Vision gate: if the target model can't see images, replace image blocks with OCR text (or a
+    # short note) once here — before the retry loop — so a text-only model never receives an image
+    # block it would reject. Vision-capable models are untouched.
+    api_messages = await _replace_images_for_nonvision_model(api_messages, options.model)
     system_blocks = build_system_prompt_blocks(
         system_prompt, enable_caching, {"querySource": options.query_source}
     )
