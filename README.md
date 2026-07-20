@@ -214,3 +214,42 @@ uv run tabvis --version
 
 Tabvis is under active development. See [the roadmap](docs/ROADMAP_v1.md) for planned work and
 `.env.example` for the complete configuration surface.
+
+## Legal notice & responsible use
+
+> ⚠️ Tabvis drives a real browser, can operate stealth engines, and can download files — how you use
+> it is **your responsibility**. By using Tabvis you agree to the following.
+
+- **Authorized use only.** Only automate, access, scrape, or download from systems you own or are
+  explicitly authorized to use. Respect each site's Terms of Service, `robots.txt`, rate limits, and
+  all applicable laws — including computer-misuse / unauthorized-access, copyright, contract, and
+  data-protection / privacy law in the relevant jurisdictions.
+
+- **Anti-detection features are for legitimate, authorized work.** The stealth browsers
+  (CloakBrowser / Camoufox), fingerprint and behavior options, and proxy support exist for uses such
+  as testing **your own** bot defenses, authorized security assessments, QA, accessibility, and
+  research. Do **not** use them to defeat CAPTCHAs or human-verification, circumvent access controls
+  or security measures, gain unauthorized access, create fake accounts, or commit fraud. Tabvis does
+  not include automated CAPTCHA / anti-bot **solving**, and requests to add it will not be honored.
+
+- **Be a good network citizen.** Request pacing is on by default
+  (`TABVIS_BROWSER_MIN_REQUEST_INTERVAL_MS` and related knobs) so the agent does not burst a server.
+  You remain responsible for staying within each site's limits and for not causing disruption or a
+  denial of service — do not raise the limits to hammer a third party.
+
+- **Downloaded content.** Files the agent fetches into the workspace may be copyrighted, private, or
+  otherwise restricted. You are responsible for the lawful handling, storage, and use of anything it
+  downloads or reads.
+
+- **Credentials & exposure.** The local server ships with **no authentication** and binds to
+  `127.0.0.1` — anyone who can reach the port acts as you. Do not expose it to an untrusted network
+  without an authentication proxy, and keep API keys and browser profiles / cookies secure.
+
+- **No warranty.** Tabvis is provided "as is", without warranty of any kind, and its authors and
+  contributors accept no liability for how it is used or for any resulting damages. This notice is
+  not legal advice; if you are unsure whether a use is permitted, obtain the target operator's
+  permission and seek your own counsel first.
+
+## License
+
+Tabvis is released under the [MIT License](LICENSE).
