@@ -1,93 +1,169 @@
 """Browser driver inventory + on-demand install — powers the console's driver picker.
 
-Each engine in ``BROWSER_ENGINE_CATALOG`` falls into one of four buckets:
-  - ``playwright`` (chromium / firefox / webkit)  — a browser Playwright can DOWNLOAD on demand.
-  - ``system``     (chrome / edge / brave / …)     — your own installed app; auto-detected, not downloaded.
-  - ``stealth``    (cloak / camoufox)              — needs a Python extra; downloads its binary on first launch.
-  - ``remote``     (cdp / connect / browserless …) — attaches to a browser you run; nothing to download.
+Every engine in ``BROWSER_ENGINE_CATALOG`` can be downloaded, is a system app you install yourself,
+or attaches to something remote:
 
-``list_drivers()`` reports every driver with its install state + next step; ``install_browser()``
-runs ``playwright install <browser>`` for the downloadable kernels.
+  install method            engines                              how ``install_browser_stream`` installs it
+  ------------------------- ------------------------------------ ------------------------------------------
+  Playwright download       chromium / firefox / webkit          `playwright install <engine>` (bundled)
+  Playwright channel        chrome / msedge                      `playwright install <engine>` (stable channel)
+  Python package (uv)       cloak / camoufox                     `uv pip install <cloakbrowser|camoufox>`
+  system app (no CLI)       brave / vivaldi / opera              — install it from the vendor; auto-detected
+  remote attach             cdp / connect / browserless / …      — nothing to download; set an endpoint
+
+``list_drivers()`` reports each driver with its install state + next step; ``install_browser_stream()``
+runs the install for a downloadable one and streams progress.
 """
 
 from __future__ import annotations
 
 import asyncio
+import importlib
+import importlib.util
 import os
 import re
+import shutil
 import sys
 from collections.abc import AsyncGenerator
 from typing import Any
 
 from tabvis.utils.debug import log_for_debugging
 
-# The Playwright kernels that can be downloaded on demand (engine key == playwright browser name).
-INSTALLABLE = ("chromium", "firefox", "webkit")
+# Playwright browsers/channels installable via `playwright install <engine key>`.
+PLAYWRIGHT_INSTALL = ("chromium", "firefox", "webkit", "chrome", "msedge")
+# Playwright's own bundled kernels (installed-state detectable via executable_path).
+PLAYWRIGHT_BUNDLED = ("chromium", "firefox", "webkit")
+# Stealth engines installed as a Python package (engine key -> pip package name).
+STEALTH_PACKAGE = {"cloak": "cloakbrowser", "camoufox": "camoufox"}
+
+# System-browser detection (best-effort, per OS): engine key -> macOS app paths / PATH command names.
+_MAC_APPS = {
+    "chrome": ["/Applications/Google Chrome.app"],
+    "msedge": ["/Applications/Microsoft Edge.app"],
+    "brave": ["/Applications/Brave Browser.app"],
+    "vivaldi": ["/Applications/Vivaldi.app"],
+    "opera": ["/Applications/Opera.app"],
+}
+_PATH_NAMES = {
+    "chrome": ["google-chrome", "google-chrome-stable", "chrome"],
+    "msedge": ["microsoft-edge", "microsoft-edge-stable", "msedge"],
+    "brave": ["brave-browser", "brave"],
+    "vivaldi": ["vivaldi", "vivaldi-stable"],
+    "opera": ["opera"],
+}
+
+
+def install_via(key: str) -> str | None:
+    """How engine ``key`` is installed: 'playwright' | 'package' | None (not downloadable)."""
+    key = (key or "").strip().lower()
+    if key in PLAYWRIGHT_INSTALL:
+        return "playwright"
+    if key in STEALTH_PACKAGE:
+        return "package"
+    return None
 
 
 def _installed_playwright() -> dict[str, bool]:
-    """Which Playwright browsers are actually on disk (executable path exists). Runs the driver, so
-    call it off the event loop via ``asyncio.to_thread``."""
+    """Which bundled Playwright browsers are on disk. Runs the driver — call via ``asyncio.to_thread``."""
     out: dict[str, bool] = {}
     try:
         from playwright.sync_api import sync_playwright
 
         with sync_playwright() as p:
-            for b in INSTALLABLE:
+            for b in PLAYWRIGHT_BUNDLED:
                 try:
                     out[b] = os.path.exists(getattr(p, b).executable_path)
-                except Exception:  # noqa: BLE001 — not installed / path unavailable
+                except Exception:  # noqa: BLE001
                     out[b] = False
-    except Exception as e:  # noqa: BLE001 — playwright missing or driver failed to start
+    except Exception as e:  # noqa: BLE001
         log_for_debugging(f"[DRIVERS] playwright status check failed: {e}")
     return out
 
 
+def _system_browser_installed(key: str) -> bool | None:
+    """Whether a system browser (chrome/edge/brave/…) is installed. None if we can't tell here."""
+    if sys.platform == "darwin":
+        paths = _MAC_APPS.get(key)
+        if paths is None:
+            return None
+        return any(os.path.exists(p) for p in paths)
+    names = _PATH_NAMES.get(key)
+    if names is None:
+        return None
+    if any(shutil.which(n) for n in names):
+        return True
+    return None if sys.platform.startswith("win") else False  # Windows check is unreliable → unknown
+
+
+def _package_installed(package: str) -> bool:
+    try:
+        importlib.invalidate_caches()  # a package installed after startup may not be cached yet
+        return importlib.util.find_spec(package) is not None
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _reset_availability_memo() -> None:
+    """After a package install, clear browser_config's memoized availability so it re-checks (and a
+    fresh launch in this same process can find the newly-installed engine)."""
+    try:
+        from tabvis.utils import browser_config as bc
+
+        for attr in ("_CLOAKBROWSER_AVAILABLE", "_CAMOUFOX_AVAILABLE"):
+            if hasattr(bc, attr):
+                setattr(bc, attr, None)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _installed(spec: Any, installed_pw: dict[str, bool]) -> bool | None:
+    if spec.key in PLAYWRIGHT_BUNDLED:
+        return bool(installed_pw.get(spec.key))
+    if spec.key in STEALTH_PACKAGE:
+        return _package_installed(STEALTH_PACKAGE[spec.key])
+    if spec.mode in ("cdp", "connect"):
+        return None
+    return _system_browser_installed(spec.key)  # chrome/msedge/brave/vivaldi/opera
+
+
 def _category(spec: Any) -> str:
-    if spec.key in INSTALLABLE:
+    if spec.key in PLAYWRIGHT_BUNDLED:
         return "playwright"
+    if spec.key in STEALTH_PACKAGE:
+        return "stealth"
     if spec.mode in ("cdp", "connect"):
         return "remote"
-    if spec.requires:  # plugin / stealth engines carry a required package
-        return "stealth"
     return "system"
 
 
-def _hint(spec: Any, category: str, installed: bool | None) -> str:
-    if category == "playwright":
-        return "Installed." if installed else f"Download the Playwright {spec.kernel} browser (~150 MB)."
-    if category == "stealth":
-        extra = "cloak" if spec.requires == "cloakbrowser" else (spec.requires or "")
-        return (
-            "Installed — downloads its patched binary on first launch."
-            if installed
-            else f"Needs the {spec.requires} package: `uv sync --extra {extra}`."
-        )
-    if category == "remote":
+def _hint(spec: Any, installed: bool | None) -> str:
+    key, via = spec.key, install_via(spec.key)
+    if installed:
+        if via == "package":
+            return "Installed — downloads its patched binary on first launch."
+        return "Installed."
+    if via == "playwright":
+        if key in PLAYWRIGHT_BUNDLED:
+            return f"Download the Playwright {spec.kernel} browser (~150 MB)."
+        return f"Download & install {spec.label} (the stable channel; may prompt for permission)."
+    if via == "package":
+        extra = "cloak" if key == "cloak" else key
+        return f"Install the {STEALTH_PACKAGE[key]} package (`uv pip install {STEALTH_PACKAGE[key]}`; needs `uv`). Or `uv sync --extra {extra}`."
+    if spec.mode in ("cdp", "connect"):
         return spec.notes or "Attach to a browser you run — set its endpoint."
-    return spec.notes or "Uses your installed browser (auto-detected)."
+    return spec.notes or f"Install {spec.label} from its website — tabvis auto-detects it."
 
 
 async def list_drivers() -> dict[str, Any]:
     """The full driver catalog with per-driver install state and next step."""
-    from tabvis.utils.browser_config import (
-        BROWSER_ENGINE_CATALOG,
-        engine_package_available,
-        playwright_available,
-    )
+    from tabvis.utils.browser_config import BROWSER_ENGINE_CATALOG, playwright_available
 
     pw = playwright_available()
     installed_pw = await asyncio.to_thread(_installed_playwright) if pw else {}
 
     drivers: list[dict[str, Any]] = []
     for key, spec in BROWSER_ENGINE_CATALOG.items():
-        category = _category(spec)
-        if category == "playwright":
-            installed: bool | None = bool(installed_pw.get(spec.browser_type))
-        elif category == "stealth":
-            installed = engine_package_available(spec.requires)
-        else:
-            installed = None  # system app / remote endpoint — not something we can detect here
+        installed = _installed(spec, installed_pw)
         drivers.append(
             {
                 "key": key,
@@ -97,45 +173,57 @@ async def list_drivers() -> dict[str, Any]:
                 "mode": spec.mode,
                 "stealth": bool(spec.stealth),
                 "requires": spec.requires,
-                "category": category,
-                "installable": category == "playwright",
+                "category": _category(spec),
+                "installable": install_via(key) is not None,
                 "installed": installed,
-                "hint": _hint(spec, category, installed),
+                "hint": _hint(spec, installed),
             }
         )
     return {"playwright_installed": pw, "drivers": drivers}
 
 
-async def install_browser_stream(browser: str) -> AsyncGenerator[dict[str, Any], None]:
-    """Run ``playwright install <browser>`` and stream progress, then a final result.
+async def install_browser_stream(key: str) -> AsyncGenerator[dict[str, Any], None]:
+    """Install a downloadable driver, streaming progress lines then a single result.
 
-    Yields ``{"type": "progress", "text": …}`` lines as the download proceeds (the playwright CLI's
-    output, split on CR/LF so the in-place progress bar surfaces as updates), then exactly one
-    ``{"type": "result", …}``. An unknown browser yields a single ``{"type": "error", …}``.
+    ``playwright`` engines run ``playwright install <key>``; ``package`` engines run
+    ``uv pip install <package>``. Progress is split on CR/LF so an in-place progress bar surfaces as
+    updates. An engine with no install path yields one ``{"type": "error", …}``.
     """
-    browser = (browser or "").strip().lower()
-    if browser not in INSTALLABLE:
+    key = (key or "").strip().lower()
+    via = install_via(key)
+    if via is None:
         yield {
             "type": "error",
-            "error": f"'{browser}' is not a downloadable Playwright browser "
-            f"(choose one of {', '.join(INSTALLABLE)}).",
+            "error": f"'{key}' is not downloadable via tabvis — install it yourself "
+            f"(system browsers) or set an endpoint (remote engines).",
         }
         return
 
-    log_for_debugging(f"[DRIVERS] streaming install of playwright {browser} …")
-    yield {"type": "progress", "text": f"Starting download of {browser}…"}
+    if via == "playwright":
+        argv = [sys.executable, "-m", "playwright", "install", key]
+    else:  # package
+        uv = shutil.which("uv")
+        pkg = STEALTH_PACKAGE[key]
+        if not uv:
+            extra = "cloak" if key == "cloak" else key
+            yield {
+                "type": "result",
+                "ok": False,
+                "browser": key,
+                "installed": False,
+                "message": f"`uv` not found. Install {pkg} yourself: `uv sync --extra {extra}`.",
+            }
+            return
+        argv = [uv, "pip", "install", "--python", sys.executable, pkg]
+
+    log_for_debugging(f"[DRIVERS] installing {key} via {via}: {' '.join(argv)}")
+    yield {"type": "progress", "text": f"Starting install of {key}…"}
     try:
         proc = await asyncio.create_subprocess_exec(
-            sys.executable,
-            "-m",
-            "playwright",
-            "install",
-            browser,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
+            *argv, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT
         )
     except Exception as e:  # noqa: BLE001
-        yield {"type": "result", "ok": False, "browser": browser, "installed": False, "message": f"could not start install: {e}"}
+        yield {"type": "result", "ok": False, "browser": key, "installed": False, "message": f"could not start install: {e}"}
         return
 
     assert proc.stdout is not None
@@ -147,52 +235,29 @@ async def install_browser_stream(browser: str) -> AsyncGenerator[dict[str, Any],
             break
         buf += chunk.decode("utf-8", "replace")
         segments = re.split(r"[\r\n]+", buf)
-        buf = segments.pop()  # keep the incomplete tail for the next chunk
+        buf = segments.pop()
         for seg in segments:
             seg = seg.strip()
-            if seg and seg != last:  # dedupe consecutive identical progress-bar frames
+            if seg and seg != last:
                 last = seg
                 yield {"type": "progress", "text": seg}
     if buf.strip() and buf.strip() != last:
         yield {"type": "progress", "text": buf.strip()}
 
     code = await proc.wait()
-    installed = (await asyncio.to_thread(_installed_playwright)).get(browser, False)
+    if via == "playwright" and key in PLAYWRIGHT_BUNDLED:
+        installed: bool = (await asyncio.to_thread(_installed_playwright)).get(key, False)
+    elif via == "playwright":  # chrome/msedge — trust the installer's exit code
+        installed = code == 0
+    else:  # package
+        _reset_availability_memo()
+        installed = _package_installed(STEALTH_PACKAGE[key])
+
     ok = code == 0 and installed
     yield {
         "type": "result",
         "ok": ok,
-        "browser": browser,
+        "browser": key,
         "installed": installed,
-        "message": f"{browser} is installed" if ok else f"install failed (exit {code})",
-    }
-
-
-async def install_browser(browser: str) -> dict[str, Any]:
-    """Download a Playwright browser via ``playwright install <browser>`` (chromium/firefox/webkit)."""
-    browser = (browser or "").strip().lower()
-    if browser not in INSTALLABLE:
-        return {
-            "ok": False,
-            "error": f"'{browser}' is not a downloadable Playwright browser (choose one of "
-            f"{', '.join(INSTALLABLE)}). System browsers are your own apps; stealth engines use "
-            f"`uv sync --extra …`; remote engines attach to an endpoint.",
-        }
-
-    from tabvis.utils.exec_file_no_throw import exec_file_no_throw
-
-    log_for_debugging(f"[DRIVERS] installing playwright {browser} …")
-    res = await exec_file_no_throw(
-        sys.executable, ["-m", "playwright", "install", browser], {"timeout": 600_000, "use_cwd": False}
-    )
-    code = res.get("code")
-    output = ((res.get("stdout") or "") + (res.get("stderr") or "")).strip()
-    installed = (await asyncio.to_thread(_installed_playwright)).get(browser, False)
-    ok = code == 0 and installed
-    return {
-        "ok": ok,
-        "browser": browser,
-        "installed": installed,
-        "message": f"{browser} is installed" if ok else f"install failed (exit {code})",
-        "output": output[-2000:],
+        "message": f"{key} is installed" if ok else f"install failed (exit {code})",
     }

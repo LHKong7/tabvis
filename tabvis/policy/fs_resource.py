@@ -80,6 +80,21 @@ def classify_path(
 
     if _is_sensitive(real):
         return f"secret:{real}"
+
+    # The download workspace is a WRITABLE working area for the agent (browser downloads + files it
+    # creates to process them). It sits under the config home by default, so classify it as
+    # ``workspace:`` BEFORE the ``config:`` hard-deny — otherwise the agent could read but never write
+    # there. (A secret dropped inside it was already caught above and stays ``secret:``.)
+    try:
+        from tabvis.browser.downloads import get_workspace_dir
+
+        real_ws = _real(get_workspace_dir())
+        if _is_under(real, real_ws):
+            rel = os.path.relpath(real, real_ws)
+            return f"workspace:{rel}"
+    except Exception:  # noqa: BLE001 — never let workspace resolution break classification
+        pass
+
     if _is_under(real, real_cfg):
         return f"config:{real}"
     if _is_under(real, real_cwd):

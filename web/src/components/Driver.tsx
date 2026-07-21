@@ -126,8 +126,9 @@ export function Driver({ open, config, onChanged }: Props) {
       .catch(() => {})
   }
 
-  // Download a Playwright browser (chromium/firefox/webkit) via the server (`playwright install`),
-  // streaming progress lines over SSE as it downloads.
+  // Download a driver by catalog key via the server: Playwright engines (chromium/firefox/webkit/
+  // chrome/msedge) go through `playwright install <key>`, stealth engines (cloak/camoufox) through
+  // `uv pip install <pkg>`. Progress lines stream over SSE as it downloads.
   const installDriver = async (browser: string) => {
     setInstalling(browser)
     setInstallProgress(null)
@@ -338,9 +339,9 @@ export function Driver({ open, config, onChanged }: Props) {
                       type="button"
                       disabled={!!installing || !writable}
                       title={writable ? 'Download this browser' : 'read-only (localhost only)'}
-                      onClick={() => installDriver(d.browser_type)}
+                      onClick={() => installDriver(d.key)}
                     >
-                      {installing === d.browser_type ? 'Downloading…' : 'Download'}
+                      {installing === d.key ? 'Downloading…' : 'Download'}
                     </button>
                   )}
                 </div>

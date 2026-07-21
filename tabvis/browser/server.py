@@ -550,14 +550,14 @@ def create_app(auth_required: bool = False, dev: bool = False) -> Any:
         except Exception:  # noqa: BLE001
             return JSONResponse({"error": "body must be JSON"}, status_code=400)
 
-        from tabvis.browser.drivers import INSTALLABLE, install_browser_stream
+        from tabvis.browser.drivers import install_browser_stream, install_via
 
         browser = (payload.get("browser") or "").strip().lower()
-        if browser not in INSTALLABLE:  # clean 400 before switching to the event stream
+        if install_via(browser) is None:  # clean 400 before switching to the event stream
             return JSONResponse(
                 {
-                    "error": f"'{browser}' is not a downloadable Playwright browser "
-                    f"(choose one of {', '.join(INSTALLABLE)})."
+                    "error": f"'{browser}' is not a downloadable driver — system browsers "
+                    "(chrome/brave/…) are installed by you; remote engines use an endpoint."
                 },
                 status_code=400,
             )
