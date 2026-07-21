@@ -1656,8 +1656,21 @@ transcript into the provider's `{id, role, text, ts}` message shape — `map_tra
 pure function over an ordered conversation chain (dropping progress entries, flattening SDK content and
 summarizing tool-use/result/image blocks per §7.9), and `load_session_transcript` reads the session's
 transcript file, rebuilds the leaf-to-root chain, and maps it (empty for a fresh session). It is the
-`SourceCollector`'s default transcript loader (`test_context_transcript.py`). Feeding the assembled
-pack into the model call path is the remaining step.
+`SourceCollector`'s default transcript loader (`test_context_transcript.py`).
+
+**Integration — pack into the model call path (landed).** When a `SourceCollector` is wired, the
+`AgentRunLauncher` assembles a Context Pack before the model call (`runtime/agent/runner.py`), renders
+its *situational* system sections — workspace/Git, browser, todos, channel identity — via
+`runtime/context/render.py`, and appends them to the model's system prompt through a new additive
+`extra_system_context` parameter on `stream_agent` (default `None`, so the loop's own assembly is
+untouched otherwise). Sections the base prompt already emits (project instructions, memory, safety,
+agent) are excluded to avoid duplication, and `secret_ref` sections never render. Each build emits a
+durable `context.pack.built` event (pack id, digest, size) and stores the pack for `explain`, so what
+the model saw is deterministic and traceable. Context assembly is fully guarded — a failing source
+degrades and never breaks the run. The daemon (`server.py::create_app`) wires the collector, so gateway
+runs feed live situational context to the model. Verified by `test_launcher_context.py` /
+`test_context_render.py`. Fully replacing the base prompt assembly with the pack (removing the
+project-instructions/memory overlap) is the remaining migration.
 
 ### Phase 6 — Plugin Runtime
 
