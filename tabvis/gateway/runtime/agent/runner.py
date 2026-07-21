@@ -24,8 +24,12 @@ import asyncio
 from typing import Any, Awaitable, Callable
 
 from tabvis.gateway.events.store import EventStore, get_event_store
+from tabvis.gateway.protocol.errors import GatewayError
 from tabvis.gateway.protocol.events import AGGREGATE_CONTEXT, AGGREGATE_RUN, EventScope, EventType
 from tabvis.gateway.runtime import runs
+from tabvis.gateway.runtime.browser.binding_context import bind_binding, unbind_binding
+from tabvis.gateway.runtime.browser.contracts import BrowserAcquireRequest, BrowserBinding
+from tabvis.gateway.runtime.browser.runtime import BrowserRuntime, set_browser_runtime
 from tabvis.gateway.runtime.context.render import render_system_context
 from tabvis.gateway.runtime.context.runtime import ContextRuntime
 from tabvis.gateway.runtime.context.sources import SourceCollector
@@ -68,6 +72,7 @@ class AgentRunLauncher:
         *,
         context_collector: SourceCollector | None = None,
         context_runtime: ContextRuntime | None = None,
+        browser_runtime: BrowserRuntime | None = None,
     ) -> None:
         self._runs = run_store or get_run_store()
         self._events = events or get_event_store()
@@ -77,6 +82,9 @@ class AgentRunLauncher:
         # by default so the loop's own assembly is untouched unless a deployment opts in.
         self._collector = context_collector
         self._context_runtime = context_runtime
+        # When a Browser Runtime is wired, the run acquires a leased binding and publishes it for the
+        # loop's browser tools to drive through (design §10.4). Off by default.
+        self._browser = browser_runtime
         self._tasks: dict[str, asyncio.Task[None]] = {}
 
     # --- RunLauncher protocol -------------------------------------------------------------------
@@ -108,37 +116,53 @@ class AgentRunLauncher:
         tool_calls = 0
         result_text: str | None = None
         is_error = False
+        binding: BrowserBinding | None = None
+        token = None
         try:
             self._runs.transition(run.run_id, runs.PREPARING, expected=runs.QUEUED)
             self._runs.transition(run.run_id, runs.RUNNING, expected=runs.PREPARING)
 
-            await self._maybe_build_context(run, context)
+            # Acquire a leased browser binding for the run and publish it for the loop's tools. A
+            # shared-profile conflict (BROWSER_PROFILE_BUSY) fails the run deterministically (design §10.5).
+            if self._browser is not None:
+                try:
+                    binding = await self._acquire_binding(run, context)
+                except GatewayError as e:
+                    self._runs.transition(run.run_id, runs.FAILED, expected=runs.RUNNING,
+                                          error_code=e.code, data={"error": e.message})
+                    return
+                token = bind_binding(binding.binding_id)
 
-            async for message in self._stream(run, context):
-                mtype = message.get("type")
-                if mtype == "assistant":
-                    turns += 1
-                    tool_calls += _count_tool_uses(message)
-                    self._events.append(
-                        AGGREGATE_RUN, run.run_id, EventType.ASSISTANT_MESSAGE_COMPLETED, scope=scope,
-                        data={"turn": turns, "text_preview": _assistant_text(message)[:_PREVIEW_CHARS]},
-                    )
-                    for _ in range(_count_tool_uses(message)):
+            try:
+                await self._maybe_build_context(run, context)
+
+                async for message in self._stream(run, context):
+                    mtype = message.get("type")
+                    if mtype == "assistant":
+                        turns += 1
+                        tool_calls += _count_tool_uses(message)
                         self._events.append(
-                            AGGREGATE_RUN, run.run_id, EventType.TOOL_COMPLETED, scope=scope,
-                            data={"turn": turns},
+                            AGGREGATE_RUN, run.run_id, EventType.ASSISTANT_MESSAGE_COMPLETED, scope=scope,
+                            data={"turn": turns, "text_preview": _assistant_text(message)[:_PREVIEW_CHARS]},
                         )
-                elif mtype == "result":
-                    result_text = message.get("result")
-                    is_error = bool(message.get("is_error"))
+                        for _ in range(_count_tool_uses(message)):
+                            self._events.append(
+                                AGGREGATE_RUN, run.run_id, EventType.TOOL_COMPLETED, scope=scope,
+                                data={"turn": turns},
+                            )
+                    elif mtype == "result":
+                        result_text = message.get("result")
+                        is_error = bool(message.get("is_error"))
 
-            terminal = runs.FAILED if is_error else runs.COMPLETED
-            self._runs.transition(
-                run.run_id, terminal, expected=runs.RUNNING,
-                error_code="agent_error" if is_error else None,
-                data={"result_preview": (result_text or "")[:_PREVIEW_CHARS]},
-                turns=turns, tool_calls=tool_calls,
-            )
+                terminal = runs.FAILED if is_error else runs.COMPLETED
+                self._runs.transition(
+                    run.run_id, terminal, expected=runs.RUNNING,
+                    error_code="agent_error" if is_error else None,
+                    data={"result_preview": (result_text or "")[:_PREVIEW_CHARS]},
+                    turns=turns, tool_calls=tool_calls,
+                )
+            finally:
+                await self._release_binding(binding, token)
         except asyncio.CancelledError:
             # Cooperative cancel: the orchestrator owns the cancelling→cancelled transitions, so we
             # leave the Run state alone and just unwind (design §7.6).
@@ -146,6 +170,23 @@ class AgentRunLauncher:
         except Exception as e:  # noqa: BLE001 - a run failure is recorded, never raised to the caller
             log_for_debugging(f"[GATEWAY] run {run.run_id} failed: {e}")
             self._fail_best_effort(run.run_id, f"{type(e).__name__}: {e}", turns, tool_calls)
+
+    async def _acquire_binding(self, run: RunRecord, context: LaunchContext) -> BrowserBinding:
+        # Register the runtime so a bound tool's execute_intent resolves this very instance (§10.4).
+        set_browser_runtime(self._browser)
+        return await self._browser.acquire(
+            BrowserAcquireRequest(agent_id=run.agent_id, run_id=run.run_id, profile=context.profile)
+        )
+
+    async def _release_binding(self, binding: BrowserBinding | None, token) -> None:
+        if binding is None:
+            return
+        if token is not None:
+            unbind_binding(token)
+        try:
+            await self._browser.release(binding.binding_id)
+        except Exception as e:  # noqa: BLE001 - release is best-effort; the run already terminalized
+            log_for_debugging(f"[GATEWAY] browser release failed for {binding.binding_id}: {e}")
 
     async def _maybe_build_context(self, run: RunRecord, context: LaunchContext) -> None:
         """Assemble a Context Pack and stage its situational sections for the model (design §11).

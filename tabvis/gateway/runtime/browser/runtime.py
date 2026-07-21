@@ -201,3 +201,20 @@ class _AgentRun:
     def __init__(self, agent_id: str | None, run_id: str | None) -> None:
         self.agent_id = agent_id
         self.run_id = run_id
+
+
+_runtime: BrowserRuntime | None = None
+
+
+def get_browser_runtime() -> BrowserRuntime:
+    """The process-wide :class:`BrowserRuntime` a bound tool resolves its binding against (design §10.4)."""
+    global _runtime
+    if _runtime is None:
+        _runtime = BrowserRuntime()
+    return _runtime
+
+
+def set_browser_runtime(runtime: BrowserRuntime | None) -> None:
+    """Install the process-wide Browser Runtime (composition root / the launcher / tests)."""
+    global _runtime
+    _runtime = runtime
