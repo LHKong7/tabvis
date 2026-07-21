@@ -37,8 +37,8 @@ class _FakeDriver:
         self.closed: list[str] = []
         self.identity_ok = identity_ok
 
-    async def launch(self, profile_key: str, engine: str) -> None:
-        self.launched.append(profile_key)
+    async def launch(self, spec) -> None:
+        self.launched.append(spec.profile_key)
 
     async def execute(self, profile_key: str, intent: BrowserIntent) -> dict:
         return dict(intent.params)

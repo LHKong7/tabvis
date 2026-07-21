@@ -1694,8 +1694,19 @@ The profile key is the exclusive resource: isolated agents get per-agent keys (p
 named profile collapses to one key (one active writer, enforced by a partial-unique index). Identity
 metadata is agent-readable with cookies/tokens/proxy credentials dropped (§10.5). A side-effecting
 execution against a disconnected session is marked `interrupted` rather than replayed, and a reconnect
-verifies identity before resuming (§10.7). Wiring the `BrowserDriver` seam to the existing
-`tabvis/browser/` Playwright manager is the remaining integration step.
+verifies identity before resuming (§10.7).
+
+**Integration — BrowserDriver → real Chromium (landed).** `runtime/browser/manager_driver.py::ManagerBrowserDriver`
+implements the `BrowserDriver` seam over tabvis's existing `browser` subsystem: `launch` reserves the
+agent's workspace (`init_browser_session`), `execute` drives the live page (`BrowserService.navigate` /
+`.snapshot`) and shapes the observation into the runtime's result dict, `verify_identity` checks the
+session is live, and `close` quits the agent's browser. Because the manager is keyed by `agent_id`, the
+`launch` seam now carries a `DriverSpec` (agent_id + profile + profile_key + session_id) and the driver
+maps `profile_key → agent_id`. Every manager touchpoint is an injectable hook (real by default), so the
+driver is unit-tested end to end through the real `BrowserRuntime` with a fake service — no Chromium
+required (`test_manager_driver.py`). `runtime/browser.real_browser_runtime(model, cwd)` composes a
+Browser Runtime that drives real Chromium. Rerouting the agent's own browser *tools* to acquire a
+`binding_id` (rather than the current agent-id ContextVar path) is the remaining §10.4 step.
 
 ### Phase 8 — optional process separation
 
