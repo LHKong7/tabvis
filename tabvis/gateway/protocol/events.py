@@ -77,6 +77,7 @@ AGGREGATE_SESSION = "session"
 AGGREGATE_CONVERSATION = "conversation"
 AGGREGATE_INTERACTION = "interaction"
 AGGREGATE_CHANNEL = "channel"
+AGGREGATE_BROWSER = "browser"
 
 
 @dataclass(frozen=True)

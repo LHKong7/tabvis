@@ -27,7 +27,7 @@ from typing import Any, Iterator
 
 from tabvis.browser.persistence.paths import get_browser_os_data_dir
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 GATEWAY_DB_FILENAME = "gateway.db"
 
 _lock = threading.RLock()
@@ -140,6 +140,23 @@ _DDL = (
     )""",
     "CREATE INDEX IF NOT EXISTS idx_bindings_account ON conversation_bindings(channel_account_id)",
     "CREATE INDEX IF NOT EXISTS idx_deliveries_run ON deliveries(run_id)",
+    # v4: durable browser leases (design §10.5, §10.7). The lease is the exclusive claim on a profile;
+    # it must survive a crash so recovery never silently reassigns a profile a live run still holds.
+    """CREATE TABLE IF NOT EXISTS browser_leases (
+        binding_id   TEXT PRIMARY KEY,
+        profile_key  TEXT NOT NULL,
+        identity_id  TEXT,
+        agent_id     TEXT,
+        run_id       TEXT,
+        status       TEXT NOT NULL,
+        acquired_at  TEXT,
+        heartbeat_at TEXT,
+        expires_at   TEXT,
+        data         TEXT NOT NULL
+    )""",
+    # At most one ACTIVE lease per profile — the atomic "one active writer" guard (design §10.5).
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_active_lease ON browser_leases(profile_key) WHERE status='active'",
+    "CREATE INDEX IF NOT EXISTS idx_leases_status ON browser_leases(status)",
 )
 
 
@@ -644,3 +661,53 @@ def insert_delivery(record: dict[str, Any]) -> bool:
             ),
         )
     return True
+
+
+# --------------------------------------------------------------------------- browser leases
+
+
+def get_active_lease_for_profile(conn: sqlite3.Connection, profile_key: str) -> dict[str, Any] | None:
+    row = conn.execute(
+        "SELECT data FROM browser_leases WHERE profile_key = ? AND status = 'active'", (profile_key,)
+    ).fetchone()
+    return json.loads(row["data"]) if row else None
+
+
+def insert_lease(conn: sqlite3.Connection, record: dict[str, Any]) -> None:
+    conn.execute(
+        "INSERT INTO browser_leases (binding_id, profile_key, identity_id, agent_id, run_id, status, "
+        "acquired_at, heartbeat_at, expires_at, data) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            record["binding_id"], record["profile_key"], record.get("identity_id"),
+            record.get("agent_id"), record.get("run_id"), record["status"],
+            record.get("acquired_at"), record.get("heartbeat_at"), record.get("expires_at"),
+            json.dumps(record, default=str),
+        ),
+    )
+
+
+def update_lease(conn: sqlite3.Connection, record: dict[str, Any]) -> None:
+    conn.execute(
+        "UPDATE browser_leases SET status=?, heartbeat_at=?, expires_at=?, data=? WHERE binding_id=?",
+        (record["status"], record.get("heartbeat_at"), record.get("expires_at"),
+         json.dumps(record, default=str), record["binding_id"]),
+    )
+
+
+def get_lease(binding_id: str) -> dict[str, Any] | None:
+    with _lock:
+        conn = connect()
+        row = conn.execute("SELECT data FROM browser_leases WHERE binding_id = ?", (binding_id,)).fetchone()
+    return json.loads(row["data"]) if row else None
+
+
+def get_lease_in(conn: sqlite3.Connection, binding_id: str) -> dict[str, Any] | None:
+    row = conn.execute("SELECT data FROM browser_leases WHERE binding_id = ?", (binding_id,)).fetchone()
+    return json.loads(row["data"]) if row else None
+
+
+def list_active_leases() -> list[dict[str, Any]]:
+    with _lock:
+        conn = connect()
+        rows = conn.execute("SELECT data FROM browser_leases WHERE status = 'active'").fetchall()
+    return [json.loads(r["data"]) for r in rows]

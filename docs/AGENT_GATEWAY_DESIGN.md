@@ -1650,16 +1650,31 @@ store. Built-in adapters register today's browser engines, MCP servers, Skills, 
 
 Deliverables:
 
-- Binding-only browser tool access.
-- Wired heartbeats and lease recovery.
-- Stable tab ids and artifact references.
-- Network/storage capability contracts.
+- Binding-only browser tool access. ✅ (`runtime/browser/`: agents receive a `BrowserBinding`
+  (`contracts.py`), never a raw browser; real DOM driving is behind the injected `BrowserDriver` seam)
+- Wired heartbeats and lease recovery. ✅ (`runtime/browser/leases.py` — durable leases in `gateway.db`
+  schema v4, heartbeat + TTL, `reclaim_expired`; `BrowserRuntime.recover`)
+- Stable tab ids and artifact references. ✅ (`runtime/browser/session.py` — stable `tab_id`,
+  content-addressed `ArtifactStore`; events carry refs, never bytes/base64)
+- Network/storage capability contracts. ✅ (`runtime/browser/contracts.py`: `NetworkObservation`
+  bodies-off-by-default; downloads quarantined with collision-safe names + provenance event)
 
 Acceptance:
 
-- Two isolated Agents run in parallel.
-- Shared profile conflict is deterministic.
-- Crash recovery does not corrupt or silently reassign a live profile.
+- Two isolated Agents run in parallel. ✅ (`test_browser_runtime.py` — distinct profile keys, no
+  contention)
+- Shared profile conflict is deterministic. ✅ (`test_browser_runtime.py` — second acquirer of a shared
+  profile gets `BROWSER_PROFILE_BUSY`)
+- Crash recovery does not corrupt or silently reassign a live profile. ✅ (`test_browser_runtime.py` —
+  `recover` reclaims only leases whose heartbeat lapsed past TTL; a freshly-heartbeated lease is never
+  reclaimed)
+
+The profile key is the exclusive resource: isolated agents get per-agent keys (parallel), a shared
+named profile collapses to one key (one active writer, enforced by a partial-unique index). Identity
+metadata is agent-readable with cookies/tokens/proxy credentials dropped (§10.5). A side-effecting
+execution against a disconnected session is marked `interrupted` rather than replayed, and a reconnect
+verifies identity before resuming (§10.7). Wiring the `BrowserDriver` seam to the existing
+`tabvis/browser/` Playwright manager is the remaining integration step.
 
 ### Phase 8 — optional process separation
 

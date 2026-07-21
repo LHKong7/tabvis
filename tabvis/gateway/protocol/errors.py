@@ -53,6 +53,10 @@ _SPECS: Final[tuple[ErrorSpec, ...]] = (
     ErrorSpec("INTERACTION_ALREADY_ANSWERED", 409, False, "The interaction was already answered"),
     ErrorSpec("INTERACTION_EXPIRED", 409, False, "The interaction expired before an answer arrived"),
     ErrorSpec("INTERACTION_CANCELLED", 409, False, "The interaction was cancelled before an answer arrived"),
+    # browser runtime
+    ErrorSpec("BROWSER_PROFILE_BUSY", 409, False, "The browser profile is in use by another run"),
+    ErrorSpec("BROWSER_BINDING_NOT_FOUND", 404, False, "No browser binding with that id"),
+    ErrorSpec("BROWSER_DISCONNECTED", 409, True, "The browser session is disconnected"),
     # infrastructure
     ErrorSpec("STORE_UNAVAILABLE", 503, True, "The metadata store is unavailable"),
     ErrorSpec("INTERNAL", 500, False, "An internal error occurred"),
