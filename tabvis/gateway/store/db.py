@@ -308,6 +308,14 @@ def count_active_runs(active_states: tuple[str, ...]) -> int:
     return int(row["n"])
 
 
+def list_all_runs() -> list[dict[str, Any]]:
+    """Every run, newest first — the source for the legacy agent projection (design §9.8)."""
+    with _lock:
+        conn = connect()
+        rows = conn.execute("SELECT data FROM runs ORDER BY created_at DESC, rowid DESC").fetchall()
+    return [json.loads(r["data"]) for r in rows]
+
+
 def get_run_by_command(command_id: str) -> dict[str, Any] | None:
     """The run created by ``command_id``, if any — the domain-level idempotency key for run.create."""
     with _lock:

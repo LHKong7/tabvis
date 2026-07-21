@@ -216,6 +216,22 @@ class RunStore:
     def list_runs_for_agent(self, agent_id: str, limit: int | None = None) -> list[RunRecord]:
         return [RunRecord.from_dict(d) for d in db.list_runs_for_agent(agent_id, limit)]
 
+    def latest_run_for_agent(self, agent_id: str) -> RunRecord | None:
+        runs_ = db.list_runs_for_agent(agent_id, limit=1)
+        return RunRecord.from_dict(runs_[0]) if runs_ else None
+
+    def latest_run_per_agent(self) -> list[RunRecord]:
+        """The newest run for each agent — one row per agent, newest agent first (design §9.8)."""
+        seen: set[str] = set()
+        out: list[RunRecord] = []
+        for data in db.list_all_runs():  # newest first, so the first per agent_id is its latest
+            agent_id = data.get("agent_id")
+            if not agent_id or agent_id in seen:
+                continue
+            seen.add(agent_id)
+            out.append(RunRecord.from_dict(data))
+        return out
+
 
 _run_store: RunStore | None = None
 

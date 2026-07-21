@@ -1096,7 +1096,10 @@ def create_app(auth_required: bool = False, dev: bool = False) -> Any:
             launcher=AgentRunLauncher(context_collector=SourceCollector()),
         )
         gateway_app.startup()
-        routes.extend(gateway_routes(health_path="/v1/gateway/health"))
+        # include_compat=False: the legacy server still owns /v1/agents with its registry-backed
+        # handlers; the gateway's projection of that surface (design §9.8) is served by the standalone
+        # gateway app until a deliberate cutover.
+        routes.extend(gateway_routes(health_path="/v1/gateway/health", include_compat=False))
 
     if dev:
         # Catch-all LAST so API routes win; forwards Vite's module graph (/src/*, /@vite/*, …) to it.

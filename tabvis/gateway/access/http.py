@@ -25,6 +25,12 @@ from tabvis.gateway.lifecycle import GatewayApplication
 from tabvis.gateway.methods.router import CommandContext
 from tabvis.gateway.protocol import ids
 from tabvis.gateway.protocol.commands import Command, CommandType
+from tabvis.gateway.protocol.compatibility import (
+    legacy_frames_for,
+    legacy_status,
+    project_agent_list,
+    project_run_as_agent,
+)
 from tabvis.gateway.protocol.errors import GatewayError
 from tabvis.gateway.protocol.events import parse_cursor
 
@@ -153,7 +159,91 @@ async def subscribe_events(request: Request) -> Response:
     return EventSourceResponse(generator)
 
 
-def gateway_routes(*, health_path: str = "/v1/health") -> list[Route]:
+# --- legacy /agents compatibility projection (design §9.8) -------------------------------------
+
+
+def _int_param(request: Request, name: str) -> int | None:
+    raw = request.query_params.get(name)
+    try:
+        return int(raw) if raw else None
+    except ValueError:
+        return None
+
+
+async def list_agents_compat(request: Request) -> Response:
+    """Legacy ``GET /agents`` — the latest Run per agent, projected to the agent shape (design §9.8)."""
+    try:
+        principal = await _principal(request)
+        gateway: GatewayApplication = request.app.state.gateway
+        latest = [r for r in gateway.runs.latest_run_per_agent() if principal.can_access_agent(r.agent_id)]
+        body = project_agent_list(latest, status=request.query_params.get("status"), limit=_int_param(request, "limit"))
+        return JSONResponse(body)
+    except GatewayError as e:
+        return _error_response(e)
+
+
+async def read_agent_compat(request: Request) -> Response:
+    try:
+        principal = await _principal(request)
+        agent_id = request.path_params["agent_id"]
+        # Ownership before existence, so a non-owner cannot probe which agent ids exist (matches legacy).
+        if not principal.can_access_agent(agent_id):
+            raise GatewayError("FORBIDDEN", details={"agent_id": agent_id})
+        run = request.app.state.gateway.runs.latest_run_for_agent(agent_id)
+        if run is None:
+            return JSONResponse({"error": "unknown agent_id"}, status_code=404)
+        return JSONResponse(project_run_as_agent(run))
+    except GatewayError as e:
+        return _error_response(e)
+
+
+async def cancel_agent_compat(request: Request) -> Response:
+    """Legacy ``POST /agents/{id}/cancel`` — cancel that agent's active Run (design §9.8)."""
+    try:
+        principal = await _principal(request)
+        agent_id = request.path_params["agent_id"]
+        if not principal.can_access_agent(agent_id):
+            raise GatewayError("FORBIDDEN", details={"agent_id": agent_id})
+        gateway: GatewayApplication = request.app.state.gateway
+        run = gateway.runs.latest_run_for_agent(agent_id)
+        if run is None:
+            return JSONResponse({"error": "unknown agent_id"}, status_code=404)
+        if run.is_terminal:
+            status = legacy_status(run.status)
+            return JSONResponse({"error": f"agent is already {status}", "status": status}, status_code=409)
+        updated = await gateway.orchestrator.cancel(run.run_id, correlation_id=ids.new_command_id())
+        return JSONResponse({"agent_id": agent_id, "status": legacy_status(updated.status)})
+    except GatewayError as e:
+        return _error_response(e)
+
+
+async def agent_events_compat(request: Request) -> Response:
+    """Legacy-named SSE frames for an agent's latest Run — v1 events projected (design §9.8)."""
+    from sse_starlette.sse import EventSourceResponse
+
+    try:
+        principal = await _principal(request)
+        agent_id = request.path_params["agent_id"]
+        if not principal.can_access_agent(agent_id):
+            raise GatewayError("FORBIDDEN", details={"agent_id": agent_id})
+        gateway: GatewayApplication = request.app.state.gateway
+        run = gateway.runs.latest_run_for_agent(agent_id)
+        if run is None:
+            return JSONResponse({"error": "unknown agent_id"}, status_code=404)
+    except GatewayError as e:
+        return _error_response(e)
+
+    async def _frames():
+        import json
+
+        for envelope in gateway.events.read(aggregate_id=run.run_id):
+            for frame in legacy_frames_for(envelope):
+                yield {"event": frame["event"], "data": json.dumps(frame["data"], default=str)}
+
+    return EventSourceResponse(_frames())
+
+
+def gateway_routes(*, health_path: str = "/v1/health", include_compat: bool = True) -> list[Route]:
     """The gateway's §9.4 HTTP routes, as a splice-able list.
 
     ``health_path`` is configurable so the routes can be mounted into an app that already owns
@@ -169,6 +259,15 @@ def gateway_routes(*, health_path: str = "/v1/health") -> list[Route]:
     ]
     if health_path:
         routes.insert(0, Route(health_path, health, methods=["GET"]))
+    if include_compat:
+        # Legacy /agents surface projected from gateway Run data (design §9.8). Excluded when mounting
+        # into the legacy server, which still owns these paths with its registry-backed handlers.
+        routes += [
+            Route("/v1/agents", list_agents_compat, methods=["GET"]),
+            Route("/v1/agents/{agent_id}", read_agent_compat, methods=["GET"]),
+            Route("/v1/agents/{agent_id}/cancel", cancel_agent_compat, methods=["POST"]),
+            Route("/v1/agents/{agent_id}/events", agent_events_compat, methods=["GET"]),
+        ]
     return routes
 
 
