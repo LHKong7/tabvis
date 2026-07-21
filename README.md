@@ -202,6 +202,7 @@ their native streaming formats to the same agent loop.
 | [Feature overview](docs/FEATURES.md) | Current tool surface and subsystem behavior. |
 | [Browser agent PRD](docs/PRD-browser-agent.md) | Browser architecture, product decisions, and safety model. |
 | [Permission engine](docs/permission-policy-engine_v1.md) | Permission and policy design. |
+| [Agent Gateway design](docs/AGENT_GATEWAY_DESIGN.md) | Target control-plane architecture, channels, runs, and the incremental migration plan. |
 
 ## Development
 

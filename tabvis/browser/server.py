@@ -398,6 +398,24 @@ def max_concurrent_agents() -> int:
         return DEFAULT_MAX_AGENTS
 
 
+def _gateway_enabled() -> bool:
+    """Whether to mount the Agent Gateway control plane. ``TABVIS_GATEWAY`` (default ON)."""
+    val = os.environ.get("TABVIS_GATEWAY")
+    if val is None:
+        return True
+    return val.strip().lower() not in ("0", "false", "no", "off", "")
+
+
+def _gateway_agents_enabled() -> bool:
+    """Whether the legacy ``/agents`` surface is served by the gateway (retiring the registry).
+
+    ``TABVIS_GATEWAY_AGENTS`` (default OFF). When on (and the gateway is mounted), the agent lifecycle
+    endpoints are backed by gateway Run data instead of the ``AgentRecord`` registry (design §9.8).
+    """
+    val = os.environ.get("TABVIS_GATEWAY_AGENTS")
+    return bool(val) and val.strip().lower() not in ("0", "false", "no", "off", "")
+
+
 def create_app(auth_required: bool = False, dev: bool = False) -> Any:
     """Build the Starlette app (imports are local so importing this module stays cheap).
 
@@ -1004,6 +1022,13 @@ def create_app(auth_required: bool = False, dev: bool = False) -> Any:
         finally:
             if _dev_server is not None:
                 await _dev_server.stop()
+            # Drain the gateway (stop accepting, close its store) before the browser cleanup.
+            gw = getattr(_app.state, "gateway", None)
+            if gw is not None:
+                try:
+                    gw.drain()
+                except Exception:  # noqa: BLE001 - best-effort
+                    pass
             # Drain the cleanup registry ONCE, at process exit — this is what closes the browser and
             # finalizes the session record. Per-request runs pass teardown=False to stay warm.
             try:
@@ -1012,6 +1037,18 @@ def create_app(auth_required: bool = False, dev: bool = False) -> Any:
                 await asyncio.wait_for(run_cleanup_functions(), timeout=10.0)
             except Exception:  # noqa: BLE001 - best-effort
                 pass
+
+    # Registry-retirement cutover (design §9.8): when TABVIS_GATEWAY_AGENTS is on and the gateway is
+    # mounted, the agent lifecycle endpoints are served by gateway Run data instead of the AgentRecord
+    # registry. Default off, so the registry-backed path above is unchanged.
+    if _gateway_enabled() and _gateway_agents_enabled():
+        from tabvis.gateway.access.legacy_agents import gateway_agent_handlers
+
+        _gw_agent = gateway_agent_handlers()
+        run_agent = _gw_agent["run_agent"]
+        list_agents = _gw_agent["list_agents"]
+        get_agent = _gw_agent["get_agent"]
+        cancel_agent = _gw_agent["cancel_agent"]
 
     # RT-1: one declarative table of API routes, each mounted at BOTH its legacy path and a ``/v1``
     # alias (same handler, byte-identical response), so the versioned Runtime API surface can grow
@@ -1060,6 +1097,32 @@ def create_app(auth_required: bool = False, dev: bool = False) -> Any:
         routes.append(Route(path, handler, methods=methods))
         routes.append(Route("/v1" + path, handler, methods=methods))
     routes.append(WebSocketRoute("/v1/events", events_ws))  # RT-2: observation event channel
+
+    # Mount the Agent Gateway control plane (docs/AGENT_GATEWAY_DESIGN.md) additively: the new /v1
+    # command surface (/v1/runs, /v1/events SSE, interactions, conversations) is served alongside the
+    # legacy /v1/agents API, and Runs execute through the real agent loop via AgentRunLauncher. The
+    # gateway health lives at /v1/gateway/health so the legacy /v1/health is untouched, and the SSE
+    # GET /v1/events coexists with the legacy WebSocket at the same path (different scope types). Set
+    # TABVIS_GATEWAY=0 to disable.
+    gateway_app = None
+    if _gateway_enabled():
+        from tabvis.gateway.access.http import gateway_routes
+        from tabvis.gateway.lifecycle import GatewayApplication
+        from tabvis.gateway.runtime.agent import AgentRunLauncher
+        from tabvis.gateway.runtime.context.sources import SourceCollector
+
+        # The launcher assembles a Context Pack from live sources and injects its situational sections
+        # into the model's system prompt (design §11 → model call path), observable via context.pack.built.
+        gateway_app = GatewayApplication.build(
+            host="0.0.0.0" if auth_required else "127.0.0.1",
+            launcher=AgentRunLauncher(context_collector=SourceCollector()),
+        )
+        gateway_app.startup()
+        # include_compat=False: the legacy server still owns /v1/agents with its registry-backed
+        # handlers; the gateway's projection of that surface (design §9.8) is served by the standalone
+        # gateway app until a deliberate cutover.
+        routes.extend(gateway_routes(health_path="/v1/gateway/health", include_compat=False))
+
     if dev:
         # Catch-all LAST so API routes win; forwards Vite's module graph (/src/*, /@vite/*, …) to it.
         routes.append(Route("/{path:path}", proxy_to_vite, methods=["GET", "HEAD"]))
@@ -1068,6 +1131,8 @@ def create_app(auth_required: bool = False, dev: bool = False) -> Any:
     # P0-2: transport hardening (security headers, body cap, default-deny CORS) — pure ASGI, so the
     # SSE/streaming routes are untouched.
     app.add_middleware(SecurityMiddleware)
+    if gateway_app is not None:
+        app.state.gateway = gateway_app  # the gateway route handlers read this
     return app
 
 
