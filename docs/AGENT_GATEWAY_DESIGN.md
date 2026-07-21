@@ -1458,34 +1458,58 @@ Minimum durable events:
 
 ## 15. Implementation Plan
 
+### Implementation status
+
+The `tabvis/gateway/` package is being built additively, seams first, without touching the existing
+`tabvis/browser/server.py` control plane. Landed so far (all covered by `tests/gateway/`):
+
+- **Phase 0 (contracts)** — typed prefixed IDs (`tabvis/gateway/protocol/ids.py`), the stable error
+  catalog (`errors.py`), and the command/event envelopes (`commands.py`, `events.py`).
+- **Phase 1 core** — the immutable `RunRecord` and its state machine (`runtime/runs.py`); an
+  authoritative durable event log with global cursor + per-aggregate `seq`, its outbox, and the
+  command idempotency ledger in a dedicated `gateway.db` (`store/db.py`, `events/store.py`); the
+  in-memory live fan-out (`events/subscriptions.py`); and `RunStore` (`runtime/run_store.py`), which
+  creates Runs and applies compare-and-set transitions, emitting one event per transition in the
+  §12.3 transaction boundary.
+
+The durable store is deliberately **authoritative** (not the best-effort shadow that `runtime.db`
+is), so a write failure surfaces rather than being swallowed. Two internal-only Run statuses
+(`preparing`, `cancelling`) emit derived event names (`run.preparing`, `run.cancelling`) since the
+§14.2 catalog is a minimum, not an exhaustive list.
+
+Still to do in Phase 1: adapting the existing SSE stream onto the event log and exposing the latest
+Run in the `POST /agent` compatibility views — both land with the Phase 3 gateway extraction so the
+legacy control plane is moved rather than duplicated.
+
 ### Phase 0 — contracts and characterization
 
 Deliverables:
 
 - Freeze legacy endpoint behavior with integration tests.
-- Add typed IDs for `run_id`, `conversation_id`, `interaction_id`, `command_id`, `event_id`.
-- Add protocol error catalog.
+- Add typed IDs for `run_id`, `conversation_id`, `interaction_id`, `command_id`, `event_id`. ✅
+- Add protocol error catalog. ✅
 - Document current event names and redaction.
 
 Acceptance:
 
-- Existing CLI, Web console, tests, and `POST /agent` remain unchanged.
+- Existing CLI, Web console, tests, and `POST /agent` remain unchanged. ✅
 
 ### Phase 1 — Run split and durable events
 
 Deliverables:
 
-- Introduce immutable RunRecord.
-- Keep AgentRecord durable fields; expose latest Run in compatibility views.
-- Add events/outbox tables and Event envelope.
-- Add cursor-based `GET /v1/events`.
-- Adapt current SSE to events without changing legacy frames.
+- Introduce immutable RunRecord. ✅
+- Keep AgentRecord durable fields; expose latest Run in compatibility views. *(views pending Phase 3)*
+- Add events/outbox tables and Event envelope. ✅
+- Add cursor-based `GET /v1/events`. *(store-level `EventStore.read(after_cursor=…)` landed; HTTP
+  endpoint pending Phase 3 access layer)*
+- Adapt current SSE to events without changing legacy frames. *(pending Phase 3)*
 
 Acceptance:
 
-- Continuing one Agent creates two queryable Runs.
-- Disconnect/reconnect with a cursor yields no gap or duplicate application.
-- Restart preserves terminal Run history.
+- Continuing one Agent creates two queryable Runs. ✅ (`test_run_store.py`)
+- Disconnect/reconnect with a cursor yields no gap or duplicate application. ✅ (`test_event_store.py`)
+- Restart preserves terminal Run history. ✅ (`test_run_store.py` — cold read from `gateway.db`)
 
 ### Phase 2 — interactions
 
