@@ -1087,10 +1087,13 @@ def create_app(auth_required: bool = False, dev: bool = False) -> Any:
         from tabvis.gateway.access.http import gateway_routes
         from tabvis.gateway.lifecycle import GatewayApplication
         from tabvis.gateway.runtime.agent import AgentRunLauncher
+        from tabvis.gateway.runtime.context.sources import SourceCollector
 
+        # The launcher assembles a Context Pack from live sources and injects its situational sections
+        # into the model's system prompt (design §11 → model call path), observable via context.pack.built.
         gateway_app = GatewayApplication.build(
             host="0.0.0.0" if auth_required else "127.0.0.1",
-            launcher=AgentRunLauncher(),
+            launcher=AgentRunLauncher(context_collector=SourceCollector()),
         )
         gateway_app.startup()
         routes.extend(gateway_routes(health_path="/v1/gateway/health"))

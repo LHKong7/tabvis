@@ -24,8 +24,11 @@ import asyncio
 from typing import Any, Awaitable, Callable
 
 from tabvis.gateway.events.store import EventStore, get_event_store
-from tabvis.gateway.protocol.events import AGGREGATE_RUN, EventScope, EventType
+from tabvis.gateway.protocol.events import AGGREGATE_CONTEXT, AGGREGATE_RUN, EventScope, EventType
 from tabvis.gateway.runtime import runs
+from tabvis.gateway.runtime.context.render import render_system_context
+from tabvis.gateway.runtime.context.runtime import ContextRuntime
+from tabvis.gateway.runtime.context.sources import SourceCollector
 from tabvis.gateway.runtime.orchestrator import LaunchContext
 from tabvis.gateway.runtime.run_store import RunStore, get_run_store
 from tabvis.gateway.runtime.runs import RunRecord
@@ -62,10 +65,18 @@ class AgentRunLauncher:
         run_store: RunStore | None = None,
         events: EventStore | None = None,
         stream_fn: StreamFn | None = None,
+        *,
+        context_collector: SourceCollector | None = None,
+        context_runtime: ContextRuntime | None = None,
     ) -> None:
         self._runs = run_store or get_run_store()
         self._events = events or get_event_store()
         self._stream_fn = stream_fn
+        # When a collector is wired, the launcher assembles a Context Pack before the model call and
+        # injects its situational sections into the system prompt (design §11 → model call path). Off
+        # by default so the loop's own assembly is untouched unless a deployment opts in.
+        self._collector = context_collector
+        self._context_runtime = context_runtime
         self._tasks: dict[str, asyncio.Task[None]] = {}
 
     # --- RunLauncher protocol -------------------------------------------------------------------
@@ -101,6 +112,8 @@ class AgentRunLauncher:
             self._runs.transition(run.run_id, runs.PREPARING, expected=runs.QUEUED)
             self._runs.transition(run.run_id, runs.RUNNING, expected=runs.PREPARING)
 
+            await self._maybe_build_context(run, context)
+
             async for message in self._stream(run, context):
                 mtype = message.get("type")
                 if mtype == "assistant":
@@ -134,12 +147,40 @@ class AgentRunLauncher:
             log_for_debugging(f"[GATEWAY] run {run.run_id} failed: {e}")
             self._fail_best_effort(run.run_id, f"{type(e).__name__}: {e}", turns, tool_calls)
 
+    async def _maybe_build_context(self, run: RunRecord, context: LaunchContext) -> None:
+        """Assemble a Context Pack and stage its situational sections for the model (design §11).
+
+        Fully guarded: context assembly is additive and must never break a run. On success the rendered
+        block is stashed on the LaunchContext (consumed by :meth:`_stream`) and a durable
+        ``context.pack.built`` event records the pack id, digest, and size for observability / `explain`.
+        """
+        if self._collector is None:
+            return
+        try:
+            pack = await self._collector.build_pack(
+                runtime=self._context_runtime, run_id=run.run_id, session_id=run.session_id,
+                agent_id=run.agent_id, model=run.model or "",
+            )
+            rendered = render_system_context(pack)
+            if rendered:
+                context.extra["system_context"] = rendered
+            self._events.append(
+                AGGREGATE_CONTEXT, pack.context_pack_id, EventType.CONTEXT_PACK_BUILT,
+                scope=EventScope(agent_id=run.agent_id, session_id=run.session_id, run_id=run.run_id),
+                data={"context_pack_id": pack.context_pack_id, "digest": pack.digest,
+                      "token_estimate": pack.token_estimate, "injected": bool(rendered)},
+            )
+        except Exception as e:  # noqa: BLE001 - context assembly never breaks a run
+            log_for_debugging(f"[GATEWAY] context build failed for run {run.run_id}: {e}")
+
     async def _stream(self, run: RunRecord, context: LaunchContext):
         if self._stream_fn is not None:
             async for m in self._stream_fn(run, context):
                 yield m
             return
-        # Default: the real headless agent loop, unchanged (design non-goal: don't replace it).
+        # Default: the real headless agent loop, unchanged (design non-goal: don't replace it). The
+        # only new input is extra_system_context — the Context Runtime's situational block, appended to
+        # the system prompt inside stream_agent.
         from tabvis.ui.cli.print import stream_agent
 
         async for m in stream_agent(
@@ -152,6 +193,7 @@ class AgentRunLauncher:
             session_id=run.session_id,
             resume=context.resume,
             teardown=False,  # the gateway owns browser teardown; keep the bundle warm past the run
+            extra_system_context=context.extra.get("system_context"),
         ):
             yield m
 

@@ -66,6 +66,8 @@ class EventType:
     # channel delivery
     CHANNEL_DELIVERY_SUCCEEDED = "channel.delivery.succeeded"
     CHANNEL_DELIVERY_FAILED = "channel.delivery.failed"
+    # context
+    CONTEXT_PACK_BUILT = "context.pack.built"
     # policy
     POLICY_DECISION = "policy.decision"
 
@@ -78,6 +80,7 @@ AGGREGATE_CONVERSATION = "conversation"
 AGGREGATE_INTERACTION = "interaction"
 AGGREGATE_CHANNEL = "channel"
 AGGREGATE_BROWSER = "browser"
+AGGREGATE_CONTEXT = "context"
 
 
 @dataclass(frozen=True)
