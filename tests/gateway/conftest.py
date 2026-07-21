@@ -15,6 +15,7 @@ from tabvis.gateway.events import subscriptions
 from tabvis.gateway.runtime import interaction_service as interaction_mod
 from tabvis.gateway.runtime import orchestrator as orchestrator_mod
 from tabvis.gateway.runtime import run_store as run_store_mod
+from tabvis.gateway.runtime.browser import runtime as browser_runtime_mod
 from tabvis.gateway.runtime.context import runtime as context_mod
 from tabvis.gateway.store import db
 
@@ -34,4 +35,5 @@ def _reset() -> None:
     interaction_mod.reset_signals()
     orchestrator_mod._orchestrator = None
     context_mod._runtime = None
+    browser_runtime_mod._runtime = None
     subscriptions.reset_live_bus()

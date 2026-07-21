@@ -1746,8 +1746,18 @@ session is live, and `close` quits the agent's browser. Because the manager is k
 maps `profile_key → agent_id`. Every manager touchpoint is an injectable hook (real by default), so the
 driver is unit-tested end to end through the real `BrowserRuntime` with a fake service — no Chromium
 required (`test_manager_driver.py`). `runtime/browser.real_browser_runtime(model, cwd)` composes a
-Browser Runtime that drives real Chromium. Rerouting the agent's own browser *tools* to acquire a
-`binding_id` (rather than the current agent-id ContextVar path) is the remaining §10.4 step.
+Browser Runtime that drives real Chromium.
+
+**Integration — agent tools → binding_id (landed, opt-in).** The binding is now the leased, observable
+access path (design §10.4). When a Browser Runtime is wired into the `AgentRunLauncher`, the run
+acquires a binding around the model loop and publishes it on a ContextVar
+(`runtime/browser/binding_context.py`); a browser tool resolves it and drives the page through
+`runtime/browser/access.py::execute_intent` — naming an intent, never holding a raw browser. The
+binding is released on completion or failure (a shared-profile conflict fails the run deterministically
+with `BROWSER_PROFILE_BUSY`), and acquire/release emit their events. `execute_intent` is the single
+choke point; converting each production browser tool to call it (retiring the direct agent-id
+ContextVar path) is a mechanical rollout, so the launcher wiring is opt-in (`browser_runtime=…`) and
+not yet enabled in the daemon by default. Verified by `test_tool_binding.py`.
 
 ### Phase 8 — optional process separation
 
