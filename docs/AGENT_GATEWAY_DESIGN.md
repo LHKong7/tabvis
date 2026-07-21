@@ -1559,10 +1559,20 @@ The new access layer serves the §9.4 core methods — `POST /v1/conversations`,
 `GET /v1/runs/{id}`, `POST /v1/runs/{id}/cancel`, `POST /v1/interactions/{id}/responses`,
 `GET /v1/events` (cursor-resumable SSE), `GET /v1/health` — with a command router that enforces
 `command_id` idempotency, a `Principal` resolved from credentials (reusing `server_auth`), and the
-§9.7 error body. Runs are created and observable, and **execute for real** once an
-`AgentRunLauncher` is wired into `GatewayApplication.build(launcher=...)` — see the integration note
-below. Moving the legacy `/v1/agents` routes onto this app and adapting the current SSE frames is the
-remaining extraction work.
+§9.7 error body. Runs are created and observable, and **execute for real** through the
+`AgentRunLauncher` (integration note below). Moving the legacy `/v1/agents` routes onto this app and
+adapting the current SSE frames is the remaining extraction work.
+
+**Integration — mounted in the daemon (landed).** `tabvis/browser/server.py::create_app` now mounts the
+gateway control plane **additively** alongside the legacy API (gated by `TABVIS_GATEWAY`, default on):
+it builds `GatewayApplication.build(host=…, launcher=AgentRunLauncher())`, starts it, and splices
+`gateway_routes()` into the server. The new command surface (`POST /v1/runs`, `GET /v1/runs/{id}`,
+cancel, `POST /v1/interactions/{id}/responses`, `POST /v1/conversations`, `GET /v1/events` SSE) is
+served next to the untouched legacy `/v1/agents` API; gateway health is at `/v1/gateway/health` so the
+legacy `/v1/health` is unaffected, and the SSE `GET /v1/events` coexists with the legacy WebSocket at
+the same path (different ASGI scope types). The gateway drains on server shutdown. A run created over
+`POST /v1/runs` now executes the real agent loop. Verified by `test_server_mount.py` against the real
+`create_app`.
 
 **Integration — RunLauncher → real agent loop (landed).** `runtime/agent/runner.py::AgentRunLauncher`
 is the concrete `RunLauncher` (§7.8): the orchestrator hands it a Run + `LaunchContext` (prompt,

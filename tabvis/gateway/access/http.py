@@ -153,12 +153,13 @@ async def subscribe_events(request: Request) -> Response:
     return EventSourceResponse(generator)
 
 
-def create_gateway_app(gateway: GatewayApplication | None = None, *, launcher: Any = None) -> Starlette:
-    """Build the standalone gateway ASGI app. Pass a prebuilt ``gateway`` or let one be composed."""
-    app_gateway = gateway or GatewayApplication.build(launcher=launcher)
-    app_gateway.startup()
+def gateway_routes(*, health_path: str = "/v1/health") -> list[Route]:
+    """The gateway's §9.4 HTTP routes, as a splice-able list.
+
+    ``health_path`` is configurable so the routes can be mounted into an app that already owns
+    ``/v1/health`` (the legacy server) without colliding — see :func:`tabvis.browser.server.create_app`.
+    """
     routes = [
-        Route("/v1/health", health, methods=["GET"]),
         Route("/v1/conversations", create_conversation, methods=["POST"]),
         Route("/v1/runs", create_run, methods=["POST"]),
         Route("/v1/runs/{run_id}", read_run, methods=["GET"]),
@@ -166,7 +167,16 @@ def create_gateway_app(gateway: GatewayApplication | None = None, *, launcher: A
         Route("/v1/interactions/{interaction_id}/responses", respond_interaction, methods=["POST"]),
         Route("/v1/events", subscribe_events, methods=["GET"]),
     ]
-    app = Starlette(routes=routes)
+    if health_path:
+        routes.insert(0, Route(health_path, health, methods=["GET"]))
+    return routes
+
+
+def create_gateway_app(gateway: GatewayApplication | None = None, *, launcher: Any = None) -> Starlette:
+    """Build the standalone gateway ASGI app. Pass a prebuilt ``gateway`` or let one be composed."""
+    app_gateway = gateway or GatewayApplication.build(launcher=launcher)
+    app_gateway.startup()
+    app = Starlette(routes=gateway_routes())
     app.add_middleware(SecurityMiddleware)
     app.state.gateway = app_gateway
     return app
