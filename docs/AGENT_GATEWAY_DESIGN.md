@@ -1051,9 +1051,22 @@ The standalone gateway app mounts these as `GET /v1/agents`, `GET /v1/agents/{id
 `POST /v1/agents/{id}/cancel` (cancels the agent's active Run via the orchestrator), and
 `GET /v1/agents/{id}/events` (legacy frames), with the same ownership filtering as the legacy server.
 When mounted into the live daemon the compat routes are **excluded** (`include_compat=False`) because the
-legacy server still owns those paths with its registry-backed handlers — pointing them at this
-projection and retiring the registry is the final, deliberate cutover. Verified by
+legacy server owns those paths — but a flag now flips them onto the gateway (below). Verified by
 `test_legacy_compat.py`.
+
+**Registry-retirement cutover (landed, flag-gated).** `access/legacy_agents.py` serves the *entire*
+legacy `/agents` surface from the gateway when `TABVIS_GATEWAY_AGENTS` is on (default off): `POST /agent`
+resolves/mints the agent, checks capacity and browser-profile bundling, creates a gateway Run via the
+router (executed by the wired `AgentRunLauncher`), and streams the Run's events projected to legacy SSE
+frames (`_legacy_agent_stream`: durable replay then live, ending on a terminal event); `GET /agents`,
+`GET /agents/{id}`, and `POST /agents/{id}/cancel` are the Run-data projections. `server.py::create_app`
+swaps the registry handlers for these when the flag is on, so the gateway becomes the single source of
+truth for the agent lifecycle and the `AgentRecord` registry leaves the public control path. Off by
+default so every registry-backed test is unchanged; flipping the flag on, observing, then deleting the
+registry (and migrating its unit tests) is the operational rollout. The browser-bundle endpoints
+(`/quit`, `/browser`, `/artifacts`, `/identity`) remain registry-backed pending their own migration.
+Verified by `test_legacy_agents_cutover.py` (isolated app with an injected fake launcher for the full
+`POST /agent` lifecycle; the real server with the flag on for the read path).
 
 ---
 

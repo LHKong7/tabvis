@@ -406,6 +406,16 @@ def _gateway_enabled() -> bool:
     return val.strip().lower() not in ("0", "false", "no", "off", "")
 
 
+def _gateway_agents_enabled() -> bool:
+    """Whether the legacy ``/agents`` surface is served by the gateway (retiring the registry).
+
+    ``TABVIS_GATEWAY_AGENTS`` (default OFF). When on (and the gateway is mounted), the agent lifecycle
+    endpoints are backed by gateway Run data instead of the ``AgentRecord`` registry (design §9.8).
+    """
+    val = os.environ.get("TABVIS_GATEWAY_AGENTS")
+    return bool(val) and val.strip().lower() not in ("0", "false", "no", "off", "")
+
+
 def create_app(auth_required: bool = False, dev: bool = False) -> Any:
     """Build the Starlette app (imports are local so importing this module stays cheap).
 
@@ -1027,6 +1037,18 @@ def create_app(auth_required: bool = False, dev: bool = False) -> Any:
                 await asyncio.wait_for(run_cleanup_functions(), timeout=10.0)
             except Exception:  # noqa: BLE001 - best-effort
                 pass
+
+    # Registry-retirement cutover (design §9.8): when TABVIS_GATEWAY_AGENTS is on and the gateway is
+    # mounted, the agent lifecycle endpoints are served by gateway Run data instead of the AgentRecord
+    # registry. Default off, so the registry-backed path above is unchanged.
+    if _gateway_enabled() and _gateway_agents_enabled():
+        from tabvis.gateway.access.legacy_agents import gateway_agent_handlers
+
+        _gw_agent = gateway_agent_handlers()
+        run_agent = _gw_agent["run_agent"]
+        list_agents = _gw_agent["list_agents"]
+        get_agent = _gw_agent["get_agent"]
+        cancel_agent = _gw_agent["cancel_agent"]
 
     # RT-1: one declarative table of API routes, each mounted at BOTH its legacy path and a ``/v1``
     # alias (same handler, byte-identical response), so the versioned Runtime API surface can grow
