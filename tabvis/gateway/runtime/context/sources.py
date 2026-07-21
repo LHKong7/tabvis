@@ -57,6 +57,12 @@ def _real_browser_summary(agent_id: str) -> dict | None:
     return summary or None
 
 
+async def _real_transcript(session_id: str) -> list:
+    from tabvis.gateway.runtime.context.transcript import load_session_transcript
+
+    return await load_session_transcript(session_id)
+
+
 @dataclass
 class SourceCollector:
     """Gathers a live :class:`ContextRequest`. Each field overrides its real loader (tests inject fakes)."""
@@ -65,7 +71,7 @@ class SourceCollector:
     memory: AsyncStr | None = None
     git_status: AsyncStr | None = None
     browser_summary: BrowserSummary | None = None
-    transcript: TranscriptLoader | None = None     # session_id -> [{id, role, text}]; default: none
+    transcript: TranscriptLoader | None = None     # session_id -> [{id, role, text}]; default: real loader
     compact_summaries: list | None = None
     tool_descriptors: list | None = None
     mcp_resources: list | None = None
@@ -102,8 +108,9 @@ class SourceCollector:
         if git:
             sources["workspace"] = git
 
-        if session_id and self.transcript is not None:
-            tx = await _guard_async(lambda: self.transcript(session_id))
+        if session_id:
+            loader = self.transcript or _real_transcript
+            tx = await _guard_async(lambda: loader(session_id))
             if tx:
                 sources["transcript"] = tx
 
