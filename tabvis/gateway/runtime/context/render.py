@@ -5,10 +5,10 @@ model's system prompt. Two guards:
 
 * **No secret material** — ``secret_ref`` sections carry only a reference and are dropped here (design
   §11.7); the pack never held the value anyway.
-* **No duplication** — sections the base system prompt already emits (project instructions, memory,
-  safety, agent definition) are excluded by default, so only the Context Runtime's *situational*
-  additions (workspace/Git, browser, todos, channel identity) reach the model. This is the interim
-  overlap boundary until the base prompt assembly is fully migrated onto the pack.
+* **No duplication** — the pack is now authoritative for project instructions, memory, and situational
+  context (workspace/Git, browser, todos, channel identity), so ``stream_agent`` suppresses the base
+  prompt's own project-instructions/memory sections when this block is supplied (``owns_system_context``).
+  Only ``safety`` and ``agent`` remain the base prompt's job and are excluded here.
 
 The block is prefixed with the pack id and a short digest so what the model saw is traceable back to an
 ``explain`` report.
@@ -18,8 +18,8 @@ from __future__ import annotations
 
 from tabvis.gateway.runtime.context.pack import SECRET_REF, ContextPack
 
-# The base system prompt already emits these; excluding them avoids double-inclusion.
-DEFAULT_EXCLUDED = frozenset({"project_instructions", "memory", "safety", "agent"})
+# safety + agent definition stay the base prompt's responsibility; everything else the pack now owns.
+DEFAULT_EXCLUDED = frozenset({"safety", "agent"})
 
 
 def render_system_context(

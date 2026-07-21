@@ -1669,8 +1669,18 @@ durable `context.pack.built` event (pack id, digest, size) and stores the pack f
 the model saw is deterministic and traceable. Context assembly is fully guarded — a failing source
 degrades and never breaks the run. The daemon (`server.py::create_app`) wires the collector, so gateway
 runs feed live situational context to the model. Verified by `test_launcher_context.py` /
-`test_context_render.py`. Fully replacing the base prompt assembly with the pack (removing the
-project-instructions/memory overlap) is the remaining migration.
+`test_context_render.py`.
+
+**Full base-prompt migration (landed).** The pack is now authoritative for **project instructions and
+memory** too, not just situational context. `get_system_prompt` gained an `include_memory` toggle
+(mirroring the existing `include_project_instructions`); when the launcher builds a pack it sets
+`owns_system_context`, and `stream_agent` then calls `get_system_prompt(..., include_project_instructions=False,
+include_memory=False)` so the base prompt suppresses its own copies while the pack supplies them —
+using the *same* `load_project_instructions_prompt` / `load_memory_prompt` loaders, so the content is
+identical but now deterministic, budgeted, and traceable to a digest. The renderer excludes only
+`safety`/`agent` (still the base prompt's job). Verified by `test_system_prompt_toggle.py`. What remains
+is routing the base prompt's *situational* pieces (env/git) through the pack too, and the broader
+tool/MCP descriptor assembly — the model-facing project context itself is now the Context Runtime's.
 
 ### Phase 6 — Plugin Runtime
 
