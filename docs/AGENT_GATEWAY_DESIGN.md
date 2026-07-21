@@ -1596,16 +1596,29 @@ mounted alongside the Phase 3 access layer.
 
 Deliverables:
 
-- ContextProvider contract and deterministic ordering.
-- Context Pack digest/provenance.
-- Providers wrapping project instructions, transcript, memory, Git, browser, tools, MCP, and skills.
-- Redacted context explain endpoint.
+- ContextProvider contract and deterministic ordering. ✅ (`runtime/context/providers/` in the fixed
+  §11.3 order)
+- Context Pack digest/provenance. ✅ (`runtime/context/pack.py`: reproducible digest over model +
+  ordered section content digests; full `provenance` with include/drop reasons)
+- Providers wrapping project instructions, transcript, memory, Git, browser, tools, MCP, and skills. ✅
+  *(the deterministic core reads a source snapshot; wiring each provider to its live subsystem is an
+  adapter step)*
+- Redacted context explain endpoint. ✅ (`ContextRuntime.explain` — service-level; HTTP binding is a
+  thin follow-up on the Phase 3 access layer)
 
 Acceptance:
 
-- Identical source revisions produce the same digest.
-- Token budget decisions are explainable.
-- No secret material appears in Context Pack snapshots.
+- Identical source revisions produce the same digest. ✅ (`test_context_runtime.py`)
+- Token budget decisions are explainable. ✅ (`explain` reports every section's include/drop reason)
+- No secret material appears in Context Pack snapshots. ✅ (`secret_ref` sections store only the ref;
+  the digest hashes the ref, not the value — `test_context_runtime.py`)
+
+The runtime is a pure function of its `ContextRequest`: providers read a source snapshot, a
+deterministic budget (`runtime/context/budget.py`) reserves required sections (safety, current user
+message, tool schemas) and greedily includes optional ones by priority/freshness — atomically, so
+structured JSON is never truncated — and the pack's `digest` depends only on model + included source
+content. A version is bumped per cache key only when a source digest changes (§11.6). `explain` masks
+sensitive/secret content while preserving all provenance (§11.7).
 
 ### Phase 6 — Plugin Runtime
 
