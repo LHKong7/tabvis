@@ -26,6 +26,7 @@ from tabvis.gateway.runtime.browser.contracts import (
     BrowserDriver,
     BrowserIntent,
     BrowserSnapshot,
+    DriverSpec,
     ExecutionRecord,
 )
 from tabvis.gateway.runtime.browser.identity import resolve_identity
@@ -61,7 +62,10 @@ class BrowserRuntime:
         )
         session.transition(session_mod.LAUNCHING)
         if self._driver is not None:
-            await self._driver.launch(identity.profile_key, request.engine)
+            await self._driver.launch(DriverSpec(
+                profile_key=identity.profile_key, agent_id=request.agent_id, profile=request.profile,
+                engine=request.engine, session_id=session.session_id,
+            ))
         session.transition(session_mod.READY)
         session.transition(session_mod.BUSY)  # Run binding acquired (design §10.3)
         session.open_tab()

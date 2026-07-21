@@ -96,10 +96,25 @@ class ExecutionRecord:
     detail: str | None = None
 
 
+@dataclass
+class DriverSpec:
+    """What the driver needs to launch a real browser for a binding.
+
+    The runtime is keyed by ``profile_key`` (the exclusive claim), but the underlying tabvis manager is
+    keyed by ``agent_id`` — so the spec carries both, and the driver maps ``profile_key → agent_id`` for
+    the later profile-key-only calls (execute/verify/close)."""
+
+    profile_key: str
+    agent_id: str
+    profile: str | None
+    engine: str
+    session_id: str
+
+
 class BrowserDriver(Protocol):
     """The real-browser seam. A deployment implements this over Playwright; tests use a fake."""
 
-    async def launch(self, profile_key: str, engine: str) -> None: ...
+    async def launch(self, spec: DriverSpec) -> None: ...
     async def execute(self, profile_key: str, intent: BrowserIntent) -> dict[str, Any]: ...
     async def verify_identity(self, profile_key: str) -> bool: ...
     async def close(self, profile_key: str) -> None: ...
