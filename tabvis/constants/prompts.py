@@ -432,6 +432,7 @@ async def get_system_prompt(
     mcp_clients: list | None = None,
     *,
     include_project_instructions: bool = True,
+    include_memory: bool = True,
 ) -> list[str]:
     if is_env_truthy(os.environ.get("TABVIS_SIMPLE")):
         return [
@@ -460,7 +461,9 @@ async def get_system_prompt(
                 else None
             ),
         ),
-        system_prompt_section("memory", load_memory_prompt),
+        system_prompt_section(
+            "memory", lambda: load_memory_prompt() if include_memory else None
+        ),
         system_prompt_section("ant_model_override", lambda: None),
         system_prompt_section(
             "env_info_simple",

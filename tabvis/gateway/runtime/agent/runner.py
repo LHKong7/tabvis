@@ -164,6 +164,9 @@ class AgentRunLauncher:
             rendered = render_system_context(pack)
             if rendered:
                 context.extra["system_context"] = rendered
+            # The pack is now authoritative for project instructions + memory too, so tell the loop to
+            # suppress the base prompt's copies (full base-prompt migration under the gateway path).
+            context.extra["owns_system_context"] = True
             self._events.append(
                 AGGREGATE_CONTEXT, pack.context_pack_id, EventType.CONTEXT_PACK_BUILT,
                 scope=EventScope(agent_id=run.agent_id, session_id=run.session_id, run_id=run.run_id),
@@ -194,6 +197,7 @@ class AgentRunLauncher:
             resume=context.resume,
             teardown=False,  # the gateway owns browser teardown; keep the bundle warm past the run
             extra_system_context=context.extra.get("system_context"),
+            owns_system_context=context.extra.get("owns_system_context", False),
         ):
             yield m
 

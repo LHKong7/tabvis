@@ -233,6 +233,7 @@ async def stream_agent(
     session_id: str | None = None,
     resume: bool = False,
     extra_system_context: str | None = None,
+    owns_system_context: bool = False,
 ) -> Any:
     """Run one agent session, yielding each SDKMessage as it is produced.
 
@@ -357,9 +358,15 @@ async def stream_agent(
                 )
                 seed_messages = [*prior, *new_turn]
 
-        system_prompt = await get_system_prompt(tools, model, None, mcp_clients)
-        # A caller (the gateway's Context Runtime) may supply a pre-assembled situational context block
-        # to append to the system prompt — deterministically built and observable via context.pack.built.
+        # A caller (the gateway's Context Runtime) may own project-context assembly: it supplies a
+        # pre-assembled block (``extra_system_context``, deterministic and observable via
+        # context.pack.built) that already includes project instructions + memory, so the base prompt
+        # suppresses its own copies to avoid duplication (``owns_system_context``).
+        system_prompt = await get_system_prompt(
+            tools, model, None, mcp_clients,
+            include_project_instructions=not owns_system_context,
+            include_memory=not owns_system_context,
+        )
         if extra_system_context:
             system_prompt = [*system_prompt, extra_system_context]
 

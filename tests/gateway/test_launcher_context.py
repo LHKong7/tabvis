@@ -39,6 +39,7 @@ def test_launcher_injects_situational_context_and_emits_pack_event() -> None:
 
         async def capture(run, context):
             captured["system_context"] = context.extra.get("system_context")
+            captured["owns"] = context.extra.get("owns_system_context")
             yield {"type": "assistant", "message": {"content": [{"type": "text", "text": "ok"}]}}
             yield {"type": "result", "result": "done"}
 
@@ -54,10 +55,12 @@ def test_launcher_injects_situational_context_and_emits_pack_event() -> None:
 
         assert rs.get_run(run.run_id).status == runs.COMPLETED
 
-        # the situational block reached the stream (workspace + browser), base sources excluded.
+        # the pack drives the model: project instructions + memory + situational all reach the stream,
+        # and the loop is told it owns project context (base prompt suppresses its own copies).
         block = captured["system_context"]
         assert block and "feature-x" in block and "example.com" in block
-        assert "BASE INSTRUCTIONS" not in block and "BASE MEMORY" not in block
+        assert "BASE INSTRUCTIONS" in block and "BASE MEMORY" in block
+        assert captured["owns"] is True
 
         # a durable context.pack.built event was emitted with a digest.
         built = [e for e in get_event_store().read() if e.type == EventType.CONTEXT_PACK_BUILT]
