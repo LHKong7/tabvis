@@ -1624,13 +1624,27 @@ sensitive/secret content while preserving all provenance (§11.7).
 
 Deliverables:
 
-- Manifest, discovery, validation, dependency graph, lifecycle, capabilities.
-- Built-in adapters for MCP, skills, browser engines, and channels.
+- Manifest, discovery, validation, dependency graph, lifecycle, capabilities. ✅
+  (`gateway/plugins/`: `manifest.py`, `discovery.py`, `validation.py`, `dependency.py`, `registry.py`,
+  `contract.py`, plus `version.py` and `permissions.py`)
+- Built-in adapters for MCP, skills, browser engines, and channels. ✅ (`gateway/plugins/builtin.py`,
+  in the §8.7 registration order)
 
 Acceptance:
 
-- An incompatible or over-privileged plugin is rejected before startup.
-- Optional plugin failure does not stop core Gateway readiness.
+- An incompatible or over-privileged plugin is rejected before startup. ✅ (`test_plugins.py` — a
+  `requires.tabvis` the host fails, or a permission outside the grantable ceiling, both fail validation
+  and never load)
+- Optional plugin failure does not stop core Gateway readiness. ✅ (`test_plugins.py` — an optional
+  plugin that raises on start goes `degraded`; healthy plugins stay `ready`; a required plugin's failure
+  raises)
+
+The registry drives every kind through one §8.3 lifecycle: validate before startup, start in
+topological dependency order and stop in reverse, and contain optional failures to `degraded`. The
+permission model is `requested ∩ granted` with an over-privileged request (outside the grantable
+ceiling) rejected up front (§8.6); a plugin receives only a capability-scoped services object, never a
+store. Built-in adapters register today's browser engines, MCP servers, Skills, and channels as plugins
+(§8.7) — deep-wiring each adapter to its subsystem and third-party installation are the follow-ups.
 
 ### Phase 7 — Browser Runtime hardening
 
