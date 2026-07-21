@@ -18,7 +18,7 @@ class _RecordingLauncher:
         self.launched: list[str] = []
         self.aborted: list[str] = []
 
-    async def launch(self, run) -> None:
+    async def launch(self, run, context=None) -> None:
         self.launched.append(run.run_id)
 
     async def abort(self, run_id: str) -> None:

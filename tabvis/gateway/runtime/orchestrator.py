@@ -12,7 +12,8 @@ but not executed — exactly the control-plane slice Phase 3 delivers, testable 
 
 from __future__ import annotations
 
-from typing import Protocol
+from dataclasses import dataclass, field
+from typing import Any, Protocol
 
 from tabvis.gateway.protocol.errors import GatewayError
 from tabvis.gateway.runtime import runs
@@ -22,10 +23,22 @@ from tabvis.gateway.runtime.runs import RunRecord
 from tabvis.utils.debug import log_for_debugging
 
 
-class RunLauncher(Protocol):
-    """Executes a Run's model/tool loop. Implemented by the Agent Runtime (a later phase)."""
+@dataclass
+class LaunchContext:
+    """The run-scoped inputs the launcher needs beyond the RunRecord (the prompt is a message, not a
+    RunRecord field, so it is threaded here from the command/channel that created the Run)."""
 
-    async def launch(self, run: RunRecord) -> None: ...
+    prompt: str = ""
+    profile: str | None = None
+    resume: bool = False
+    stream_partials: bool = False
+    extra: dict[str, Any] = field(default_factory=dict)
+
+
+class RunLauncher(Protocol):
+    """Executes a Run's model/tool loop. Implemented by the Agent Runtime (`runtime/agent/runner.py`)."""
+
+    async def launch(self, run: RunRecord, context: LaunchContext) -> None: ...
 
     async def abort(self, run_id: str) -> None: ...
 
@@ -57,15 +70,22 @@ class RunOrchestrator:
         workspace_id: str | None = None,
         max_turns: int | None = None,
         attempt: int = 1,
+        prompt: str = "",
+        profile: str | None = None,
+        resume: bool = False,
+        stream_partials: bool = False,
     ) -> RunRecord:
-        """Create a Run and, if a launcher is wired, start executing it."""
+        """Create a Run and, if a launcher is wired, start executing it (design §7)."""
         run = self._runs.create_run(
             agent_id=agent_id, session_id=session_id, command_id=command_id, model=model,
             prompt_message_id=prompt_message_id, conversation_id=conversation_id,
             workspace_id=workspace_id, max_turns=max_turns, attempt=attempt, correlation_id=command_id,
         )
         if self._launcher is not None:
-            await self._launcher.launch(run)
+            await self._launcher.launch(
+                run,
+                LaunchContext(prompt=prompt, profile=profile, resume=resume, stream_partials=stream_partials),
+            )
         return run
 
     async def cancel(self, run_id: str, *, correlation_id: str | None = None) -> RunRecord:

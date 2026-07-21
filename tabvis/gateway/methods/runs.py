@@ -12,6 +12,16 @@ from tabvis.gateway.runtime.run_store import RunStore, get_run_store
 from tabvis.gateway.store import db
 
 
+def _prompt_text(data: dict) -> str:
+    """Extract the user prompt from a run.create body: a ``message`` object/string or ``prompt``."""
+    message = data.get("message")
+    if isinstance(message, dict):
+        return str(message.get("text", ""))
+    if isinstance(message, str):
+        return message
+    return str(data.get("prompt", ""))
+
+
 class RunCreateHandler:
     """``run.create`` — resolve/mint the Agent + Session, create a Run, hand it to the orchestrator.
 
@@ -44,6 +54,10 @@ class RunCreateHandler:
             conversation_id=data.get("conversation_id"),
             workspace_id=data.get("workspace_id"),
             max_turns=data.get("max_turns"),
+            prompt=_prompt_text(data),
+            profile=data.get("profile"),
+            resume=bool(data.get("resume", False)),
+            stream_partials=bool(data.get("stream", False)),
         )
         return CommandResult(command.command_id, data={"run": run.to_dict()})
 

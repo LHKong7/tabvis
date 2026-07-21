@@ -1559,10 +1559,21 @@ The new access layer serves the §9.4 core methods — `POST /v1/conversations`,
 `GET /v1/runs/{id}`, `POST /v1/runs/{id}/cancel`, `POST /v1/interactions/{id}/responses`,
 `GET /v1/events` (cursor-resumable SSE), `GET /v1/health` — with a command router that enforces
 `command_id` idempotency, a `Principal` resolved from credentials (reusing `server_auth`), and the
-§9.7 error body. Runs are created and observable but only *execute* once a real `RunLauncher`
-(wrapping the existing agent loop into `runtime/agent/runner.py`) is wired — that bridge, plus moving
-the legacy `/v1/agents` routes onto this app and adapting the current SSE frames, is the remaining
-extraction work.
+§9.7 error body. Runs are created and observable, and **execute for real** once an
+`AgentRunLauncher` is wired into `GatewayApplication.build(launcher=...)` — see the integration note
+below. Moving the legacy `/v1/agents` routes onto this app and adapting the current SSE frames is the
+remaining extraction work.
+
+**Integration — RunLauncher → real agent loop (landed).** `runtime/agent/runner.py::AgentRunLauncher`
+is the concrete `RunLauncher` (§7.8): the orchestrator hands it a Run + `LaunchContext` (prompt,
+profile, resume), and it starts the Run's execution in its own task, driving `preparing → running →
+completed | failed` while streaming tabvis's existing headless loop (`stream_agent`, unchanged) and
+emitting durable `assistant.message.completed` / `tool.completed` events (bounded — no full DOM/secret
+payloads). Cancel stays cooperative: `abort` cancels the task and the orchestrator owns the
+`cancelling → cancelled` transitions. The prompt now threads from the `run.create` command body and
+from channel inbound messages into the loop. The loop is injected (`stream_fn`) so the launcher is
+tested without a model or browser (`test_agent_launcher.py`), and a `POST /v1/runs` with a wired
+launcher runs the agent end to end.
 
 ### Phase 4 — Channel Framework
 
