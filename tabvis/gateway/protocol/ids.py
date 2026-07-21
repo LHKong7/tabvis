@@ -27,6 +27,7 @@ EVENT_PREFIX: Final = "evt_"
 SUBSCRIPTION_PREFIX: Final = "sub_"
 WORKSPACE_PREFIX: Final = "ws_"
 DELIVERY_PREFIX: Final = "dlv_"
+CONTEXT_PACK_PREFIX: Final = "ctx_"
 
 _ENTROPY_BYTES: Final = 6
 
@@ -81,6 +82,10 @@ def new_workspace_id() -> str:
 
 def new_delivery_id() -> str:
     return _mint(DELIVERY_PREFIX)
+
+
+def new_context_pack_id() -> str:
+    return _mint(CONTEXT_PACK_PREFIX)
 
 
 # --- validators --------------------------------------------------------------------------------
