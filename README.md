@@ -56,10 +56,10 @@ Your goal
    │
    ▼
 Agent reasoning loop
-   ├── Files: Read · Edit · Write · Glob · Grep
-   ├── Runtime: Bash · TodoWrite · Workflow · Agent
-   ├── Browser: Navigate · Snapshot · Click · Type · Wait
-   └── Extensions: MCP · project/user skills
+   ├── Files:      Read · Edit · Write · Glob · Grep · NotebookEdit
+   ├── Runtime:    Bash · Workflow · Agent · TodoWrite · AskUserQuestion · ToolSearch
+   ├── Browser:    BrowserNavigate · BrowserSnapshot · BrowserClick · BrowserType · BrowserWait · BrowserDownload
+   └── Extensions: Skill (project/user skills) · MCP tools
    │
    ▼
 Observed result → next action → completed outcome
@@ -137,14 +137,23 @@ starting an interactive terminal UI.
 
 ### Local agent service
 
-Run the HTTP/SSE server and open its web console:
+Run the HTTP/SSE server:
 
 ```bash
 uv run tabvis --serve
-# http://127.0.0.1:8765
+# JSON/SSE API on http://127.0.0.1:8765
 ```
 
-Or launch an agent programmatically:
+Tabvis is headless and serves **no built-in UI** by default — `GET /` returns a JSON pointer, and
+`/health` is the liveness probe. To use the bundled web console, either attach the live dev console:
+
+```bash
+uv run tabvis --serve --dev     # starts Vite and reverse-proxies the console at http://127.0.0.1:8765/
+```
+
+or build `web/` and host the static bundle yourself, pointed at the API (see [`web/README.md`](web/README.md)).
+
+Launch an agent programmatically over SSE:
 
 ```bash
 curl -N -X POST http://127.0.0.1:8765/agent \
@@ -153,11 +162,16 @@ curl -N -X POST http://127.0.0.1:8765/agent \
 ```
 
 The service can launch and inspect agents, stream events, cancel runs, expose browser history and
-artifacts, and update supported settings without restarting the process. Agents can run in
-parallel with isolated browser workspaces.
+artifacts, and update supported settings without restarting the process. Agents run in parallel with
+isolated browser workspaces. With `TABVIS_GATEWAY` enabled (the default), the gateway control-plane
+routes (`/v1/runs`, `/v1/events`, `/v1/interactions/…`, `/v1/gateway/health`) mount alongside the
+legacy surface. See [Running Tabvis](docs/RUNNING.md) for the full endpoint reference.
 
-> The server has no built-in user authentication and binds to `127.0.0.1` by default. Do not
-> expose it to an untrusted network without an authentication proxy and appropriate isolation.
+> **Security.** On its default `127.0.0.1` bind the server is unauthenticated — anyone who can reach
+> the port acts as you. A token-based auth layer (admin bearer token + per-agent credentials) engages
+> automatically on any non-loopback bind, and the server refuses to start a public bind without
+> `TABVIS_SERVER_ADMIN_TOKEN`. Even so, do not expose it to an untrusted network without a proxy and
+> appropriate isolation.
 
 ## Browser choices
 
@@ -182,17 +196,28 @@ by the remote browser provider.
 
 ```text
 tabvis/
-├── agent/       reasoning loop, model providers, tools, memory, MCP, workflows
-├── browser/     browser runtime, sessions, artifacts, HTTP/SSE service
-├── policy/      permission rules and action adapters
-├── ui/          CLI entrypoints, server configuration, slash commands
+├── agent/       reasoning loop, model providers, tools, memory, MCP, skills, workflows, sub-agents
+├── browser/     browser runtime, sessions, downloads, artifacts, HTTP/SSE service
+├── gateway/     Agent Gateway control plane — runs, durable events, interactions, context packs
+├── channels/    inbound/outbound messaging framework (web + webhook plugins)
+├── policy/      unified permission engine — actions, resources, modes, adapters
+├── ui/          CLI entrypoints, server config API, slash commands, workflows
 ├── services/    shared runtime services
-└── utils/       focused cross-cutting helpers
+├── constants/   tool names and shared constants
+├── state/       app/session state
+├── types/       shared and generated types
+└── utils/       settings, model resolution, permissions, sandbox, and other helpers
 ```
 
 The built-in tool registry lives in `tabvis/agent/tools/`. Connected MCP tools are added to the same
 tool pool at runtime. Anthropic is the default model protocol; OpenAI and Gemini providers adapt
 their native streaming formats to the same agent loop.
+
+The **Agent Gateway** (`tabvis/gateway/`) is a control plane that fronts the runtime: a single command
+ingress, a durable append-only event log, and an explicit split between a durable *agent* and an
+immutable *run* (one prompt-to-terminal execution). It mounts alongside the legacy server by default
+(`TABVIS_GATEWAY=1`), exposing `/v1/runs`, `/v1/events` (SSE), `/v1/interactions/…`, and
+`/v1/gateway/health`. See the [Agent Gateway design](docs/AGENT_GATEWAY_DESIGN.md) for the full model.
 
 ## Documentation
 
@@ -200,9 +225,9 @@ their native streaming formats to the same agent loop.
 |---|---|
 | [Running Tabvis](docs/RUNNING.md) | Complete CLI, environment, browser, server, settings, and troubleshooting reference. |
 | [Feature overview](docs/FEATURES.md) | Current tool surface and subsystem behavior. |
-| [Browser agent PRD](docs/PRD-browser-agent.md) | Browser architecture, product decisions, and safety model. |
-| [Permission engine](docs/permission-policy-engine_v1.md) | Permission and policy design. |
-| [Agent Gateway design](docs/AGENT_GATEWAY_DESIGN.md) | Target control-plane architecture, channels, runs, and the incremental migration plan. |
+| [Data model](docs/DATA_MODEL.md) | On-disk records, ID scheme, and the SQLite stores. |
+| [Agent Gateway design](docs/AGENT_GATEWAY_DESIGN.md) | Control-plane architecture — channels, runs, interactions, context — and the incremental migration plan. |
+| [Web console](web/README.md) | Running, developing, and self-hosting the React console. |
 
 ## Development
 
@@ -213,8 +238,8 @@ uv run python -m compileall -q tabvis
 uv run tabvis --version
 ```
 
-Tabvis is under active development. See [the roadmap](docs/ROADMAP_v1.md) for planned work and
-`.env.example` for the complete configuration surface.
+Tabvis is under active development. See `.env.example` for the complete configuration surface and
+[docs/](docs/) for architecture and reference material.
 
 ## Legal notice & responsible use
 
@@ -242,9 +267,11 @@ Tabvis is under active development. See [the roadmap](docs/ROADMAP_v1.md) for pl
   otherwise restricted. You are responsible for the lawful handling, storage, and use of anything it
   downloads or reads.
 
-- **Credentials & exposure.** The local server ships with **no authentication** and binds to
-  `127.0.0.1` — anyone who can reach the port acts as you. Do not expose it to an untrusted network
-  without an authentication proxy, and keep API keys and browser profiles / cookies secure.
+- **Credentials & exposure.** On its default `127.0.0.1` bind the local server is **unauthenticated** —
+  anyone who can reach the port acts as you. Token auth engages on non-loopback binds (and the server
+  refuses to start a public bind without `TABVIS_SERVER_ADMIN_TOKEN`), but you should still front it
+  with an authentication proxy and isolation before exposing it. Keep API keys and browser profiles /
+  cookies secure.
 
 - **No warranty.** Tabvis is provided "as is", without warranty of any kind, and its authors and
   contributors accept no liability for how it is used or for any resulting damages. This notice is
