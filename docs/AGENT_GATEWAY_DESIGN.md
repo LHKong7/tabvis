@@ -1539,14 +1539,30 @@ depends on the open question in §18.2 about checkpoint-vs-transcript resume).
 
 Deliverables:
 
-- Split access, methods, orchestration, auth, and event modules out of `browser/server.py`.
-- One composition root for CLI, daemon, and tests.
-- Component health and graceful drain.
+- Split access, methods, orchestration, auth, and event modules out of `browser/server.py`. ✅
+  *(new modules stand alongside the legacy server: `access/http.py`, `access/sse.py`, `methods/`
+  (router + run/interaction/conversation handlers), `runtime/orchestrator.py`, `auth/`. Physically
+  moving the existing `browser/server.py` routes onto this app is the follow-up "move" step — the
+  design discourages a large mechanical rewrite in one change (§14), so the legacy server is left
+  intact and untouched.)*
+- One composition root for CLI, daemon, and tests. ✅ (`lifecycle.py::GatewayApplication.build`)
+- Component health and graceful drain. ✅ (`GatewayApplication.health` in the §2.3 shape; `drain`)
 
 Acceptance:
 
-- No HTTP handler directly executes the model loop or browser operation.
-- Legacy and v1 API tests pass.
+- No HTTP handler directly executes the model loop or browser operation. ✅ (handlers route to the
+  orchestrator, which delegates execution to an injected `RunLauncher` seam — `test_http_api.py`,
+  `test_orchestrator.py`)
+- Legacy and v1 API tests pass. ✅ (existing `test_server_auth.py` untouched; new gateway HTTP suite green)
+
+The new access layer serves the §9.4 core methods — `POST /v1/conversations`, `POST /v1/runs`,
+`GET /v1/runs/{id}`, `POST /v1/runs/{id}/cancel`, `POST /v1/interactions/{id}/responses`,
+`GET /v1/events` (cursor-resumable SSE), `GET /v1/health` — with a command router that enforces
+`command_id` idempotency, a `Principal` resolved from credentials (reusing `server_auth`), and the
+§9.7 error body. Runs are created and observable but only *execute* once a real `RunLauncher`
+(wrapping the existing agent loop into `runtime/agent/runner.py`) is wired — that bridge, plus moving
+the legacy `/v1/agents` routes onto this app and adapting the current SSE frames, is the remaining
+extraction work.
 
 ### Phase 4 — Channel Framework
 

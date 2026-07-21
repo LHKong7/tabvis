@@ -237,6 +237,27 @@ def count_active_runs_for_agent(conn: sqlite3.Connection, agent_id: str, active_
     return int(row["n"])
 
 
+def count_active_runs(active_states: tuple[str, ...]) -> int:
+    """Global count of non-terminal runs — feeds gateway capacity reporting (design §2.3)."""
+    placeholders = ",".join("?" for _ in active_states)
+    with _lock:
+        conn = connect()
+        row = conn.execute(
+            f"SELECT COUNT(*) AS n FROM runs WHERE status IN ({placeholders})", tuple(active_states)
+        ).fetchone()
+    return int(row["n"])
+
+
+def get_run_by_command(command_id: str) -> dict[str, Any] | None:
+    """The run created by ``command_id``, if any — the domain-level idempotency key for run.create."""
+    with _lock:
+        conn = connect()
+        row = conn.execute(
+            "SELECT data FROM runs WHERE command_id = ? ORDER BY created_at ASC LIMIT 1", (command_id,)
+        ).fetchone()
+    return json.loads(row["data"]) if row else None
+
+
 # --------------------------------------------------------------------------- events / outbox
 
 
