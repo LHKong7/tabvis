@@ -108,6 +108,7 @@ class ChannelIngress:
             command_id=command_id,
             conversation_id=binding.conversation_id,
             prompt_message_id=message_id,
+            prompt=message.text,   # the channel message text is the Run's prompt
         )
 
         db.record_inbound(

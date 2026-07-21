@@ -131,6 +131,8 @@ class RunStore:
         error_code: str | None = None,
         result_message_id: str | None = None,
         correlation_id: str | None = None,
+        turns: int | None = None,
+        tool_calls: int | None = None,
     ) -> tuple[RunRecord, Any]:
         """Compare-and-set within an already-open transaction; returns (record, undelivered event).
 
@@ -160,6 +162,10 @@ class RunStore:
             record.error_code = error_code
         if result_message_id is not None:
             record.result_message_id = result_message_id
+        if turns is not None:
+            record.turns = turns
+        if tool_calls is not None:
+            record.tool_calls = tool_calls
 
         db.update_run(conn, record.to_dict())
         etype = event_type or _STATUS_EVENT.get(to_status, f"run.{to_status}")
@@ -184,6 +190,8 @@ class RunStore:
         error_code: str | None = None,
         result_message_id: str | None = None,
         correlation_id: str | None = None,
+        turns: int | None = None,
+        tool_calls: int | None = None,
     ) -> RunRecord:
         """Compare-and-set a Run's status and emit the matching event, atomically.
 
@@ -194,7 +202,7 @@ class RunStore:
             record, envelope = self.apply_transition(
                 conn, run_id, to_status, expected=expected, event_type=event_type,
                 data=data, error_code=error_code, result_message_id=result_message_id,
-                correlation_id=correlation_id,
+                correlation_id=correlation_id, turns=turns, tool_calls=tool_calls,
             )
         self._events.notify_live(envelope)
         return record
