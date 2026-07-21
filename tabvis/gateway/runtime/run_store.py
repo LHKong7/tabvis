@@ -119,6 +119,60 @@ class RunStore:
 
     # --- transition -----------------------------------------------------------------------------
 
+    def apply_transition(
+        self,
+        conn: Any,
+        run_id: str,
+        to_status: str,
+        *,
+        expected: str | None = None,
+        event_type: str | None = None,
+        data: dict[str, Any] | None = None,
+        error_code: str | None = None,
+        result_message_id: str | None = None,
+        correlation_id: str | None = None,
+    ) -> tuple[RunRecord, Any]:
+        """Compare-and-set within an already-open transaction; returns (record, undelivered event).
+
+        This is the composable core of :meth:`transition`. A caller that must change a Run *and* do
+        related work atomically — the interaction pause writes the Run to ``waiting_for_input`` and
+        inserts the interaction in the same transaction — uses this and owns the commit and the live
+        notify. The returned envelope has been appended durably but not yet fanned out.
+        """
+        current = db.get_run_in(conn, run_id)
+        if current is None:
+            raise GatewayError("RUN_NOT_FOUND", details={"run_id": run_id})
+        record = RunRecord.from_dict(current)
+        if expected is not None and record.status != expected:
+            raise GatewayError(
+                "CONFLICT",
+                message=f"Run {run_id} is {record.status!r}, expected {expected!r}",
+                details={"run_id": run_id, "status": record.status, "expected": expected},
+            )
+        runs.assert_transition(record.status, to_status)
+
+        record.status = to_status
+        if to_status == runs.RUNNING and record.started_at is None:
+            record.started_at = _utc_now()
+        if to_status in runs.TERMINAL:
+            record.ended_at = _utc_now()
+        if error_code is not None:
+            record.error_code = error_code
+        if result_message_id is not None:
+            record.result_message_id = result_message_id
+
+        db.update_run(conn, record.to_dict())
+        etype = event_type or _STATUS_EVENT.get(to_status, f"run.{to_status}")
+        scope = EventScope(
+            agent_id=record.agent_id, session_id=record.session_id, run_id=record.run_id,
+            conversation_id=record.conversation_id, workspace_id=record.workspace_id,
+        )
+        envelope = self._events.append(
+            AGGREGATE_RUN, run_id, etype, scope=scope,
+            data=data or {}, correlation_id=correlation_id, conn=conn,
+        )
+        return record, envelope
+
     def transition(
         self,
         run_id: str,
@@ -137,37 +191,10 @@ class RunStore:
         optimistic-concurrency guard from §19 rule 7. The edge itself must be legal (§7.4).
         """
         with db.transaction() as conn:
-            current = db.get_run_in(conn, run_id)
-            if current is None:
-                raise GatewayError("RUN_NOT_FOUND", details={"run_id": run_id})
-            record = RunRecord.from_dict(current)
-            if expected is not None and record.status != expected:
-                raise GatewayError(
-                    "CONFLICT",
-                    message=f"Run {run_id} is {record.status!r}, expected {expected!r}",
-                    details={"run_id": run_id, "status": record.status, "expected": expected},
-                )
-            runs.assert_transition(record.status, to_status)
-
-            record.status = to_status
-            if to_status == runs.RUNNING and record.started_at is None:
-                record.started_at = _utc_now()
-            if to_status in runs.TERMINAL:
-                record.ended_at = _utc_now()
-            if error_code is not None:
-                record.error_code = error_code
-            if result_message_id is not None:
-                record.result_message_id = result_message_id
-
-            db.update_run(conn, record.to_dict())
-            etype = event_type or _STATUS_EVENT.get(to_status, f"run.{to_status}")
-            scope = EventScope(
-                agent_id=record.agent_id, session_id=record.session_id, run_id=record.run_id,
-                conversation_id=record.conversation_id, workspace_id=record.workspace_id,
-            )
-            envelope = self._events.append(
-                AGGREGATE_RUN, run_id, etype, scope=scope,
-                data=data or {}, correlation_id=correlation_id, conn=conn,
+            record, envelope = self.apply_transition(
+                conn, run_id, to_status, expected=expected, event_type=event_type,
+                data=data, error_code=error_code, result_message_id=result_message_id,
+                correlation_id=correlation_id,
             )
         self._events.notify_live(envelope)
         return record

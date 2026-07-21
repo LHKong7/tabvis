@@ -1515,17 +1515,25 @@ Acceptance:
 
 Deliverables:
 
-- InteractionRecord and InteractionService.
-- `waiting_for_input` / `waiting_for_approval` Run states.
-- question and approval events.
-- response HTTP/WS method.
-- React components for choices, free text, expiry, and approval.
+- InteractionRecord and InteractionService. ✅ (`runtime/interactions.py`, `runtime/interaction_service.py`)
+- `waiting_for_input` / `waiting_for_approval` Run states. ✅ (wired into the §7.4 machine + `RunStore`)
+- question and approval events. ✅ (`interaction.requested/answered/expired`, durable `interactions` table)
+- response HTTP/WS method. *(service-level `respond()` landed; HTTP/WS binding pending Phase 3)*
+- React components for choices, free text, expiry, and approval. *(frontend — pending Phase 3 access layer)*
 
 Acceptance:
 
-- `AskUserQuestion` pauses a Run, survives page refresh, receives one answer, and resumes.
-- Duplicate answers return the original receipt.
-- Cancel while waiting terminates the Run and interaction.
+- `AskUserQuestion` pauses a Run, survives page refresh, receives one answer, and resumes. ✅
+  (`test_interactions.py` — pause + resume driven through the orchestrator-owned future, resolved by a
+  fresh service instance to simulate a refresh)
+- Duplicate answers return the original receipt. ✅ (`test_interactions.py`)
+- Cancel while waiting terminates the Run and interaction. ✅ (`test_interactions.py`)
+
+The resume future is **process-global and transport-decoupled** (§5.2): the agent task blocks on
+`InteractionService.wait(interaction_id)`, and `respond` / `expire` / `cancel_for_run` resolve it from
+wherever the answer arrives. Restart recovery of the pending set is available via
+`db.list_pending_interactions`; resuming the model from that set is deferred to a later phase (it
+depends on the open question in §18.2 about checkpoint-vs-transcript resume).
 
 ### Phase 3 — Gateway module extraction
 
