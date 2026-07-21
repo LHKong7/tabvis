@@ -1568,15 +1568,29 @@ extraction work.
 
 Deliverables:
 
-- Channel contract, account store, conversation binding, delivery receipts.
-- WebChannel adapter.
-- Webhook signature/idempotency primitives.
-- One optional external channel proof of concept.
+- Channel contract, account store, conversation binding, delivery receipts. ✅ (`channels/core/`:
+  `contract.py`, `stores.py`, `delivery.py`; schema v3 adds `channel_accounts`,
+  `conversation_bindings` (unique key), `channel_inbound`, `deliveries`)
+- WebChannel adapter. ✅ (`channels/web/channel.py`)
+- Webhook signature/idempotency primitives. ✅ (`channels/core/signatures.py` HMAC-SHA256 +
+  `channels/core/inbound.py` dedupe ledger and derived idempotent `command_id`)
+- One optional external channel proof of concept. ✅ (`channels/plugins/example_webhook/`)
 
 Acceptance:
 
-- The same Run can originate from WebChannel or the proof channel.
-- External webhook retries create one internal message and one Run.
+- The same Run can originate from WebChannel or the proof channel. ✅ (`test_channels.py`)
+- External webhook retries create one internal message and one Run. ✅ (`test_channels.py`)
+
+The inbound pipeline is one path for every channel (design §4.1): verify signature → normalize (plugin)
+→ dedupe by `external_event_id` → resolve/create binding → emit `conversation.message.received` →
+create Run. Idempotency is layered — the `channel_inbound` ledger short-circuits a retry, and the Run's
+`command_id` is derived from `(account, external_event_id)` so `run.create` is idempotent even if the
+ledger is bypassed. Outbound delivery is idempotent on `delivery_id` and degrades by capability (a
+channel without `stream.incremental` receives only final messages). Secrets resolve through a
+`SecretResolver` (an in-memory stand-in here; a real SecretStore is future work), never inline.
+
+An HTTP webhook ingress route and the WebChannel↔console/SSE binding land when the channel gateway is
+mounted alongside the Phase 3 access layer.
 
 ### Phase 5 — Context Runtime
 

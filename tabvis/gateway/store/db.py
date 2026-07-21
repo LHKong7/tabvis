@@ -27,7 +27,7 @@ from typing import Any, Iterator
 
 from tabvis.browser.persistence.paths import get_browser_os_data_dir
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 GATEWAY_DB_FILENAME = "gateway.db"
 
 _lock = threading.RLock()
@@ -97,6 +97,49 @@ _DDL = (
         data                TEXT NOT NULL
     )""",
     "CREATE INDEX IF NOT EXISTS idx_interactions_run ON interactions(run_id, status)",
+    # v3: Channel Framework (design §4.3, §12.2). A ChannelAccount is one configured external
+    # connection; a ConversationBinding maps an external thread to an internal conversation.
+    """CREATE TABLE IF NOT EXISTS channel_accounts (
+        channel_account_id  TEXT PRIMARY KEY,
+        plugin_id           TEXT NOT NULL,
+        tenant_id           TEXT,
+        external_account_ref TEXT,
+        status              TEXT NOT NULL,
+        data                TEXT NOT NULL
+    )""",
+    # The UNIQUE key is the design's guard (§4.3): one external thread never maps to two internal
+    # conversations, even under webhook retries.
+    """CREATE TABLE IF NOT EXISTS conversation_bindings (
+        binding_id               TEXT PRIMARY KEY,
+        channel_account_id       TEXT NOT NULL,
+        external_conversation_id TEXT NOT NULL,
+        conversation_id          TEXT NOT NULL,
+        session_id               TEXT,
+        agent_id                 TEXT,
+        data                     TEXT NOT NULL,
+        UNIQUE(channel_account_id, external_conversation_id)
+    )""",
+    # Inbound dedupe ledger: an external_event_id is processed at most once (design §4.5, §5.5).
+    """CREATE TABLE IF NOT EXISTS channel_inbound (
+        channel_account_id TEXT NOT NULL,
+        external_event_id  TEXT NOT NULL,
+        conversation_id    TEXT,
+        run_id             TEXT,
+        message_id         TEXT,
+        created_at         TEXT,
+        PRIMARY KEY (channel_account_id, external_event_id)
+    )""",
+    # Outbound delivery receipts, idempotent on delivery_id (design §4.5, §12.2).
+    """CREATE TABLE IF NOT EXISTS deliveries (
+        delivery_id        TEXT PRIMARY KEY,
+        channel_account_id TEXT,
+        run_id             TEXT,
+        status             TEXT NOT NULL,
+        created_at         TEXT,
+        data               TEXT NOT NULL
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_bindings_account ON conversation_bindings(channel_account_id)",
+    "CREATE INDEX IF NOT EXISTS idx_deliveries_run ON deliveries(run_id)",
 )
 
 
@@ -459,3 +502,145 @@ def list_pending_interactions() -> list[dict[str, Any]]:
             "SELECT data FROM interactions WHERE status = 'pending' ORDER BY created_at ASC"
         ).fetchall()
     return [json.loads(r["data"]) for r in rows]
+
+
+# --------------------------------------------------------------------------- channel accounts
+
+
+def upsert_channel_account(record: dict[str, Any]) -> None:
+    with transaction() as conn:
+        conn.execute(
+            "INSERT INTO channel_accounts (channel_account_id, plugin_id, tenant_id, external_account_ref, status, data) "
+            "VALUES (?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(channel_account_id) DO UPDATE SET plugin_id=excluded.plugin_id, "
+            "tenant_id=excluded.tenant_id, external_account_ref=excluded.external_account_ref, "
+            "status=excluded.status, data=excluded.data",
+            (
+                record["channel_account_id"],
+                record["plugin_id"],
+                record.get("tenant_id"),
+                record.get("external_account_ref"),
+                record["status"],
+                json.dumps(record, default=str),
+            ),
+        )
+
+
+def get_channel_account(channel_account_id: str) -> dict[str, Any] | None:
+    with _lock:
+        conn = connect()
+        row = conn.execute(
+            "SELECT data FROM channel_accounts WHERE channel_account_id = ?", (channel_account_id,)
+        ).fetchone()
+    return json.loads(row["data"]) if row else None
+
+
+def list_channel_accounts() -> list[dict[str, Any]]:
+    with _lock:
+        conn = connect()
+        rows = conn.execute("SELECT data FROM channel_accounts").fetchall()
+    return [json.loads(r["data"]) for r in rows]
+
+
+# --------------------------------------------------------------------------- conversation bindings
+
+
+def get_binding(channel_account_id: str, external_conversation_id: str) -> dict[str, Any] | None:
+    with _lock:
+        conn = connect()
+        row = conn.execute(
+            "SELECT data FROM conversation_bindings WHERE channel_account_id = ? AND external_conversation_id = ?",
+            (channel_account_id, external_conversation_id),
+        ).fetchone()
+    return json.loads(row["data"]) if row else None
+
+
+def insert_binding(conn: sqlite3.Connection, record: dict[str, Any]) -> None:
+    conn.execute(
+        "INSERT INTO conversation_bindings (binding_id, channel_account_id, external_conversation_id, "
+        "conversation_id, session_id, agent_id, data) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (
+            record["binding_id"],
+            record["channel_account_id"],
+            record["external_conversation_id"],
+            record["conversation_id"],
+            record.get("session_id"),
+            record.get("agent_id"),
+            json.dumps(record, default=str),
+        ),
+    )
+
+
+def get_binding_in(conn: sqlite3.Connection, channel_account_id: str, external_conversation_id: str) -> dict[str, Any] | None:
+    row = conn.execute(
+        "SELECT data FROM conversation_bindings WHERE channel_account_id = ? AND external_conversation_id = ?",
+        (channel_account_id, external_conversation_id),
+    ).fetchone()
+    return json.loads(row["data"]) if row else None
+
+
+# --------------------------------------------------------------------------- channel inbound dedupe
+
+
+def get_inbound(channel_account_id: str, external_event_id: str) -> dict[str, Any] | None:
+    with _lock:
+        conn = connect()
+        row = conn.execute(
+            "SELECT conversation_id, run_id, message_id FROM channel_inbound "
+            "WHERE channel_account_id = ? AND external_event_id = ?",
+            (channel_account_id, external_event_id),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def record_inbound(
+    channel_account_id: str, external_event_id: str, *,
+    conversation_id: str, run_id: str | None, message_id: str, created_at: str,
+) -> bool:
+    """Record a processed inbound event. Returns False if it was already recorded (a retry)."""
+    with transaction() as conn:
+        exists = conn.execute(
+            "SELECT 1 FROM channel_inbound WHERE channel_account_id = ? AND external_event_id = ?",
+            (channel_account_id, external_event_id),
+        ).fetchone()
+        if exists:
+            return False
+        conn.execute(
+            "INSERT INTO channel_inbound (channel_account_id, external_event_id, conversation_id, "
+            "run_id, message_id, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (channel_account_id, external_event_id, conversation_id, run_id, message_id, created_at),
+        )
+    return True
+
+
+# --------------------------------------------------------------------------- deliveries
+
+
+def get_delivery(delivery_id: str) -> dict[str, Any] | None:
+    with _lock:
+        conn = connect()
+        row = conn.execute("SELECT data FROM deliveries WHERE delivery_id = ?", (delivery_id,)).fetchone()
+    return json.loads(row["data"]) if row else None
+
+
+def insert_delivery(record: dict[str, Any]) -> bool:
+    """Insert a delivery receipt. Returns False if the delivery_id was already recorded (idempotent)."""
+    with transaction() as conn:
+        exists = conn.execute(
+            "SELECT 1 FROM deliveries WHERE delivery_id = ?", (record["delivery_id"],)
+        ).fetchone()
+        if exists:
+            return False
+        conn.execute(
+            "INSERT INTO deliveries (delivery_id, channel_account_id, run_id, status, created_at, data) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                record["delivery_id"],
+                record.get("channel_account_id"),
+                record.get("run_id"),
+                record["status"],
+                record.get("created_at"),
+                json.dumps(record, default=str),
+            ),
+        )
+    return True
