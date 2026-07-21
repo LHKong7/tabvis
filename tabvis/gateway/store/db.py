@@ -27,7 +27,7 @@ from typing import Any, Iterator
 
 from tabvis.browser.persistence.paths import get_browser_os_data_dir
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 GATEWAY_DB_FILENAME = "gateway.db"
 
 _lock = threading.RLock()
@@ -157,6 +157,27 @@ _DDL = (
     # At most one ACTIVE lease per profile — the atomic "one active writer" guard (design §10.5).
     "CREATE UNIQUE INDEX IF NOT EXISTS idx_active_lease ON browser_leases(profile_key) WHERE status='active'",
     "CREATE INDEX IF NOT EXISTS idx_leases_status ON browser_leases(status)",
+    # v5: optional process separation (design §15 Phase 8). Durable worker registry + run placements,
+    # so the gateway tracks workers across its own restart and reclaims a lost worker's runs.
+    """CREATE TABLE IF NOT EXISTS workers (
+        worker_id     TEXT PRIMARY KEY,
+        kind          TEXT NOT NULL,
+        status        TEXT NOT NULL,
+        max_slots     INTEGER NOT NULL,
+        registered_at TEXT,
+        heartbeat_at  TEXT,
+        expires_at    TEXT,
+        data          TEXT NOT NULL
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_workers_kind ON workers(kind, status)",
+    """CREATE TABLE IF NOT EXISTS run_placements (
+        run_id    TEXT PRIMARY KEY,
+        worker_id TEXT NOT NULL,
+        status    TEXT NOT NULL,
+        placed_at TEXT,
+        data      TEXT NOT NULL
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_placements_worker ON run_placements(worker_id, status)",
 )
 
 
@@ -718,4 +739,95 @@ def list_active_leases() -> list[dict[str, Any]]:
     with _lock:
         conn = connect()
         rows = conn.execute("SELECT data FROM browser_leases WHERE status = 'active'").fetchall()
+    return [json.loads(r["data"]) for r in rows]
+
+
+# --------------------------------------------------------------------------- workers / placements
+
+
+def upsert_worker(conn: sqlite3.Connection, record: dict[str, Any]) -> None:
+    conn.execute(
+        "INSERT INTO workers (worker_id, kind, status, max_slots, registered_at, heartbeat_at, expires_at, data) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
+        "ON CONFLICT(worker_id) DO UPDATE SET kind=excluded.kind, status=excluded.status, "
+        "max_slots=excluded.max_slots, heartbeat_at=excluded.heartbeat_at, expires_at=excluded.expires_at, "
+        "data=excluded.data",
+        (
+            record["worker_id"], record["kind"], record["status"], record["max_slots"],
+            record.get("registered_at"), record.get("heartbeat_at"), record.get("expires_at"),
+            json.dumps(record, default=str),
+        ),
+    )
+
+
+def update_worker(conn: sqlite3.Connection, record: dict[str, Any]) -> None:
+    conn.execute(
+        "UPDATE workers SET status=?, heartbeat_at=?, expires_at=?, data=? WHERE worker_id=?",
+        (record["status"], record.get("heartbeat_at"), record.get("expires_at"),
+         json.dumps(record, default=str), record["worker_id"]),
+    )
+
+
+def get_worker(worker_id: str) -> dict[str, Any] | None:
+    with _lock:
+        conn = connect()
+        row = conn.execute("SELECT data FROM workers WHERE worker_id = ?", (worker_id,)).fetchone()
+    return json.loads(row["data"]) if row else None
+
+
+def get_worker_in(conn: sqlite3.Connection, worker_id: str) -> dict[str, Any] | None:
+    row = conn.execute("SELECT data FROM workers WHERE worker_id = ?", (worker_id,)).fetchone()
+    return json.loads(row["data"]) if row else None
+
+
+def list_workers_by_kind(conn: sqlite3.Connection, kind: str, status: str) -> list[dict[str, Any]]:
+    rows = conn.execute(
+        "SELECT data FROM workers WHERE kind = ? AND status = ? ORDER BY worker_id", (kind, status)
+    ).fetchall()
+    return [json.loads(r["data"]) for r in rows]
+
+
+def list_workers(status: str | None = None) -> list[dict[str, Any]]:
+    with _lock:
+        conn = connect()
+        if status:
+            rows = conn.execute("SELECT data FROM workers WHERE status = ?", (status,)).fetchall()
+        else:
+            rows = conn.execute("SELECT data FROM workers").fetchall()
+    return [json.loads(r["data"]) for r in rows]
+
+
+def count_active_placements(conn: sqlite3.Connection, worker_id: str) -> int:
+    row = conn.execute(
+        "SELECT COUNT(*) AS n FROM run_placements WHERE worker_id = ? AND status = 'placed'", (worker_id,)
+    ).fetchone()
+    return int(row["n"])
+
+
+def get_placement_in(conn: sqlite3.Connection, run_id: str) -> dict[str, Any] | None:
+    row = conn.execute("SELECT data FROM run_placements WHERE run_id = ?", (run_id,)).fetchone()
+    return json.loads(row["data"]) if row else None
+
+
+def get_placement(run_id: str) -> dict[str, Any] | None:
+    with _lock:
+        conn = connect()
+        row = conn.execute("SELECT data FROM run_placements WHERE run_id = ?", (run_id,)).fetchone()
+    return json.loads(row["data"]) if row else None
+
+
+def upsert_placement(conn: sqlite3.Connection, record: dict[str, Any]) -> None:
+    conn.execute(
+        "INSERT INTO run_placements (run_id, worker_id, status, placed_at, data) VALUES (?, ?, ?, ?, ?) "
+        "ON CONFLICT(run_id) DO UPDATE SET worker_id=excluded.worker_id, status=excluded.status, "
+        "data=excluded.data",
+        (record["run_id"], record["worker_id"], record["status"], record.get("placed_at"),
+         json.dumps(record, default=str)),
+    )
+
+
+def active_placements_for_worker(conn: sqlite3.Connection, worker_id: str) -> list[dict[str, Any]]:
+    rows = conn.execute(
+        "SELECT data FROM run_placements WHERE worker_id = ? AND status = 'placed'", (worker_id,)
+    ).fetchall()
     return [json.loads(r["data"]) for r in rows]
