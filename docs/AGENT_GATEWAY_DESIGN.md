@@ -1041,6 +1041,20 @@ Error codes are stable; human-readable messages are not protocol identifiers.
 | `POST /agents/{id}/cancel` | cancel that Agent's active Run |
 | current SSE names | project v1 domain events to legacy frames |
 
+**Integration — legacy /agents projection (landed).** `protocol/compatibility.py` projects the legacy
+agent-centric surface entirely from gateway Run data — an "agent" is an `agent_id` and its **latest
+Run** (§15 Phase 1), with no second lifecycle. It provides `project_run_as_agent` /`project_agent_list`
+(the legacy `GET /agents` and `GET /agents/{id}` shapes, with a Run→legacy status mapping and the full
+gateway record embedded as `latest_run`), a Run→legacy status map, and `legacy_frames_for` (v1 domain
+events → legacy SSE frame names: `agent`/`assistant`/`tool_use`/`result`/`done`/`cancelled`/`error`).
+The standalone gateway app mounts these as `GET /v1/agents`, `GET /v1/agents/{id}`,
+`POST /v1/agents/{id}/cancel` (cancels the agent's active Run via the orchestrator), and
+`GET /v1/agents/{id}/events` (legacy frames), with the same ownership filtering as the legacy server.
+When mounted into the live daemon the compat routes are **excluded** (`include_compat=False`) because the
+legacy server still owns those paths with its registry-backed handlers — pointing them at this
+projection and retiring the registry is the final, deliberate cutover. Verified by
+`test_legacy_compat.py`.
+
 ---
 
 ## 10. Browser Runtime
