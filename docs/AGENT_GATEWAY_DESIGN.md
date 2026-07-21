@@ -1649,8 +1649,15 @@ consumes: project `TABVIS.md` instructions (`load_project_instructions_prompt`),
 guard, so a subsystem that errors or is absent omits its section without breaking assembly (§11.3), and
 each is an injectable hook (real by default) so the collector is unit-tested with fakes while the pure
 core stays untouched (`test_context_sources.py`). `SourceCollector.build_pack` collects and assembles
-in one call. Mapping the transcript's conversation-chain format to the provider message shape, and
-feeding the assembled pack into the model call path, are the remaining steps.
+in one call.
+
+The transcript is wired too: `runtime/context/transcript.py` maps tabvis's `parentUuid`-linked
+transcript into the provider's `{id, role, text, ts}` message shape — `map_transcript_messages` is a
+pure function over an ordered conversation chain (dropping progress entries, flattening SDK content and
+summarizing tool-use/result/image blocks per §7.9), and `load_session_transcript` reads the session's
+transcript file, rebuilds the leaf-to-root chain, and maps it (empty for a fresh session). It is the
+`SourceCollector`'s default transcript loader (`test_context_transcript.py`). Feeding the assembled
+pack into the model call path is the remaining step.
 
 ### Phase 6 — Plugin Runtime
 
