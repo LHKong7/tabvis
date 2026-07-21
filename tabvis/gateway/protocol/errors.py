@@ -52,6 +52,7 @@ _SPECS: Final[tuple[ErrorSpec, ...]] = (
     ErrorSpec("INTERACTION_NOT_FOUND", 404, False, "No pending interaction with that id"),
     ErrorSpec("INTERACTION_ALREADY_ANSWERED", 409, False, "The interaction was already answered"),
     ErrorSpec("INTERACTION_EXPIRED", 409, False, "The interaction expired before an answer arrived"),
+    ErrorSpec("INTERACTION_CANCELLED", 409, False, "The interaction was cancelled before an answer arrived"),
     # infrastructure
     ErrorSpec("STORE_UNAVAILABLE", 503, True, "The metadata store is unavailable"),
     ErrorSpec("INTERNAL", 500, False, "An internal error occurred"),

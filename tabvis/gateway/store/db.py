@@ -27,7 +27,7 @@ from typing import Any, Iterator
 
 from tabvis.browser.persistence.paths import get_browser_os_data_dir
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 GATEWAY_DB_FILENAME = "gateway.db"
 
 _lock = threading.RLock()
@@ -81,6 +81,22 @@ _DDL = (
         result     TEXT NOT NULL,
         created_at TEXT
     )""",
+    # v2: pending questions/approvals a Run is blocked on (design §5.2, §12.2). Durable so a restart
+    # can reconstruct what a Run was waiting for.
+    """CREATE TABLE IF NOT EXISTS interactions (
+        interaction_id      TEXT PRIMARY KEY,
+        run_id              TEXT NOT NULL,
+        agent_id            TEXT,
+        session_id          TEXT,
+        kind                TEXT NOT NULL,
+        status              TEXT NOT NULL,
+        created_at          TEXT,
+        expires_at          TEXT,
+        answered_at         TEXT,
+        response_command_id TEXT,
+        data                TEXT NOT NULL
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_interactions_run ON interactions(run_id, status)",
 )
 
 
@@ -349,3 +365,76 @@ def insert_command_result(conn: sqlite3.Connection, command_id: str, ctype: str,
         "INSERT INTO commands (command_id, type, result, created_at) VALUES (?, ?, ?, ?)",
         (command_id, ctype, json.dumps(result, default=str), created_at),
     )
+
+
+# --------------------------------------------------------------------------- interactions
+
+
+def insert_interaction(conn: sqlite3.Connection, record: dict[str, Any]) -> None:
+    conn.execute(
+        "INSERT INTO interactions (interaction_id, run_id, agent_id, session_id, kind, status, "
+        "created_at, expires_at, answered_at, response_command_id, data) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            record["interaction_id"],
+            record["run_id"],
+            record.get("agent_id"),
+            record.get("session_id"),
+            record["kind"],
+            record["status"],
+            record.get("created_at"),
+            record.get("expires_at"),
+            record.get("answered_at"),
+            record.get("response_command_id"),
+            json.dumps(record, default=str),
+        ),
+    )
+
+
+def update_interaction(conn: sqlite3.Connection, record: dict[str, Any]) -> None:
+    conn.execute(
+        "UPDATE interactions SET status=?, answered_at=?, response_command_id=?, data=? "
+        "WHERE interaction_id=?",
+        (
+            record["status"],
+            record.get("answered_at"),
+            record.get("response_command_id"),
+            json.dumps(record, default=str),
+            record["interaction_id"],
+        ),
+    )
+
+
+def get_interaction(interaction_id: str) -> dict[str, Any] | None:
+    with _lock:
+        conn = connect()
+        row = conn.execute(
+            "SELECT data FROM interactions WHERE interaction_id = ?", (interaction_id,)
+        ).fetchone()
+    return json.loads(row["data"]) if row else None
+
+
+def get_interaction_in(conn: sqlite3.Connection, interaction_id: str) -> dict[str, Any] | None:
+    row = conn.execute(
+        "SELECT data FROM interactions WHERE interaction_id = ?", (interaction_id,)
+    ).fetchone()
+    return json.loads(row["data"]) if row else None
+
+
+def find_pending_interaction_for_run(conn: sqlite3.Connection, run_id: str) -> dict[str, Any] | None:
+    row = conn.execute(
+        "SELECT data FROM interactions WHERE run_id = ? AND status = 'pending' "
+        "ORDER BY created_at ASC LIMIT 1",
+        (run_id,),
+    ).fetchone()
+    return json.loads(row["data"]) if row else None
+
+
+def list_pending_interactions() -> list[dict[str, Any]]:
+    """Every still-pending interaction — the set a restart must reconstruct (design §5.2)."""
+    with _lock:
+        conn = connect()
+        rows = conn.execute(
+            "SELECT data FROM interactions WHERE status = 'pending' ORDER BY created_at ASC"
+        ).fetchall()
+    return [json.loads(r["data"]) for r in rows]
