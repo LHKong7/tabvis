@@ -1641,6 +1641,17 @@ structured JSON is never truncated — and the pack's `digest` depends only on m
 content. A version is bumped per cache key only when a source digest changes (§11.6). `explain` masks
 sensitive/secret content while preserving all provenance (§11.7).
 
+**Integration — providers → live subsystems (landed).** `runtime/context/sources.py::SourceCollector`
+gathers the real tabvis subsystems into the `ContextRequest.sources` snapshot the deterministic core
+consumes: project `TABVIS.md` instructions (`load_project_instructions_prompt`), project memory
+(`load_memory_prompt`), Git/workspace state (`_get_git_status`), and the browser summary
+(`get_session_summary`), plus caller-supplied transcript/tools/skills. Every source is gathered under a
+guard, so a subsystem that errors or is absent omits its section without breaking assembly (§11.3), and
+each is an injectable hook (real by default) so the collector is unit-tested with fakes while the pure
+core stays untouched (`test_context_sources.py`). `SourceCollector.build_pack` collects and assembles
+in one call. Mapping the transcript's conversation-chain format to the provider message shape, and
+feeding the assembled pack into the model call path, are the remaining steps.
+
 ### Phase 6 — Plugin Runtime
 
 Deliverables:
