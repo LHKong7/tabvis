@@ -1779,9 +1779,21 @@ Only after contracts are stable:
 
 - Split Agent/Browser workers from Gateway if isolation or scale requires it.
 - Preserve the same Command/Event protocol.
-- Add worker registration, leases, and placement.
+- Add worker registration, leases, and placement. ✅ (`runtime/workers.py`)
 
 Process separation is not required for the initial Gateway.
+
+**Coordination scaffolding (landed).** `runtime/workers.py` provides the mechanism a split would use,
+built in-process and testable, preserving the Command/Event protocol: `WorkerRegistry`
+(register/heartbeat/deregister/`reclaim_expired`) is a lease exactly like the browser lease — durable in
+`gateway.db` schema v5, injected clock, TTL expiry; `WorkerCoordinator.place` assigns a Run to the
+least-loaded ready worker of a kind (with label matching), idempotently, raising `NO_WORKER_AVAILABLE`
+at capacity, and `release` frees a slot; `reclaim` surfaces a lost worker's placed Runs and
+`recover_lost_runs` marks the *running* ones `interrupted` (design §7.4 running → interrupted "worker
+lost", §1.5 lease-backed recovery) while leaving queued ones for re-placement. Placements survive a cold
+read (durable). It is not wired into the daemon — the initial gateway runs in-process (§2.2 daemon
+mode), and a worker split (§2.2 worker mode) would compose this over the internal gateway protocol.
+Verified by `test_workers.py`.
 
 ---
 
