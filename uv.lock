@@ -2132,6 +2132,9 @@ camoufox = [
 cloak = [
     { name = "cloakbrowser" },
 ]
+discord = [
+    { name = "websockets" },
+]
 feishu = [
     { name = "cryptography" },
 ]
@@ -2141,11 +2144,17 @@ gemini = [
 google-chat = [
     { name = "cryptography" },
 ]
+mattermost = [
+    { name = "websockets" },
+]
 ocr = [
     { name = "tesserocr" },
 ]
 openai = [
     { name = "openai" },
+]
+simplex = [
+    { name = "websockets" },
 ]
 teams = [
     { name = "cryptography" },
@@ -2184,8 +2193,11 @@ requires-dist = [
     { name = "tesserocr", marker = "extra == 'ocr'", specifier = ">=2.6" },
     { name = "uvicorn", specifier = ">=0.30" },
     { name = "wcwidth", specifier = ">=0.2" },
+    { name = "websockets", marker = "extra == 'discord'", specifier = ">=12" },
+    { name = "websockets", marker = "extra == 'mattermost'", specifier = ">=12" },
+    { name = "websockets", marker = "extra == 'simplex'", specifier = ">=12" },
 ]
-provides-extras = ["camoufox", "cloak", "feishu", "gemini", "google-chat", "ocr", "openai", "teams", "wecom"]
+provides-extras = ["camoufox", "cloak", "discord", "feishu", "gemini", "google-chat", "mattermost", "ocr", "openai", "simplex", "teams", "wecom"]
 
 [package.metadata.requires-dev]
 dev = [{ name = "pytest", specifier = ">=8.0" }]

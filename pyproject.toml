@@ -55,6 +55,15 @@ feishu = ["cryptography>=41"]
 wecom = ["cryptography>=41"]
 teams = ["cryptography>=41"]
 google_chat = ["cryptography>=41"]
+# Client-loop IM channels whose live connection is a WebSocket (httpx has no WS client). Optional
+# because their inbound event parsing + outbound send are tested without a live socket; the socket is
+# only needed to actually connect, and the plugin raises a clear install hint if it is missing:
+#   discord      — the Discord Gateway websocket
+#   mattermost   — the Mattermost websocket event feed
+#   simplex      — the local SimpleX Chat CLI websocket
+discord = ["websockets>=12"]
+mattermost = ["websockets>=12"]
+simplex = ["websockets>=12"]
 
 [project.scripts]
 tabvis = "tabvis.bootstrap_entry:main"

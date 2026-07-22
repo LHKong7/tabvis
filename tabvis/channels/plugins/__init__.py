@@ -19,14 +19,24 @@ import importlib
 
 # plugin_id -> "module:class". The built-in IM channel plugins distilled from the Hermes reference.
 BUILTIN_CHANNEL_PLUGINS: dict[str, str] = {
+    # Webhook transport (verified + parsed HTTP callbacks).
     "feishu": "tabvis.channels.plugins.feishu:FeishuChannel",
     "dingtalk": "tabvis.channels.plugins.dingtalk:DingTalkChannel",
+    "wecom": "tabvis.channels.plugins.wecom:WeComChannel",
     "slack": "tabvis.channels.plugins.slack:SlackChannel",
     "teams": "tabvis.channels.plugins.teams:TeamsChannel",
     "line": "tabvis.channels.plugins.line:LineChannel",
     "google_chat": "tabvis.channels.plugins.google_chat:GoogleChatChannel",
-    "wecom": "tabvis.channels.plugins.wecom:WeComChannel",
     "whatsapp": "tabvis.channels.plugins.whatsapp:WhatsAppChannel",
+    # Client-loop transport (a persistent connection pushes into the inbound pipeline).
+    "telegram": "tabvis.channels.plugins.telegram:TelegramChannel",
+    "matrix": "tabvis.channels.plugins.matrix:MatrixChannel",
+    "irc": "tabvis.channels.plugins.irc:IrcChannel",
+    "discord": "tabvis.channels.plugins.discord:DiscordChannel",
+    "mattermost": "tabvis.channels.plugins.mattermost:MattermostChannel",
+    "simplex": "tabvis.channels.plugins.simplex:SimpleXChatChannel",
+    "imessage": "tabvis.channels.plugins.imessage:IMessageChannel",
+    # Reference / test channels.
     "example_webhook": "tabvis.channels.plugins.example_webhook:ExampleWebhookChannel",
 }
 

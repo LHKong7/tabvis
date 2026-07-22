@@ -146,7 +146,7 @@ def test_to_inbound_handles_top_level_envelope() -> None:
     # Older daemons emit the event at the top level (no "resp" wrapper); it must still parse.
     frame = _dm_frame(2, 7, "flat envelope")["resp"]
     frame["corrId"] = None
-    msg = ch = _channel()._to_inbound(frame)
+    msg = _channel()._to_inbound(frame)
     assert msg is not None and msg.text == "flat envelope" and msg.external_conversation_id == "7"
 
 
