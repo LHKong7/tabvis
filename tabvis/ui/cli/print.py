@@ -177,6 +177,25 @@ def _skill_listing_reminder(commands: list[Any]) -> str | None:
     )
 
 
+def _prepend_context_block(message: dict[str, Any], text: str) -> None:
+    """Insert ``text`` as a leading content block in a user message envelope (Resume Plus §11.4).
+
+    Keeps the memory context inside the current user turn — before the prompt, one valid user turn,
+    never the system prompt — so the model reads it as low-privilege reference data.
+    """
+    inner = message.get("message")
+    if not isinstance(inner, dict):
+        return
+    block = {"type": "text", "text": text}
+    content = inner.get("content")
+    if isinstance(content, str):
+        inner["content"] = [block, {"type": "text", "text": content}]
+    elif isinstance(content, list):
+        inner["content"] = [block, *content]
+    else:
+        inner["content"] = [block]
+
+
 async def run_headless(
     prompt: str,
     *,
@@ -217,6 +236,21 @@ async def run_headless(
         for w in result.warnings:
             print(f"tabvis: warning: {w}", file=sys.stderr)
 
+    # Resume Plus §11: for a `plus` resume that reads memory, assemble the Agent Memory context block
+    # and inject it as low-privilege context (see stream_agent). Best-effort — never blocks a run.
+    context_preamble = None
+    if rt is not None and rt.mode == "plus" and getattr(rt, "read_memory", False):
+        try:
+            from tabvis.agent.mem.provider import build_memory_context
+
+            ctx = build_memory_context(
+                rt.principal_id, rt.agent_id, rt.session_id, prompt,
+                live_snapshot={"recovery_mode": rt.browser_recovery},
+            )
+            context_preamble = ctx.to_preamble()
+        except Exception as e:  # noqa: BLE001 - memory context is additive, never fatal
+            print(f"tabvis: warning: could not load agent memory: {e}", file=sys.stderr)
+
     last_result: dict[str, Any] | None = None
     async for message in stream_agent(
         prompt,
@@ -234,6 +268,7 @@ async def run_headless(
         run_id=(rt.run_id if rt is not None else None),
         resume_mode=(rt.mode if rt is not None else "fresh"),
         principal_id=(rt.principal_id if rt is not None else "principal_local"),
+        context_preamble=context_preamble,
     ):
         if output_format == "stream-json":
             _write_ndjson(message)
@@ -270,6 +305,7 @@ async def stream_agent(
     resume_mode: str = "fresh",
     principal_id: str = "principal_local",
     skip_browser_init: bool = False,
+    context_preamble: str | None = None,
 ) -> Any:
     """Run one agent session, yielding each SDKMessage as it is produced.
 
@@ -407,17 +443,25 @@ async def stream_agent(
         # above produced (a slash/skill expansion) or the plain prompt — `ask` won't add the prompt
         # itself once `seed_messages` is set, so we include it. Prior envelopes keep their uuids, so
         # record_transcript dedups them and nothing is duplicated on disk.
+        prior: list[Any] = []
         if resume and should_query:
             from tabvis.utils.session_storage import load_conversation_for_resume
 
             prior = await load_conversation_for_resume(session_id)
-            if prior:
-                new_turn = (
-                    seed_messages
-                    if seed_messages is not None
-                    else [create_user_message(content=prompt)]
-                )
-                seed_messages = [*prior, *new_turn]
+
+        # Resume Plus §11.4: inject Agent Memory as LOW-PRIVILEGE contextual data — a leading text
+        # block in the CURRENT user turn, before the prompt, so the model sees it as reference data
+        # below the user's current instruction. It goes into the conversation, NOT the system prompt
+        # (that would promote it to an instruction). It is distinct from the raw transcript replay
+        # above, so nothing is duplicated.
+        if should_query and (prior or context_preamble):
+            new_turn = (
+                seed_messages if seed_messages is not None
+                else [create_user_message(content=prompt)]
+            )
+            if context_preamble and new_turn:
+                _prepend_context_block(new_turn[-1], context_preamble)
+            seed_messages = [*prior, *new_turn]
 
         # A caller (the gateway's Context Runtime) may own project-context assembly: it supplies a
         # pre-assembled block (``extra_system_context``, deterministic and observable via
