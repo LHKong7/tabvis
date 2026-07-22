@@ -68,6 +68,11 @@ def _parse_args(args: list[str]) -> dict[str, Any]:
         "output_format": "text",
         "max_turns": None,
         "browser_engine": None,
+        # Resume Plus (design §12.1). ``resume_plus`` holds the selected session id when requested.
+        "resume_plus": None,
+        "conversation_only": False,
+        "no_memory": False,
+        "allow_new_browser": False,
     }
     i = 0
     while i < len(args):
@@ -75,6 +80,31 @@ def _parse_args(args: list[str]) -> dict[str, Any]:
         if a in ("-p", "--print"):
             parsed["prompt"] = args[i + 1] if i + 1 < len(args) else ""
             i += 2
+            continue
+        # --- Resume Plus flags ---
+        if a in ("--resume-plus", "--resume") and i + 1 < len(args):
+            parsed["resume_plus"] = args[i + 1]
+            i += 2
+            continue
+        if a.startswith("--resume-plus="):
+            parsed["resume_plus"] = a[len("--resume-plus=") :]
+            i += 1
+            continue
+        if a.startswith("--resume="):
+            parsed["resume_plus"] = a[len("--resume=") :]
+            i += 1
+            continue
+        if a == "--conversation-only":
+            parsed["conversation_only"] = True
+            i += 1
+            continue
+        if a == "--no-memory":
+            parsed["no_memory"] = True
+            i += 1
+            continue
+        if a == "--allow-new-browser":
+            parsed["allow_new_browser"] = True
+            i += 1
             continue
         if a.startswith("--print="):
             parsed["prompt"] = a[len("--print=") :]
@@ -124,6 +154,26 @@ async def main() -> None:
         print(HEADLESS_ONLY_GUIDANCE, file=sys.stderr)
         sys.exit(1)
 
+    # Resume-flag validation: reject dependent/conflicting combinations rather than ignoring them.
+    if parsed["resume_plus"] is None:
+        if parsed["conversation_only"] or parsed["no_memory"] or parsed["allow_new_browser"]:
+            print(
+                "tabvis: --conversation-only / --no-memory / --allow-new-browser require "
+                "--resume-plus <session_id>.",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+    elif not parsed["resume_plus"].strip():
+        print("tabvis: --resume-plus requires a session id.", file=sys.stderr)
+        sys.exit(2)
+    elif parsed["conversation_only"] and parsed["no_memory"]:
+        # Both mean "no agent memory this run"; accepting both silently hides a likely mistake.
+        print(
+            "tabvis: --conversation-only already excludes Agent Memory; drop --no-memory.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+
     engine = parsed["browser_engine"]
     if engine is not None:
         if engine not in BROWSER_ENGINES:
@@ -147,9 +197,35 @@ async def main() -> None:
 
     from tabvis.ui.cli.print import run_headless
 
+    resume_target = None
+    if parsed["resume_plus"] is not None:
+        resume_target = _resolve_cli_resume(parsed)
+
     await run_headless(
         parsed["prompt"],
         model=parsed["model"],
         output_format=parsed["output_format"],
         max_turns=parsed["max_turns"],
+        resume_target=resume_target,
     )
+
+
+def _resolve_cli_resume(parsed: dict[str, Any]) -> Any:
+    """Resolve the CLI's Resume selector to a ``ResumeTarget``, exiting cleanly on a Resume error."""
+    from tabvis.agent.resume_plus import ResumeError, resolve_resume
+
+    mode = "conversation_only" if parsed["conversation_only"] else "plus"
+    read_write = not (parsed["no_memory"] or parsed["conversation_only"])
+    try:
+        return resolve_resume(
+            parsed["resume_plus"].strip(),
+            mode=mode,
+            current_cwd=os.getcwd(),
+            allow_new_browser=parsed["allow_new_browser"],
+            read_memory=read_write,
+            write_memory=read_write,
+            resident=False,  # a one-shot CLI is never a resident daemon (§6.1)
+        )
+    except ResumeError as e:
+        print(f"tabvis: cannot resume: {e.code}: {e.message}", file=sys.stderr)
+        sys.exit(3)

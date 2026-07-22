@@ -186,13 +186,37 @@ async def run_headless(
     tools: Any | None = None,
     deps: QueryDeps | None = None,
     max_turns: int | None = None,
+    resume_target: Any | None = None,
 ) -> dict[str, Any] | None:
     """Run a single headless turn and write the result to stdout. Returns the result message.
 
     Thin consumer of :func:`stream_agent` — the session machinery (browser warm-up, session
     record, cleanup drain) lives there so the SSE server (``tabvis.browser.server``) can reuse
     the exact same path.
+
+    ``resume_target`` (a ``tabvis.agent.resume_plus.ResumeTarget``) continues an existing session:
+    its resolved ``session_id`` / ``project_dir`` / ``run_id`` are threaded into ``stream_agent`` and
+    the prior conversation is replayed. A one-shot CLI is never resident, so the resolver already
+    reports a cold ``relaunched_profile`` recovery — this path never claims a live browser.
     """
+    rt = resume_target
+    if rt is not None:
+        # Announce, on stderr, what was actually restored (§5.2) — separate from the stdout result.
+        from tabvis.agent.resume_plus import ResumeResult
+
+        result = ResumeResult(
+            resume_mode=rt.mode, agent_id=rt.agent_id, session_id=rt.session_id,
+            run_id=rt.run_id, browser_recovery=rt.browser_recovery,
+            warnings=list(rt.warnings),
+        )
+        print(
+            f"tabvis: resuming session {rt.session_id} (mode={rt.mode}, "
+            f"browser={rt.browser_recovery}, run={rt.run_id}).",
+            file=sys.stderr,
+        )
+        for w in result.warnings:
+            print(f"tabvis: warning: {w}", file=sys.stderr)
+
     last_result: dict[str, Any] | None = None
     async for message in stream_agent(
         prompt,
@@ -203,6 +227,13 @@ async def run_headless(
         max_turns=max_turns,
         include_partial_messages=(output_format == "stream-json"),
         teardown=True,
+        session_id=(rt.session_id if rt is not None else None),
+        resume=(rt is not None and rt.mode != "fresh"),
+        profile=(rt.profile if rt is not None else DEFAULT_PROFILE),
+        project_dir=(rt.project_dir if rt is not None else None),
+        run_id=(rt.run_id if rt is not None else None),
+        resume_mode=(rt.mode if rt is not None else "fresh"),
+        principal_id=(rt.principal_id if rt is not None else "principal_local"),
     ):
         if output_format == "stream-json":
             _write_ndjson(message)
@@ -234,6 +265,10 @@ async def stream_agent(
     resume: bool = False,
     extra_system_context: str | None = None,
     owns_system_context: bool = False,
+    project_dir: str | None = None,
+    run_id: str | None = None,
+    resume_mode: str = "fresh",
+    principal_id: str = "principal_local",
 ) -> Any:
     """Run one agent session, yielding each SDKMessage as it is produced.
 
@@ -271,8 +306,26 @@ async def stream_agent(
     # advertise to the SDK stream. record_transcript / get_transcript_path both derive the on-disk
     # file name and the stamped "sessionId" from get_session_id() — NOT from this local variable —
     # so without switch_session() the transcript would land under the bootstrap-default uuid and
-    # resume-by-id could not find it.
-    switch_session(as_session_id(session_id))
+    # resume-by-id could not find it. On a Resume Plus the resolver supplies ``project_dir`` (the
+    # ORIGINAL session's project directory, possibly under a different cwd), so the transcript is read
+    # and written where it actually lives rather than re-derived from the current cwd.
+    switch_session(as_session_id(session_id), project_dir=project_dir)
+
+    # Bind the immutable per-Run locator (Resume Plus §4.1) for this task. Additive: writers that
+    # still read process-global session state are unaffected; this is the seam they migrate onto.
+    from tabvis.agent.run_context import RunContext, set_run_context
+
+    set_run_context(
+        RunContext(
+            principal_id=principal_id,
+            agent_id=agent_id,
+            session_id=session_id,
+            run_id=run_id or "",
+            cwd=get_cwd(),
+            project_dir=project_dir,
+            resume_mode=resume_mode,
+        )
+    )
 
     # --- Bundle the browser to the agent, at spawn ----------------------------------------
     # init_browser_session RESERVES the workspace for this agent now (it owns it for its whole life),

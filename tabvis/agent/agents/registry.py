@@ -44,6 +44,17 @@ def new_agent_id() -> str:
     return f"ag_{secrets.token_hex(4)}"
 
 
+def new_run_id() -> str:
+    """A fresh, unique id for one execution (Resume Plus §4.3). Distinct from the durable agent_id."""
+    return f"run_{secrets.token_hex(8)}"
+
+
+# The default owning principal for local single-user deployments (Resume Plus §4.4). A server/gateway
+# fills a real principal; the CLI resolves this fixed one. Keeping it on the record is the seam that
+# lets the resolver scope a reverse lookup by owner without a schema rewrite.
+LOCAL_PRINCIPAL = "principal_local"
+
+
 @dataclass
 class AgentRecord:
     """Everything known about one agent run."""
@@ -51,6 +62,12 @@ class AgentRecord:
     agent_id: str
     session_id: str
     status: str = "queued"  # queued | running | completed | failed | cancelled
+    # --- Resume Plus identity (§4.3) ---
+    # ``run_id`` distinguishes each execution of a durable agent (a reuse gets a fresh one); it is
+    # append-only inspectable identity, not a lifecycle field. ``principal_id`` is the owning
+    # principal the resolver scopes lookups to.
+    run_id: str = ""
+    principal_id: str = LOCAL_PRINCIPAL
     # --- inputs ---
     prompt: str = ""
     model: str | None = None
@@ -154,6 +171,7 @@ def create(
     record = AgentRecord(
         agent_id=agent_id or new_agent_id(),
         session_id=session_id,
+        run_id=new_run_id(),
         prompt=prompt,
         model=model,
         max_turns=max_turns,
@@ -185,7 +203,10 @@ def reuse(
     if record is None:
         return None
     # Keep identity: agent_id, session_id, profile, cwd, created_at. Reset everything run-scoped.
+    # A reuse is a *new execution* of the same durable agent, so it gets a fresh run_id (§4.3) —
+    # that is what makes two reuses separately inspectable.
     record.status = "queued"
+    record.run_id = new_run_id()
     record.prompt = prompt
     if model is not None:
         record.model = model
@@ -206,6 +227,40 @@ def reuse(
 def get(agent_id: str) -> AgentRecord | None:
     _ensure_loaded()
     return _records.get(agent_id)
+
+
+def find_agents_by_session(
+    session_id: str, *, principal_id: str | None = None
+) -> list[AgentRecord]:
+    """Every durable agent that claims ``session_id``, optionally scoped to an owning principal.
+
+    The reverse of the canonical Resume mapping (§4.4): a Session belongs to exactly one Agent, so a
+    well-formed store returns 0 or 1. The resolver treats >1 as ``RESUME_SESSION_AMBIGUOUS`` rather
+    than guessing. When ``principal_id`` is given, records owned by a different principal are excluded
+    — possession of a Session ID is not authority to operate it.
+    """
+    _ensure_loaded()
+    out: list[AgentRecord] = []
+    for record in _records.values():
+        if record.session_id != session_id:
+            continue
+        if principal_id is not None and (record.principal_id or LOCAL_PRINCIPAL) != principal_id:
+            continue
+        out.append(record)
+    return out
+
+
+def active_run(agent_id: str) -> AgentRecord | None:
+    """The agent's record if it currently has a non-terminal (queued/running) run, else None.
+
+    The single-active-Run guard (§16.1): a caller starting a new Run for an agent that is already
+    driving one must be refused (``AGENT_RUN_ACTIVE``) rather than double-driving its browser.
+    """
+    _ensure_loaded()
+    record = _records.get(agent_id)
+    if record is not None and record.status not in TERMINAL:
+        return record
+    return None
 
 
 # --------------------------------------------------------------------------- durability (survive restarts)
