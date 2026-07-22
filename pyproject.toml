@@ -43,6 +43,18 @@ gemini = ["google-genai>=0.3"]
 # `tesserocr` builds against libtesseract/leptonica; on Windows `pip install pytesseract pillow` +
 # the binary is the easier route (the OCR layer auto-detects whichever is present).
 ocr = ["tesserocr>=2.6"]
+# IM channel plugins that need `cryptography` for inbound verification. Optional because most channels
+# (DingTalk, Slack, LINE, WhatsApp) verify with standard-library HMAC/SHA and need nothing extra; only
+# these use public-key or AES crypto and raise a clear install hint if their credential is configured
+# without the package installed:
+#   feishu       — AES-256-CBC decryption of the encrypted event envelope (Encrypt Key)
+#   wecom        — WXBizMsgCrypt AES-256-CBC callback decryption (企业微信)
+#   teams        — RS256 JWT (Bot Framework) validation of the inbound bearer token
+#   google_chat  — RS256 OIDC id-token verification + Service Account assertion signing
+feishu = ["cryptography>=41"]
+wecom = ["cryptography>=41"]
+teams = ["cryptography>=41"]
+google_chat = ["cryptography>=41"]
 
 [project.scripts]
 tabvis = "tabvis.bootstrap_entry:main"

@@ -625,6 +625,21 @@ def get_binding_in(conn: sqlite3.Connection, channel_account_id: str, external_c
     return json.loads(row["data"]) if row else None
 
 
+def get_binding_by_conversation(conversation_id: str) -> dict[str, Any] | None:
+    """Reverse lookup: the binding for an internal conversation.
+
+    Outbound delivery starts from an internal ``conversation_id`` but a channel needs the *external*
+    thread id (a Feishu ``chat_id``, a Slack channel) to send to — this resolves it.
+    """
+    with _lock:
+        conn = connect()
+        row = conn.execute(
+            "SELECT data FROM conversation_bindings WHERE conversation_id = ? LIMIT 1",
+            (conversation_id,),
+        ).fetchone()
+    return json.loads(row["data"]) if row else None
+
+
 # --------------------------------------------------------------------------- channel inbound dedupe
 
 

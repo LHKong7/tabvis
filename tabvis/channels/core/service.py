@@ -50,6 +50,11 @@ class DefaultChannelServices:
     def get_binding(self, channel_account_id: str, external_conversation_id: str) -> ConversationBinding | None:
         return self._bindings.get(channel_account_id, external_conversation_id)
 
+    def resolve_external_conversation(self, conversation_id: str) -> str | None:
+        """Map an internal conversation back to the channel's external thread id (for outbound sends)."""
+        binding = self._bindings.get_by_conversation(conversation_id)
+        return binding.external_conversation_id if binding is not None else None
+
     def resolve_secret(self, credential_ref: str) -> str | None:
         return self._resolve(credential_ref)
 
