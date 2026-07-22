@@ -248,6 +248,9 @@ async def _run_agent(record: AgentRecord, queue: asyncio.Queue[Any]) -> None:
             session_id=record.session_id,
             resume=record.resume,  # a reused agent replays its session's prior turns
             teardown=False,  # close only this agent's browser; registry drains at shutdown
+            run_id=record.run_id,
+            resume_mode=record.resume_mode,
+            principal_id=record.principal_id,
         ):
             mtype = message.get("type")
             if mtype == "assistant":
@@ -957,6 +960,21 @@ def create_app(auth_required: bool = False, dev: bool = False) -> Any:
             cap = _at_capacity()
             if cap is not None:
                 return cap
+            # Resume recovery (§5.2): if this agent's bundled browser is still live, the reuse
+            # reattaches the exact workspace; otherwise it will relaunch the persistent profile.
+            from tabvis.browser.manager import get_browser_service
+
+            svc = get_browser_service(requested_id)
+            recovery = (
+                "attached_live" if (svc is not None and svc.is_alive()) else "relaunched_profile"
+            )
+            resume_mode = str(payload.get("resume_mode") or "plus").strip() or "plus"
+            if resume_mode not in ("plus", "conversation_only"):
+                return JSONResponse(
+                    {"error": f"invalid resume_mode {resume_mode!r}; "
+                     "expected 'plus' or 'conversation_only'"},
+                    status_code=400,
+                )
             # Its profile is its own bundle, so no profile-conflict check — reuse keeps it.
             record = registry.reuse(
                 requested_id,
@@ -964,6 +982,8 @@ def create_app(auth_required: bool = False, dev: bool = False) -> Any:
                 model=payload.get("model"),
                 max_turns=payload.get("max_turns"),
                 stream_partials=bool(payload.get("stream", False)),
+                resume_mode=resume_mode,
+                browser_recovery=recovery,
             )
             return EventSourceResponse(
                 _agent_events(record), headers={"X-Agent-Id": record.agent_id}

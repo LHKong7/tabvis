@@ -269,6 +269,7 @@ async def stream_agent(
     run_id: str | None = None,
     resume_mode: str = "fresh",
     principal_id: str = "principal_local",
+    skip_browser_init: bool = False,
 ) -> Any:
     """Run one agent session, yielding each SDKMessage as it is produced.
 
@@ -335,14 +336,21 @@ async def stream_agent(
     # `get_or_create_browser_service` memoizes the in-flight launch, so a tool call awaits this very
     # task — there is never a double launch. TABVIS_BROWSER_EAGER=0 opts out of the eager launch (the
     # reservation still holds; the browser then launches lazily on the first browser tool call).
-    init_browser_session(
-        session_id=session_id,
-        model=model,
-        cwd=get_cwd(),
-        agent_id=agent_id,
-        profile=profile,
-    )
-    warmup_task = start_browser_warmup()
+    #
+    # ``skip_browser_init`` (Resume Plus item 2): when the caller already acquired the browser binding
+    # — the Gateway's BrowserRuntime reserves the workspace and owns the lease — this path must NOT
+    # reserve/launch/detach a second time. Exactly one runtime owns browser init and release; here we
+    # only bind the agent ContextVar (done above) so the loop's tools target the right workspace.
+    warmup_task = None
+    if not skip_browser_init:
+        init_browser_session(
+            session_id=session_id,
+            model=model,
+            cwd=get_cwd(),
+            agent_id=agent_id,
+            profile=profile,
+        )
+        warmup_task = start_browser_warmup()
 
     # NOTE: `mcp_clients` / `mcp_resources` are bound BEFORE the try so the finally can always
     # reach them, and the try now opens here (not just before the model call) so that a failure
@@ -474,12 +482,15 @@ async def stream_agent(
                 await asyncio.wait_for(run_cleanup_functions(), timeout=10.0)
             except Exception:  # noqa: BLE001 - best-effort; gather() does not swallow
                 pass
-        else:
+        elif not skip_browser_init:
             # Server path: the run is over, but the BUNDLED BROWSER STAYS OPEN and still owned by
             # this agent. It is the agent's environment, not a per-run resource — the window keeps
             # its tabs and its logins for the agent's next run. detach_agent only drops the
             # *actively-driving* claim; the bundle is not idle-reaped and lives until the user quits
             # the agent (POST /agents/<id>/quit) or the process exits (cleanup registry).
+            #
+            # Skipped when ``skip_browser_init``: the caller (the Gateway BrowserRuntime) acquired the
+            # binding, so it — not this loop — releases the Run's driving claim (§7.2 terminal barrier).
             try:
                 await asyncio.wait_for(detach_agent(agent_id), timeout=10.0)
             except Exception:  # noqa: BLE001 - best-effort

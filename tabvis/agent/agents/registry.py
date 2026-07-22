@@ -68,6 +68,10 @@ class AgentRecord:
     # principal the resolver scopes lookups to.
     run_id: str = ""
     principal_id: str = LOCAL_PRINCIPAL
+    # How this run continues a prior one, and what browser recovery it got (§5.1/§5.2). ``fresh`` for
+    # a brand-new agent; a reuse records ``plus``/``conversation_only`` and the resolved recovery mode.
+    resume_mode: str = "fresh"
+    browser_recovery: str | None = None
     # --- inputs ---
     prompt: str = ""
     model: str | None = None
@@ -190,6 +194,8 @@ def reuse(
     model: str | None = None,
     max_turns: int | None = None,
     stream_partials: bool = False,
+    resume_mode: str = "plus",
+    browser_recovery: str | None = None,
 ) -> AgentRecord | None:
     """Re-arm an EXISTING agent for another run — the reusable-agent path. None if unknown.
 
@@ -207,6 +213,8 @@ def reuse(
     # that is what makes two reuses separately inspectable.
     record.status = "queued"
     record.run_id = new_run_id()
+    record.resume_mode = resume_mode
+    record.browser_recovery = browser_recovery
     record.prompt = prompt
     if model is not None:
         record.model = model

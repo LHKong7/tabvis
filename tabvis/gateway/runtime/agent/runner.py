@@ -132,6 +132,9 @@ class AgentRunLauncher:
                                           error_code=e.code, data={"error": e.message})
                     return
                 token = bind_binding(binding.binding_id)
+                # The BrowserRuntime now owns browser init AND release for this Run, so the inner
+                # loop must not reserve/launch/detach a second workspace (Resume Plus item 2).
+                context.extra["skip_browser_init"] = True
 
             try:
                 await self._maybe_build_context(run, context)
@@ -239,6 +242,12 @@ class AgentRunLauncher:
             teardown=False,  # the gateway owns browser teardown; keep the bundle warm past the run
             extra_system_context=context.extra.get("system_context"),
             owns_system_context=context.extra.get("owns_system_context", False),
+            # A resumed Run continues the prior transcript lineage; carry the resolved identity so the
+            # transcript/RunContext agree with the durable Run (Resume Plus §4.1, item 1).
+            run_id=run.run_id,
+            resume_mode=(context.resume_mode or ("plus" if context.resume else "fresh")),
+            # When a browser binding was acquired above, the runtime owns init/release (item 2).
+            skip_browser_init=bool(context.extra.get("skip_browser_init")),
         ):
             yield m
 
