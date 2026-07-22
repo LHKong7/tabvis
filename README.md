@@ -227,6 +227,7 @@ immutable *run* (one prompt-to-terminal execution). It mounts alongside the lega
 | [Feature overview](docs/FEATURES.md) | Current tool surface and subsystem behavior. |
 | [Data model](docs/DATA_MODEL.md) | On-disk records, ID scheme, and the SQLite stores. |
 | [Agent Gateway design](docs/AGENT_GATEWAY_DESIGN.md) | Control-plane architecture — channels, runs, interactions, context — and the incremental migration plan. |
+| [Resume Plus design](docs/RESUME_PLUS_DESIGN.md) | Draft target design for durable Agent continuity, resident-browser recovery, and agent-scoped browser memory. |
 | [Web console](web/README.md) | Running, developing, and self-hosting the React console. |
 
 ## Development
