@@ -13,7 +13,7 @@ from typing import Any
 
 from starlette.applications import Starlette
 from starlette.requests import Request
-from starlette.responses import JSONResponse, Response
+from starlette.responses import JSONResponse, PlainTextResponse, Response
 from starlette.routing import Route
 
 from tabvis.browser.server_auth import SecurityMiddleware
@@ -159,6 +159,45 @@ async def subscribe_events(request: Request) -> Response:
     return EventSourceResponse(generator)
 
 
+# --- IM channel ingress (design §4.5 inbound flow) ---------------------------------------------
+
+
+async def channel_webhook(request: Request) -> Response:
+    """POST webhook ingress for a channel — verify + normalize + start a Run (design §4.5)."""
+    runtime = getattr(request.app.state.gateway, "channels", None)
+    if runtime is None:
+        return JSONResponse({"error": "channels not configured"}, status_code=404)
+    raw = await request.body()
+    try:
+        result = await runtime.ingest_webhook(
+            request.path_params["plugin"], request.headers, raw, dict(request.query_params)
+        )
+    except GatewayError as e:
+        return _error_response(e)
+    if result.get("challenge") is not None:
+        # A POST url_verification handshake (Feishu/Slack) echoes the challenge as JSON.
+        return JSONResponse({"challenge": result["challenge"]})
+    return JSONResponse({"ok": True, "results": result.get("results", [])})
+
+
+async def channel_webhook_verify(request: Request) -> Response:
+    """GET subscription handshake for a channel (e.g. WhatsApp's ``hub.challenge``)."""
+    runtime = getattr(request.app.state.gateway, "channels", None)
+    if runtime is None:
+        return JSONResponse({"error": "channels not configured"}, status_code=404)
+    try:
+        result = await runtime.ingest_webhook(
+            request.path_params["plugin"], request.headers, b"", dict(request.query_params)
+        )
+    except GatewayError as e:
+        return _error_response(e)
+    challenge = result.get("challenge")
+    if challenge is None:
+        return Response(status_code=403)
+    # A GET handshake echoes the challenge as plain text.
+    return PlainTextResponse(str(challenge))
+
+
 # --- legacy /agents compatibility projection (design §9.8) -------------------------------------
 
 
@@ -256,6 +295,10 @@ def gateway_routes(*, health_path: str = "/v1/health", include_compat: bool = Tr
         Route("/v1/runs/{run_id}/cancel", cancel_run, methods=["POST"]),
         Route("/v1/interactions/{interaction_id}/responses", respond_interaction, methods=["POST"]),
         Route("/v1/events", subscribe_events, methods=["GET"]),
+        # IM channel ingress: POST message webhook, GET subscription handshake (no-op unless a
+        # ChannelRuntime is attached to the gateway).
+        Route("/v1/channels/{plugin}/webhook", channel_webhook, methods=["POST"]),
+        Route("/v1/channels/{plugin}/webhook", channel_webhook_verify, methods=["GET"]),
     ]
     if health_path:
         routes.insert(0, Route(health_path, health, methods=["GET"]))

@@ -1039,12 +1039,20 @@ def create_app(auth_required: bool = False, dev: bool = False) -> Any:
         try:
             if _dev_server is not None:
                 await _dev_server.start()  # fail loud if npm/web deps are missing
+            _gw = getattr(_app.state, "gateway", None)
+            if _gw is not None and getattr(_gw, "channels", None) is not None:
+                await _gw.channels.start()  # subscribe outbound delivery + start client-loop read loops
             yield
         finally:
+            gw = getattr(_app.state, "gateway", None)
+            if gw is not None and getattr(gw, "channels", None) is not None:
+                try:
+                    await gw.channels.stop()
+                except Exception:  # noqa: BLE001 - best-effort
+                    pass
             if _dev_server is not None:
                 await _dev_server.stop()
             # Drain the gateway (stop accepting, close its store) before the browser cleanup.
-            gw = getattr(_app.state, "gateway", None)
             if gw is not None:
                 try:
                     gw.drain()
@@ -1139,6 +1147,15 @@ def create_app(auth_required: bool = False, dev: bool = False) -> Any:
             launcher=AgentRunLauncher(context_collector=SourceCollector()),
         )
         gateway_app.startup()
+        # Mount the IM channel plugins (design §4 Phase 4) when TABVIS_CHANNELS is set: inbound webhooks
+        # (POST /v1/channels/{plugin}/webhook) start Runs, and a finished Run's result is delivered back
+        # to its originating channel. The read loops + outbound subscriber start in the lifespan below.
+        try:
+            from tabvis.gateway.runtime.channels import ChannelRuntime
+
+            gateway_app.channels = ChannelRuntime.from_env()
+        except Exception:  # noqa: BLE001 - a channel-config problem must never stop the server
+            gateway_app.channels = None
         # include_compat=False: the legacy server still owns /v1/agents with its registry-backed
         # handlers; the gateway's projection of that surface (design §9.8) is served by the standalone
         # gateway app until a deliberate cutover.

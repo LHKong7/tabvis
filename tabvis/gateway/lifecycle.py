@@ -10,7 +10,7 @@ Phase 3 control-plane slice needs: open the store, register handlers, report rea
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Any, Literal
 
 from tabvis.gateway.events.store import EventStore, get_event_store
 from tabvis.gateway.methods.conversations import ConversationCreateHandler
@@ -50,6 +50,8 @@ class GatewayApplication:
         self.host = host
         self.max_runs = max_runs
         self.status: GatewayStatus = "starting"
+        # Optional IM channel runtime, attached by the server when TABVIS_CHANNELS is set (design §4).
+        self.channels: Any = None
 
     # --- construction ---------------------------------------------------------------------------
 
@@ -114,7 +116,7 @@ class GatewayApplication:
                 "event_store": store_state,
                 "agent_runtime": agent_state,
                 "browser_runtime": "not_configured",
-                "channels": {},
+                "channels": self.channels.health() if self.channels is not None else {},
             },
             "capacity": {"runs": self.max_runs, "available": max(0, self.max_runs - active)},
         }
