@@ -213,7 +213,15 @@ def _get_using_your_tools_section(enabled_tools: set[str]) -> str:
 
 
 _BROWSER_TOOL_NAMES = frozenset(
-    {"BrowserNavigate", "BrowserSnapshot", "BrowserClick", "BrowserType", "BrowserWait"}
+    {
+        "BrowserNavigate",
+        "BrowserSnapshot",
+        "BrowserClick",
+        "BrowserType",
+        "BrowserScroll",
+        "BrowserKeys",
+        "BrowserWait",
+    }
 )
 
 
@@ -244,9 +252,13 @@ def _get_browsing_section(enabled_tools: set[str]) -> str | None:
         "Work in an observe -> act -> observe loop:\n"
         " - BrowserNavigate opens a URL (or goes back/forward/reloads). It returns an "
         "accessibility snapshot of the page: the interactive elements, each tagged [ref=eN].\n"
-        " - Act on an element by passing its ref to BrowserClick or BrowserType. Every act tool "
+        " - Act on an element by passing its ref to BrowserClick, BrowserType, BrowserScroll, or "
+        "BrowserKeys. Every act tool "
         "returns a fresh snapshot of the resulting page — read it before your next action, so you "
         "rarely need a standalone BrowserSnapshot.\n"
+        " - Use BrowserScroll to reveal content (or scroll a ref-tagged container), and BrowserKeys "
+        "for Enter, Tab, Escape, arrows, and shortcuts. On a visual-only canvas, BrowserClick can "
+        "use screenshot viewport coordinates instead of a ref.\n"
         " - A page is often NOT ready when it first loads: single-page apps render late, content lazy-"
         "loads, and interstitials ('Just a moment...', 'Loading...') replace themselves after a few "
         "seconds. If a snapshot looks empty, shows a spinner, or is missing what you expected, use "

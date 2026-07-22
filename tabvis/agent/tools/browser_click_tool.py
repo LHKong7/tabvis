@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from tabvis.constants.tools import BROWSER_CLICK_TOOL_NAME
 from tabvis.browser.browser_service import BrowserError
@@ -17,12 +17,14 @@ from tabvis.agent.tools.browser_common import (
 )
 from tabvis.types.permissions import PermissionDecision
 
-_DESCRIPTION = """Click the element identified by ref (from the latest snapshot), then return a
-fresh snapshot of the resulting page.
+_DESCRIPTION = """Click an element ref or a viewport coordinate, then return a fresh snapshot of
+the resulting page.
 
 Usage:
  - ref must come from the MOST RECENT snapshot (e.g. 'e7'). If the page changed since, the tool
    returns a 'stale ref' error — call BrowserSnapshot to get fresh refs and try again.
+ - For a canvas or visual-only page, omit ref and provide both coordinate_x and coordinate_y from
+   the latest screenshot. Coordinates are CSS pixels within the current viewport.
  - Set double=true for a double-click.
  - Provide description (a short human label like "the blue Sign in button") for the transcript."""
 
@@ -30,11 +32,28 @@ Usage:
 class BrowserClickInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    ref: str = Field(description="Element ref from the latest snapshot, e.g. 'e7'.")
+    ref: str | None = Field(
+        default=None, description="Element ref from the latest snapshot, e.g. 'e7'."
+    )
+    coordinate_x: float | None = Field(
+        default=None, ge=0, description="Viewport x coordinate for a visual-only target."
+    )
+    coordinate_y: float | None = Field(
+        default=None, ge=0, description="Viewport y coordinate for a visual-only target."
+    )
     double: bool = Field(default=False, description="Double-click instead of single-click.")
     description: str | None = Field(
         default=None, description="Short human label of the element being clicked."
     )
+
+    @model_validator(mode="after")
+    def _one_target(self) -> "BrowserClickInput":
+        has_coordinates = self.coordinate_x is not None or self.coordinate_y is not None
+        if bool(self.ref) == has_coordinates:
+            raise ValueError("provide either ref or coordinate_x/coordinate_y")
+        if has_coordinates and (self.coordinate_x is None or self.coordinate_y is None):
+            raise ValueError("coordinate_x and coordinate_y must be provided together")
+        return self
 
 
 class BrowserClickTool(Tool):
@@ -88,7 +107,12 @@ class BrowserClickTool(Tool):
     ) -> ToolResult[dict[str, Any]]:
         try:
             service = await get_or_create_browser_service()
-            data = await service.click(args.ref, double=args.double)
+            data = await service.click(
+                args.ref,
+                double=args.double,
+                coordinate_x=args.coordinate_x,
+                coordinate_y=args.coordinate_y,
+            )
         except BrowserError as e:
             return ToolResult(data={"error": str(e)})
         except Exception as e:  # noqa: BLE001 - surface as a recoverable tool error
@@ -99,7 +123,12 @@ class BrowserClickTool(Tool):
             event={
                 "type": "interaction",
                 "action": "double_click" if args.double else "click",
-                "interaction": {"ref": args.ref, "double": args.double},
+                "interaction": {
+                    "ref": args.ref,
+                    "coordinate_x": args.coordinate_x,
+                    "coordinate_y": args.coordinate_y,
+                    "double": args.double,
+                },
             },
         )
         return ToolResult(data=data)

@@ -8,6 +8,7 @@ all, per the configured posture).
 
 from __future__ import annotations
 
+import json
 from fnmatch import fnmatch
 from typing import Any
 from urllib.parse import urlparse
@@ -159,6 +160,9 @@ def observation_to_block(data: dict[str, Any], tool_use_id: str) -> dict[str, An
         f"Title: {data.get('title', '')}\n"
         f"Open tabs: {data.get('tab_count', 1)}\n\n"
     )
+    action_result = data.get("action_result")
+    if isinstance(action_result, dict):
+        header += "Action result: " + json.dumps(action_result, ensure_ascii=False) + "\n\n"
     text = header + (data.get("snapshot") or "")
     html = data.get("html")
     if html:

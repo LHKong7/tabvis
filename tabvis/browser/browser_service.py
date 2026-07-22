@@ -81,6 +81,14 @@ _HTML_BUDGET = 12_000
 _ARIA_THIN_MAX_REFS = 3
 _ARIA_THIN_MAX_CHARS = 400
 
+# Native input timings mirror the deterministic sequencing described in the browser-operation
+# design.  They are deliberately small and fixed: their purpose is to preserve browser event order,
+# not to pretend that deterministic automation has a human biometric signature.
+_SCROLL_INTO_VIEW_DELAY = 0.05
+_MOUSE_MOVE_DELAY = 0.05
+_MOUSE_HOLD_DELAY = 0.08
+_SCROLL_STEP_DELAY = 0.15
+
 # One pass to lift a trimmed copy of the page HTML: drop non-content/heavy nodes and defuse inline
 # data: URIs (base64 images blow the budget and say nothing). Operates on a clone — no DOM mutation.
 _HTML_EXTRACT_JS = r"""
@@ -102,7 +110,9 @@ _HTML_EXTRACT_JS = r"""
 # One JS pass: clear old refs, tag visible interactive/named nodes, return a compact node list.
 _SNAPSHOT_JS = r"""
 () => {
-  const INTERACTIVE_TAGS = new Set(['A','BUTTON','INPUT','TEXTAREA','SELECT','SUMMARY']);
+  const INTERACTIVE_TAGS = new Set([
+    'A','BUTTON','INPUT','TEXTAREA','SELECT','DETAILS','SUMMARY','OPTION'
+  ]);
   const INTERACTIVE_ROLES = new Set(['button','link','textbox','searchbox','checkbox','radio',
     'combobox','menuitem','menuitemcheckbox','menuitemradio','tab','switch','option','slider']);
   document.querySelectorAll('[data-tabvis-ref]').forEach(el => el.removeAttribute('data-tabvis-ref'));
@@ -149,12 +159,14 @@ _SNAPSHOT_JS = r"""
   };
   const out = [];
   let n = 0;
-  const sel = 'a,button,input,textarea,select,summary,[role],[onclick],' +
+  const sel = 'a,button,input,textarea,select,details,summary,option,[role],[onclick],' +
+    '[onmousedown],[onmouseup],' +
     '[contenteditable=""],[contenteditable="true"],[tabindex]';
   for (const el of document.querySelectorAll(sel)) {
     const role = roleOf(el);
     const interactive = INTERACTIVE_TAGS.has(el.tagName) || INTERACTIVE_ROLES.has(role) ||
-      el.hasAttribute('onclick') || el.isContentEditable;
+      el.hasAttribute('onclick') || el.hasAttribute('onmousedown') ||
+      el.hasAttribute('onmouseup') || el.hasAttribute('tabindex') || el.isContentEditable;
     if (!interactive || !isVisible(el) || el.disabled) continue;
     const ref = 'e' + (++n);
     el.setAttribute('data-tabvis-ref', ref);
@@ -1164,17 +1176,306 @@ class BrowserService:
             # Playwright's own timeout — see wait_for() for why not asyncio.wait_for.
             await page.wait_for_load_state("networkidle", timeout=_SETTLE_SECONDS * 1000)
 
-    async def click(self, ref: str, *, double: bool = False) -> dict[str, Any]:
+    async def _viewport_size(self, page: Page) -> tuple[float, float]:
+        """Return the live CSS viewport, including for contexts without ``viewport_size``."""
+        size = getattr(page, "viewport_size", None)
+        if isinstance(size, dict) and size.get("width") and size.get("height"):
+            return float(size["width"]), float(size["height"])
+        try:
+            value = await page.evaluate("() => ({width: innerWidth, height: innerHeight})")
+            return float(value["width"]), float(value["height"])
+        except Exception as e:  # noqa: BLE001
+            raise BrowserError(f"Could not determine the browser viewport: {e}") from e
+
+    async def _visible_center(self, locator: Locator, page: Page) -> tuple[float, float] | None:
+        """Scroll a ref into view and return the centre of its largest visible rectangle."""
+        with contextlib.suppress(Exception):
+            await locator.scroll_into_view_if_needed()
+        await asyncio.sleep(_SCROLL_INTO_VIEW_DELAY)
+        try:
+            box = await locator.bounding_box()
+        except Exception:  # noqa: BLE001 - a missing box triggers the JavaScript fallback
+            return None
+        if not box:
+            return None
+        width, height = await self._viewport_size(page)
+        return _visible_box_center(box, width, height)
+
+    async def _point_hits_element(
+        self, locator: Locator, x: float, y: float
+    ) -> bool:
+        """Whether ``elementFromPoint`` hits the target or a semantically related element."""
+        script = r"""
+        (target, point) => {
+          const hit = document.elementFromPoint(point.x, point.y);
+          if (!hit) return false;
+          if (hit === target || target.contains(hit) || hit.contains(target)) return true;
+          const targetLabel = target.closest('label');
+          const hitLabel = hit.closest && hit.closest('label');
+          if (targetLabel && hitLabel === targetLabel) return true;
+          const targetId = target.id;
+          if (targetId && hitLabel && hitLabel.htmlFor === targetId) return true;
+          const hitId = hit.id;
+          const targetFor = targetLabel && targetLabel.htmlFor;
+          return Boolean(hitId && targetFor && hitId === targetFor);
+        }
+        """
+        try:
+            return bool(await locator.evaluate(script, {"x": x, "y": y}))
+        except Exception:  # noqa: BLE001 - inability to prove it is clear => use safe fallback
+            return False
+
+    async def _dispatch_cdp(self, page: Page, events: list[tuple[str, dict[str, Any]]]) -> bool:
+        """Send raw CDP events when the active engine supports them.
+
+        Firefox/WebKit and some remote providers do not expose CDP sessions.  Returning ``False``
+        lets callers use Playwright's native input facade and, finally, JavaScript as a fallback.
+        """
+        session: Any = None
+        try:
+            session = await page.context.new_cdp_session(page)
+            for method, params in events:
+                await session.send(method, params)
+            return True
+        except Exception as e:  # noqa: BLE001 - expected on non-Chromium engines
+            log_for_debugging(f"[BROWSER] CDP input unavailable ({e}); using fallback.")
+            return False
+        finally:
+            if session is not None:
+                with contextlib.suppress(Exception):
+                    await session.detach()
+
+    async def _native_click(
+        self, page: Page, x: float, y: float, *, double: bool
+    ) -> str:
+        """Dispatch an ordered native click and return the mechanism used."""
+        session: Any = None
+        try:
+            session = await page.context.new_cdp_session(page)
+            await session.send(
+                "Input.dispatchMouseEvent", {"type": "mouseMoved", "x": x, "y": y}
+            )
+            await asyncio.sleep(_MOUSE_MOVE_DELAY)
+            for count in range(1, (2 if double else 1) + 1):
+                await session.send(
+                    "Input.dispatchMouseEvent",
+                    {
+                        "type": "mousePressed",
+                        "x": x,
+                        "y": y,
+                        "button": "left",
+                        "clickCount": count,
+                    },
+                )
+                await asyncio.sleep(_MOUSE_HOLD_DELAY)
+                await session.send(
+                    "Input.dispatchMouseEvent",
+                    {
+                        "type": "mouseReleased",
+                        "x": x,
+                        "y": y,
+                        "button": "left",
+                        "clickCount": count,
+                    },
+                )
+            return "cdp"
+        except Exception as e:  # noqa: BLE001 - expected on non-Chromium engines
+            log_for_debugging(f"[BROWSER] CDP click unavailable ({e}); using fallback.")
+        finally:
+            if session is not None:
+                with contextlib.suppress(Exception):
+                    await session.detach()
+
+        try:
+            await page.mouse.move(x, y)
+            await asyncio.sleep(_MOUSE_MOVE_DELAY)
+            if double:
+                await page.mouse.dblclick(x, y, delay=int(_MOUSE_HOLD_DELAY * 1000))
+            else:
+                await page.mouse.down(button="left")
+                await asyncio.sleep(_MOUSE_HOLD_DELAY)
+                await page.mouse.up(button="left")
+            return "playwright-native"
+        except Exception as e:  # noqa: BLE001
+            raise BrowserError(f"Native click failed: {e}") from e
+
+    @staticmethod
+    async def _checked_state(locator: Locator) -> bool | None:
+        try:
+            return await locator.evaluate(
+                "el => (el.matches('input[type=checkbox],input[type=radio]') ? !!el.checked : null)"
+            )
+        except Exception:  # noqa: BLE001 - verification is best-effort for non-check controls
+            return None
+
+    @staticmethod
+    async def _javascript_click(locator: Locator) -> None:
+        try:
+            await locator.evaluate("el => el.click()")
+        except Exception as e:  # noqa: BLE001
+            raise BrowserError(f"JavaScript click fallback failed: {e}") from e
+
+    async def _observe_action_change(
+        self, page: Page, before_url: str, before_pages: set[int]
+    ) -> tuple[dict[str, Any], bool, bool]:
+        """Switch to a newly opened tab, settle navigation, and return a fresh observation."""
+        await asyncio.sleep(0.1)
+        open_pages = [p for p in self._pages() if not p.is_closed()]
+        new_pages = [p for p in open_pages if id(p) not in before_pages]
+        new_tab = bool(new_pages)
+        if new_pages:
+            self._active_page = new_pages[-1]
+            page = self._active_page
+        page_changed = new_tab or page.url != before_url
+        if page_changed:
+            await self._settle(page)
+        return await self.observe(), page_changed, new_tab
+
+    async def click(
+        self,
+        ref: str | None = None,
+        *,
+        double: bool = False,
+        coordinate_x: float | None = None,
+        coordinate_y: float | None = None,
+    ) -> dict[str, Any]:
+        """Click a ref or viewport coordinate using native browser input.
+
+        Ref clicks scroll into view, reject an occluded centre, and fall back to ``element.click``
+        when a usable native coordinate is unavailable.  Coordinate clicks exist for canvas and
+        other visual-only pages and intentionally cannot use the element fallback.
+        """
         async with self._action_lock:
-            locator = await self._resolve_visible(ref)
+            has_coordinates = coordinate_x is not None or coordinate_y is not None
+            if bool(ref) == has_coordinates:
+                raise BrowserError("Provide either ref or both coordinate_x and coordinate_y.")
+            if has_coordinates and (coordinate_x is None or coordinate_y is None):
+                raise BrowserError("coordinate_x and coordinate_y must be provided together.")
+
+            page = self.active_page
+            locator = await self._resolve_visible(ref) if ref else None
             # A click frequently triggers a request (link/submit/XHR); pace it per host too.
             await get_request_pacer().pace(host_of(self._current_url()), counts_as_request=True)
-            timeout = self._action_timeout_s()
-            if double:
-                await asyncio.wait_for(locator.dblclick(), timeout=timeout)
+            before_url = page.url
+            before_pages = {id(p) for p in self._pages() if not p.is_closed()}
+            checked_before = await self._checked_state(locator) if locator else None
+
+            if locator is not None:
+                point = await self._visible_center(locator, page)
+                unobscured = bool(
+                    point and await self._point_hits_element(locator, point[0], point[1])
+                )
+                if point and unobscured:
+                    executed_via = await asyncio.wait_for(
+                        self._native_click(page, point[0], point[1], double=double),
+                        timeout=self._action_timeout_s(),
+                    )
+                else:
+                    await asyncio.wait_for(
+                        self._javascript_click(locator), timeout=self._action_timeout_s()
+                    )
+                    executed_via = "javascript"
             else:
-                await asyncio.wait_for(locator.click(), timeout=timeout)
-            return await self.observe()
+                width, height = await self._viewport_size(page)
+                assert coordinate_x is not None and coordinate_y is not None
+                if not (0 <= coordinate_x < width and 0 <= coordinate_y < height):
+                    raise BrowserError(
+                        f"Click coordinate ({coordinate_x}, {coordinate_y}) is outside the "
+                        f"{int(width)}x{int(height)} viewport."
+                    )
+                point = (float(coordinate_x), float(coordinate_y))
+                executed_via = await asyncio.wait_for(
+                    self._native_click(page, point[0], point[1], double=double),
+                    timeout=self._action_timeout_s(),
+                )
+
+            # A checkbox/radio native click that did not toggle is not a successful interaction.
+            # Retry it with DOM click, exactly once, as the documented compatibility fallback.
+            checked_after = await self._checked_state(locator) if locator else None
+            if locator is not None and checked_before is not None and checked_after == checked_before:
+                await self._javascript_click(locator)
+                checked_after = await self._checked_state(locator)
+                executed_via += "+javascript-retry"
+
+            data, page_changed, new_tab = await self._observe_action_change(
+                page, before_url, before_pages
+            )
+            data["action_result"] = {
+                "action": "double_click" if double else "click",
+                "executed_via": executed_via,
+                "coordinates": {"x": round(point[0], 2), "y": round(point[1], 2)},
+                "page_changed": page_changed,
+                "new_tab": new_tab,
+                "checked_changed": (
+                    checked_after != checked_before if checked_before is not None else None
+                ),
+                "verified": checked_after != checked_before if checked_before is not None else True,
+            }
+            return data
+
+    @staticmethod
+    async def _read_input_value(locator: Locator) -> str | None:
+        try:
+            return await locator.evaluate(
+                "el => ('value' in el ? String(el.value) : (el.isContentEditable ? el.textContent : null))"
+            )
+        except Exception:  # noqa: BLE001
+            return None
+
+    async def _clear_input(self, locator: Locator, page: Page) -> None:
+        """Clear standard, controlled, and contenteditable inputs using layered strategies."""
+        clear_js = r"""
+        el => {
+          if ('value' in el) {
+            const proto = Object.getPrototypeOf(el);
+            const descriptor = Object.getOwnPropertyDescriptor(proto, 'value');
+            if (descriptor && descriptor.set) descriptor.set.call(el, '');
+            else el.value = '';
+          } else if (el.isContentEditable) {
+            el.textContent = '';
+          }
+          el.dispatchEvent(new InputEvent('input', {bubbles: true, inputType: 'deleteContentBackward'}));
+          el.dispatchEvent(new Event('change', {bubbles: true}));
+        }
+        """
+        with contextlib.suppress(Exception):
+            await locator.evaluate(clear_js)
+        if (await self._read_input_value(locator)) in (None, ""):
+            return
+
+        # Rich editors and Web Components may ignore the value setter.  Select visually first.
+        with contextlib.suppress(Exception):
+            await locator.click(click_count=3)
+            await page.keyboard.press("Backspace")
+        if (await self._read_input_value(locator)) in (None, ""):
+            return
+
+        modifier = "Meta" if sys.platform == "darwin" else "Control"
+        await page.keyboard.press(f"{modifier}+A")
+        await page.keyboard.press("Backspace")
+
+    @staticmethod
+    async def _type_native(page: Page, text: str) -> None:
+        """Type characters natively, converting line breaks to full Enter key sequences."""
+        parts = re.split(r"(\r\n|\r|\n)", text)
+        for part in parts:
+            if not part:
+                continue
+            if part in ("\r\n", "\r", "\n"):
+                await page.keyboard.press("Enter")
+            else:
+                # Playwright keyboard.type emits keydown/keypress/input/keyup for every character.
+                await page.keyboard.type(part, delay=1)
+
+    @staticmethod
+    async def _dispatch_framework_input_events(locator: Locator) -> None:
+        with contextlib.suppress(Exception):
+            await locator.evaluate(
+                """el => {
+                  el.dispatchEvent(new Event('input', {bubbles: true}));
+                  el.dispatchEvent(new Event('change', {bubbles: true}));
+                }"""
+            )
 
     async def type_text(
         self, ref: str, text: str, *, clear: bool = True, submit: bool = False
@@ -1186,14 +1487,44 @@ class BrowserService:
             # Scales with len(text) — a humanized keystroke-by-keystroke fill takes far longer than
             # a plain one, and a flat cap would cancel it mid-word (see _action_timeout_s).
             timeout = self._action_timeout_s(len(text))
+            page = self.active_page
+            before_url = page.url
+            before_pages = {id(p) for p in self._pages() if not p.is_closed()}
+            previous_value = await self._read_input_value(locator)
+
+            with contextlib.suppress(Exception):
+                await locator.scroll_into_view_if_needed()
+            await asyncio.sleep(_SCROLL_INTO_VIEW_DELAY)
+            try:
+                await asyncio.wait_for(locator.focus(), timeout=timeout)
+            except Exception:  # noqa: BLE001 - a centre click is the focus fallback
+                point = await self._visible_center(locator, page)
+                if not point:
+                    raise BrowserError(f"Could not focus ref '{ref}'.")
+                await self._native_click(page, point[0], point[1], double=False)
+
             if clear:
-                await asyncio.wait_for(locator.fill(text), timeout=timeout)
-            else:
-                await asyncio.wait_for(locator.click(), timeout=timeout)
-                await asyncio.wait_for(locator.type(text), timeout=timeout)
+                await asyncio.wait_for(self._clear_input(locator, page), timeout=timeout)
+            await asyncio.wait_for(self._type_native(page, text), timeout=timeout)
+            await self._dispatch_framework_input_events(locator)
+
+            actual_value = await self._read_input_value(locator)
+            expected_value = text if clear or previous_value is None else previous_value + text
+            verified = actual_value is None or actual_value == expected_value
+            # Contenteditable normalises CR/LF and may append a final newline; compare a normalised
+            # form before treating a successful native input as a failure.
+            if not verified and actual_value is not None:
+                normal_actual = actual_value.replace("\r\n", "\n").rstrip("\n")
+                normal_expected = expected_value.replace("\r\n", "\n").rstrip("\n")
+                verified = normal_actual == normal_expected
+            if not verified:
+                raise BrowserError(
+                    f"Typing into ref '{ref}' did not produce the requested value "
+                    f"(expected {len(expected_value)} characters, got {len(actual_value or '')})."
+                )
             if submit:
                 await asyncio.wait_for(
-                    locator.press("Enter"), timeout=self._action_timeout_s()
+                    page.keyboard.press("Enter"), timeout=self._action_timeout_s()
                 )
                 # Enter usually submits a form, i.e. navigates. Settle before snapshotting so the
                 # agent sees the page it just asked for rather than the one it typed into.
@@ -1202,7 +1533,180 @@ class BrowserService:
                 # is exactly how the snapshot ends up racing the new document (_evaluate_snapshot
                 # catches what slips through).
                 await self._settle(self.active_page)
-            return await self.observe()
+            data, page_changed, new_tab = await self._observe_action_change(
+                page, before_url, before_pages
+            )
+            data["action_result"] = {
+                "action": "type",
+                "executed_via": "native-keyboard",
+                "characters": len(text),
+                "clear": clear,
+                "submit": submit,
+                "value_length": len(actual_value) if actual_value is not None else None,
+                "page_changed": page_changed,
+                "new_tab": new_tab,
+                "verified": verified,
+            }
+            return data
+
+    async def send_keys(self, keys: str, *, ref: str | None = None) -> dict[str, Any]:
+        """Send a special key or shortcut, optionally after focusing a fresh ref."""
+        sequence = _normalize_key_sequence(keys)
+        async with self._action_lock:
+            page = self.active_page
+            before_url = page.url
+            before_pages = {id(p) for p in self._pages() if not p.is_closed()}
+            if ref:
+                locator = await self._resolve_visible(ref)
+                with contextlib.suppress(Exception):
+                    await locator.scroll_into_view_if_needed()
+                try:
+                    await locator.focus()
+                except Exception as e:  # noqa: BLE001
+                    raise BrowserError(f"Could not focus ref '{ref}' before sending keys: {e}") from e
+            await get_request_pacer().pace(
+                host_of(self._current_url()),
+                counts_as_request=sequence.endswith("Enter"),
+            )
+            try:
+                await asyncio.wait_for(
+                    page.keyboard.press(sequence), timeout=self._action_timeout_s()
+                )
+            except Exception as e:  # noqa: BLE001
+                raise BrowserError(f"Could not send keys '{keys}': {e}") from e
+            data, page_changed, new_tab = await self._observe_action_change(
+                page, before_url, before_pages
+            )
+            data["action_result"] = {
+                "action": "keys",
+                "keys": sequence,
+                "page_changed": page_changed,
+                "new_tab": new_tab,
+                "verified": True,
+            }
+            return data
+
+    async def _scroll_position(self, page: Page, locator: Locator | None) -> float | None:
+        try:
+            if locator is not None:
+                return float(await locator.evaluate("el => el.scrollTop"))
+            return float(await page.evaluate("() => window.scrollY"))
+        except Exception:  # noqa: BLE001
+            return None
+
+    async def _scroll_once(
+        self,
+        page: Page,
+        pixels: float,
+        *,
+        point: tuple[float, float],
+        locator: Locator | None,
+    ) -> str:
+        """Perform one native scroll step, with the documented JavaScript fallback."""
+        x, y = point
+        if locator is None:
+            native = await self._dispatch_cdp(
+                page,
+                [
+                    (
+                        "Input.synthesizeScrollGesture",
+                        {
+                            "x": x,
+                            "y": y,
+                            "xDistance": 0,
+                            "yDistance": -pixels,
+                            "speed": 50000,
+                        },
+                    )
+                ],
+            )
+        else:
+            native = await self._dispatch_cdp(
+                page,
+                [
+                    (
+                        "Input.dispatchMouseEvent",
+                        {
+                            "type": "mouseWheel",
+                            "x": x,
+                            "y": y,
+                            "deltaX": 0,
+                            "deltaY": pixels,
+                        },
+                    )
+                ],
+            )
+        if native:
+            return "cdp"
+
+        try:
+            await page.mouse.move(x, y)
+            await page.mouse.wheel(0, pixels)
+            return "playwright-native"
+        except Exception as e:  # noqa: BLE001 - JavaScript is the final compatibility fallback
+            log_for_debugging(f"[BROWSER] native scroll failed ({e}); using JavaScript.")
+
+        try:
+            if locator is not None:
+                await locator.evaluate("(el, dy) => el.scrollBy({top: dy, behavior: 'instant'})", pixels)
+            else:
+                await page.evaluate("dy => window.scrollBy({top: dy, behavior: 'instant'})", pixels)
+            return "javascript"
+        except Exception as e:  # noqa: BLE001
+            raise BrowserError(f"Scroll failed: {e}") from e
+
+    async def scroll(
+        self, *, down: bool = True, pages: float = 1.0, ref: str | None = None
+    ) -> dict[str, Any]:
+        """Scroll the page or a ref's container in page-sized native input steps."""
+        if not (0 < pages <= 100):
+            raise BrowserError("pages must be greater than 0 and no more than 100.")
+        async with self._action_lock:
+            page = self.active_page
+            locator = await self._resolve_visible(ref) if ref else None
+            width, height = await self._viewport_size(page)
+            if locator is not None:
+                point = await self._visible_center(locator, page)
+                if point is None:
+                    raise BrowserError(f"Could not find a visible scroll point for ref '{ref}'.")
+            else:
+                point = (width / 2, height / 2)
+
+            before = await self._scroll_position(page, locator)
+            direction = 1 if down else -1
+            full_steps = int(pages)
+            fractions = [1.0] * full_steps
+            remainder = pages - full_steps
+            if remainder > 1e-9:
+                fractions.append(remainder)
+            mechanisms: list[str] = []
+            for index, fraction in enumerate(fractions):
+                mechanisms.append(
+                    await self._scroll_once(
+                        page,
+                        direction * height * fraction,
+                        point=point,
+                        locator=locator,
+                    )
+                )
+                if index < len(fractions) - 1:
+                    await asyncio.sleep(_SCROLL_STEP_DELAY)
+
+            after = await self._scroll_position(page, locator)
+            data = await self.observe()
+            data["action_result"] = {
+                "action": "scroll",
+                "direction": "down" if down else "up",
+                "pages": pages,
+                "target": ref or "page",
+                "executed_via": "+".join(dict.fromkeys(mechanisms)),
+                "position_changed": (
+                    after != before if before is not None and after is not None else None
+                ),
+                # No movement at the document boundary is still a verified delivered gesture.
+                "verified": True,
+            }
+            return data
 
     async def snapshot(self, *, include_screenshot: bool = False) -> dict[str, Any]:
         async with self._action_lock:
@@ -1210,6 +1714,78 @@ class BrowserService:
 
 
 # --------------------------------------------------------------------------- helpers
+
+
+def _visible_box_center(
+    box: dict[str, float], viewport_width: float, viewport_height: float
+) -> tuple[float, float] | None:
+    """Centre of the box/viewport intersection, clamped to valid CSS coordinates."""
+    left = max(0.0, float(box.get("x", 0.0)))
+    top = max(0.0, float(box.get("y", 0.0)))
+    right = min(viewport_width, float(box.get("x", 0.0)) + float(box.get("width", 0.0)))
+    bottom = min(viewport_height, float(box.get("y", 0.0)) + float(box.get("height", 0.0)))
+    if right <= left or bottom <= top or viewport_width <= 0 or viewport_height <= 0:
+        return None
+    x = max(0.0, min(viewport_width - 1, (left + right) / 2))
+    y = max(0.0, min(viewport_height - 1, (top + bottom) / 2))
+    return x, y
+
+
+_KEY_ALIASES = {
+    "ctrl": "Control",
+    "control": "Control",
+    "cmd": "Meta",
+    "command": "Meta",
+    "meta": "Meta",
+    "alt": "Alt",
+    "option": "Alt",
+    "shift": "Shift",
+    "enter": "Enter",
+    "return": "Enter",
+    "tab": "Tab",
+    "escape": "Escape",
+    "esc": "Escape",
+    "pageup": "PageUp",
+    "pagedown": "PageDown",
+    "arrowup": "ArrowUp",
+    "arrowdown": "ArrowDown",
+    "arrowleft": "ArrowLeft",
+    "arrowright": "ArrowRight",
+    "backspace": "Backspace",
+    "delete": "Delete",
+    "space": "Space",
+    "home": "Home",
+    "end": "End",
+}
+_KEY_MODIFIERS = frozenset({"Control", "Meta", "Alt", "Shift"})
+_KEY_NAMES = frozenset(set(_KEY_ALIASES.values()) - set(_KEY_MODIFIERS))
+
+
+def _normalize_key_sequence(keys: str) -> str:
+    """Validate and canonicalise a Playwright/CDP key chord such as ``Control+A``."""
+    raw = (keys or "").strip()
+    if not raw:
+        raise BrowserError("keys must not be empty.")
+    parts = [part.strip() for part in raw.split("+")]
+    if any(not part for part in parts):
+        raise BrowserError(f"Invalid key sequence '{keys}'.")
+
+    normalized: list[str] = []
+    main_keys = 0
+    for part in parts:
+        canonical = _KEY_ALIASES.get(part.lower())
+        if canonical is None and len(part) == 1:
+            canonical = part.upper() if part.isalpha() else part
+        if canonical is None or (canonical not in _KEY_MODIFIERS and canonical not in _KEY_NAMES and len(canonical) != 1):
+            raise BrowserError(f"Unsupported key '{part}'.")
+        if canonical not in _KEY_MODIFIERS:
+            main_keys += 1
+        if canonical in normalized:
+            raise BrowserError(f"Duplicate key '{part}' in '{keys}'.")
+        normalized.append(canonical)
+    if main_keys != 1:
+        raise BrowserError("A key sequence must contain exactly one non-modifier key.")
+    return "+".join(normalized)
 
 
 def _display_available() -> bool:

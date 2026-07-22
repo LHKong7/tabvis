@@ -9,7 +9,7 @@ an *adapter* — it maps a tool call to a ``(action, resource)`` pair, evaluates
 
 Behavior is deliberately preserved (``standard`` posture unchanged):
 
-* The five current tools (navigate / click / type / snapshot / wait) map to ``browser.navigate`` or
+* Browser navigation and interaction tools map to ``browser.navigate`` or
   ``browser.interact``, both of which a **browser baseline** allows — so with no identity or
   settings policy, the decision is ``allow`` exactly as before.
 * Navigation ``goto`` still runs :func:`check_navigation_permission` first, preserving the domain
@@ -34,7 +34,9 @@ from typing import Any
 from tabvis.constants.tools import (
     BROWSER_CLICK_TOOL_NAME,
     BROWSER_DOWNLOAD_TOOL_NAME,
+    BROWSER_KEYS_TOOL_NAME,
     BROWSER_NAVIGATE_TOOL_NAME,
+    BROWSER_SCROLL_TOOL_NAME,
     BROWSER_SNAPSHOT_TOOL_NAME,
     BROWSER_TYPE_TOOL_NAME,
     BROWSER_WAIT_TOOL_NAME,
@@ -136,6 +138,8 @@ def _action_and_resource(tool_name: str, input: Any) -> tuple[str, str]:
         return "browser.download", f"url:{get_field(input, 'url') or ''}"
     if tool_name in (
         BROWSER_CLICK_TOOL_NAME,
+        BROWSER_KEYS_TOOL_NAME,
+        BROWSER_SCROLL_TOOL_NAME,
         BROWSER_TYPE_TOOL_NAME,
         BROWSER_SNAPSHOT_TOOL_NAME,
         BROWSER_WAIT_TOOL_NAME,
