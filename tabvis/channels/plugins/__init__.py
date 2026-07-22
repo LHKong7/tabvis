@@ -36,6 +36,8 @@ BUILTIN_CHANNEL_PLUGINS: dict[str, str] = {
     "mattermost": "tabvis.channels.plugins.mattermost:MattermostChannel",
     "simplex": "tabvis.channels.plugins.simplex:SimpleXChatChannel",
     "imessage": "tabvis.channels.plugins.imessage:IMessageChannel",
+    "signal": "tabvis.channels.plugins.signal:SignalChannel",
+    "qq": "tabvis.channels.plugins.qq:QQChannel",
     # Reference / test channels.
     "example_webhook": "tabvis.channels.plugins.example_webhook:ExampleWebhookChannel",
 }

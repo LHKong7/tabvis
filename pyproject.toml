@@ -51,10 +51,12 @@ ocr = ["tesserocr>=2.6"]
 #   wecom        — WXBizMsgCrypt AES-256-CBC callback decryption (企业微信)
 #   teams        — RS256 JWT (Bot Framework) validation of the inbound bearer token
 #   google_chat  — RS256 OIDC id-token verification + Service Account assertion signing
+#   qq           — Ed25519 QQ-bot webhook signature verify + validation handshake
 feishu = ["cryptography>=41"]
 wecom = ["cryptography>=41"]
 teams = ["cryptography>=41"]
 google_chat = ["cryptography>=41"]
+qq = ["cryptography>=41"]
 # Client-loop IM channels whose live connection is a WebSocket (httpx has no WS client). Optional
 # because their inbound event parsing + outbound send are tested without a live socket; the socket is
 # only needed to actually connect, and the plugin raises a clear install hint if it is missing:

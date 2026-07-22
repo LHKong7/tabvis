@@ -2153,6 +2153,9 @@ ocr = [
 openai = [
     { name = "openai" },
 ]
+qq = [
+    { name = "cryptography" },
+]
 simplex = [
     { name = "websockets" },
 ]
@@ -2175,6 +2178,7 @@ requires-dist = [
     { name = "cloakbrowser", marker = "extra == 'cloak'", specifier = ">=0.4.10" },
     { name = "cryptography", marker = "extra == 'feishu'", specifier = ">=41" },
     { name = "cryptography", marker = "extra == 'google-chat'", specifier = ">=41" },
+    { name = "cryptography", marker = "extra == 'qq'", specifier = ">=41" },
     { name = "cryptography", marker = "extra == 'teams'", specifier = ">=41" },
     { name = "cryptography", marker = "extra == 'wecom'", specifier = ">=41" },
     { name = "google-genai", marker = "extra == 'gemini'", specifier = ">=0.3" },
@@ -2197,7 +2201,7 @@ requires-dist = [
     { name = "websockets", marker = "extra == 'mattermost'", specifier = ">=12" },
     { name = "websockets", marker = "extra == 'simplex'", specifier = ">=12" },
 ]
-provides-extras = ["camoufox", "cloak", "discord", "feishu", "gemini", "google-chat", "mattermost", "ocr", "openai", "simplex", "teams", "wecom"]
+provides-extras = ["camoufox", "cloak", "discord", "feishu", "gemini", "google-chat", "mattermost", "ocr", "openai", "qq", "simplex", "teams", "wecom"]
 
 [package.metadata.requires-dev]
 dev = [{ name = "pytest", specifier = ">=8.0" }]

@@ -146,6 +146,9 @@ class ChannelRuntime:
 
         if getattr(result, "rejected", False):
             raise GatewayError("FORBIDDEN", message=getattr(result, "reason", None) or "webhook rejected")
+        validation = getattr(result, "validation", None)
+        if validation is not None:  # a custom handshake response body (e.g. QQ's op-13), returned verbatim
+            return {"body": validation}
         challenge = getattr(result, "challenge", None)
         if challenge is not None:
             return {"challenge": challenge}

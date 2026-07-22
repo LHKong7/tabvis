@@ -298,17 +298,33 @@ the legacy `tabvis/browser/server.py`, it mounts beside it. Current state:
 | Interactions (service + HTTP) | Implemented (model-resume-after-restart is future work) |
 | Gateway extraction + real run execution, mounted in the daemon | Implemented |
 | Context runtime | Implemented and wired into the run launcher |
-| Channels framework (below) | Implemented but **not mounted** (no HTTP webhook ingress yet) |
+| IM channels — 17 platforms + HTTP ingress + outbound delivery (below) | Implemented and **mounted** when `TABVIS_CHANNELS` is set |
 | Plugin runtime, worker coordination, leased-binding browser path | Present as scaffolding, **not started/wired** in the daemon by default |
 
 See [AGENT_GATEWAY_DESIGN.md](AGENT_GATEWAY_DESIGN.md) for the target architecture and
 [DATA_MODEL.md](DATA_MODEL.md) for the on-disk records.
 
-### Channels
+### IM channels
 
-`tabvis/channels/` is a framework for connecting inbound/outbound messaging surfaces (a `ChannelPlugin`
-contract with normalize/deliver, HMAC webhook-signature verification, idempotent delivery, and
-identity/conversation binding). It ships a web channel and an example webhook channel. The framework
-is exercised by tests but is **not mounted into the server** — there is no runtime webhook route yet,
-so it isn't reachable in `--serve` today. It's the seam that later phases (messaging integrations)
-slot into.
+`tabvis/channels/` connects external messaging surfaces to the agent through one `ChannelPlugin`
+contract (verify → normalize → deliver) and the same inbound pipeline (dedupe → bind → message event
+→ Run). **17 IM platforms** ship, in two transport shapes:
+
+- **Webhook** (an HTTP callback the plugin verifies): Feishu 飞书, DingTalk 钉钉, WeCom 企业微信, Slack,
+  Microsoft Teams, LINE, Google Chat, WhatsApp, and QQ.
+- **Client-loop** (a persistent connection that pushes into the pipeline): Telegram, Discord, Matrix,
+  Mattermost, IRC, SimpleX, Signal, and iMessage.
+
+Each verifies its platform's real scheme — Feishu/WeCom AES envelopes, Teams/Google Chat RS256 JWT, QQ
+Ed25519, and the Slack/LINE/WhatsApp/DingTalk HMAC variants — and reads `TABVIS_<PLATFORM>_*` config.
+Crypto/websocket channels pull an optional extra (`uv sync --extra feishu|wecom|teams|google_chat|qq|discord|mattermost|simplex`).
+
+**Wired live.** Set `TABVIS_CHANNELS` (e.g. `feishu,slack,telegram`) under `tabvis --serve` and the
+gateway mounts an ingress at `POST /v1/channels/<plugin>/webhook` (plus a GET handshake for WhatsApp),
+starts the client-loop channels' read loops, and delivers each finished Run's reply back to its
+originating chat by subscribing to `run.completed`. End-to-end: a chat message → webhook / read-loop →
+verify → normalize → bind → **Run** → agent → reply delivered back to the chat.
+
+Not included as channels: personal WeChat (个人微信 — no official bot API; automating a personal account
+violates ToS; WeCom/企业微信 is the official enterprise path) and Tencent Yuanbao (腾讯元宝 — an assistant
+app, not an IM). The `example_webhook` and `web` channels remain as the reference/console channels.

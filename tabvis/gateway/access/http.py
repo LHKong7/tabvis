@@ -174,6 +174,9 @@ async def channel_webhook(request: Request) -> Response:
         )
     except GatewayError as e:
         return _error_response(e)
+    if result.get("body") is not None:
+        # A custom handshake response body (e.g. QQ's op-13 validation), returned verbatim.
+        return JSONResponse(result["body"])
     if result.get("challenge") is not None:
         # A POST url_verification handshake (Feishu/Slack) echoes the challenge as JSON.
         return JSONResponse({"challenge": result["challenge"]})
