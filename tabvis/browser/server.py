@@ -251,6 +251,7 @@ async def _run_agent(record: AgentRecord, queue: asyncio.Queue[Any]) -> None:
             run_id=record.run_id,
             resume_mode=record.resume_mode,
             principal_id=record.principal_id,
+            write_memory=(record.resume_mode != "conversation_only"),
         ):
             mtype = message.get("type")
             if mtype == "assistant":

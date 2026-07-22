@@ -248,6 +248,8 @@ class AgentRunLauncher:
             resume_mode=(context.resume_mode or ("plus" if context.resume else "fresh")),
             # When a browser binding was acquired above, the runtime owns init/release (item 2).
             skip_browser_init=bool(context.extra.get("skip_browser_init")),
+            # A conversation-only resume does not write Agent Memory (§5.1).
+            write_memory=(context.resume_mode != "conversation_only"),
         ):
             yield m
 

@@ -38,6 +38,7 @@ from tabvis.browser.manager import (
     DEFAULT_PROFILE,
     bind_agent,
     detach_agent,
+    get_browser_service,
     init_browser_session,
     start_browser_warmup,
     unbind_agent,
@@ -269,6 +270,7 @@ async def run_headless(
         resume_mode=(rt.mode if rt is not None else "fresh"),
         principal_id=(rt.principal_id if rt is not None else "principal_local"),
         context_preamble=context_preamble,
+        write_memory=(rt.write_memory if rt is not None else True),
     ):
         if output_format == "stream-json":
             _write_ndjson(message)
@@ -306,6 +308,7 @@ async def stream_agent(
     principal_id: str = "principal_local",
     skip_browser_init: bool = False,
     context_preamble: str | None = None,
+    write_memory: bool = True,
 ) -> Any:
     """Run one agent session, yielding each SDKMessage as it is produced.
 
@@ -339,6 +342,13 @@ async def stream_agent(
     # Callers that need to know the session id up-front (the server, so it can put it on the agent
     # record before the run starts) pass it in; everyone else gets a fresh one.
     session_id = session_id or str(uuid.uuid4())
+    if not run_id:
+        from tabvis.agent.agents.registry import new_run_id
+
+        run_id = new_run_id()  # every run is separately identifiable, incl. a fresh CLI run
+    # Terminal status for post-run consolidation; overwritten when the result frame arrives. Defaults
+    # to "interrupted" so a cancel/crash before the result still records a truthful digest (§10.4).
+    run_status = "interrupted"
     # Register the session id in bootstrap state so the persistence layer agrees with the id we
     # advertise to the SDK stream. record_transcript / get_transcript_path both derive the on-disk
     # file name and the stamped "sessionId" from get_session_id() — NOT from this local variable —
@@ -494,6 +504,8 @@ async def stream_agent(
             should_query=should_query,
             result_text=result_text,
         ):
+            if message.get("type") == "result":
+                run_status = "failed" if message.get("is_error") else "completed"
             yield message
     finally:
         # Flush the batched transcript write queue to disk before the loop/process exits. The
@@ -504,6 +516,33 @@ async def stream_agent(
 
             await flush_session_storage()
         except Exception:  # noqa: BLE001 - flushing is best-effort
+            pass
+
+        # Resume Plus glue (§7.2/§10.4): after the transcript is on disk, consolidate this Run's
+        # evidence into Agent Memory. Doubly gated (write_memory + TABVIS_BROWSER_MEMORY + per-agent
+        # consent) and fully best-effort — a consolidation failure never affects the Run. One point
+        # here covers the CLI, the legacy server, and the Gateway (all drive stream_agent).
+        try:
+            from tabvis.agent.mem.extractor import is_browser_memory_enabled
+
+            if write_memory and is_browser_memory_enabled():
+                from tabvis.agent.mem.integration import consolidate_after_run
+
+                live_tabs: list[Any] = []
+                try:
+                    svc = get_browser_service(agent_id)
+                    if svc is not None and svc.is_alive():
+                        live_tabs = svc.tabs()
+                except Exception:  # noqa: BLE001 - a tab read is best-effort
+                    live_tabs = []
+                await asyncio.wait_for(
+                    consolidate_after_run(
+                        principal_id=principal_id, agent_id=agent_id, session_id=session_id,
+                        run_id=run_id, status=run_status, tabs=live_tabs, write_memory=write_memory,
+                    ),
+                    timeout=30.0,
+                )
+        except Exception:  # noqa: BLE001 - consolidation never breaks a run
             pass
 
         # Settle the browser warm-up BEFORE draining cleanups. The browser only registers its
