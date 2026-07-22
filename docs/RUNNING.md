@@ -295,10 +295,11 @@ served via `GET /agents/<id>/artifacts`.
 
 | Var | Default | Meaning |
 |---|---|---|
-| `TABVIS_BROWSER_ARTIFACTS` | `1` | Record navigation/page/interaction/DOM events |
+| `TABVIS_BROWSER_ARTIFACTS` | `1` | Record navigation/page/interaction/download/DOM events |
 | `TABVIS_BROWSER_ARTIFACTS_DOM` | `1` | Capture page DOM per event |
 | `TABVIS_BROWSER_ARTIFACTS_MAX_DOM_BYTES` | `1000000` | Cap per captured DOM blob |
-| `TABVIS_BROWSER_ARTIFACTS_REDACT_INPUT` | `0` | Store typed text as length-only |
+| `TABVIS_BROWSER_ARTIFACTS_INCLUDE_INPUT` | `0` | Persist typed text (truncated, sensitive-stripped); default keeps only `text_len` |
+| `TABVIS_BROWSER_ARTIFACTS_REDACT_INPUT` | `0` | Force redaction even when `INCLUDE_INPUT=1` |
 
 ### 6.5 Stealth options (`cloak` engine)
 

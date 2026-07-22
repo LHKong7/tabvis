@@ -26,6 +26,7 @@ import asyncio
 import hashlib
 import json
 import os
+import re
 import uuid
 from typing import Any
 
@@ -34,6 +35,7 @@ from tabvis.utils.browser_config import (
     get_browser_artifacts_max_dom_bytes,
     is_browser_artifacts_dom_enabled,
     is_browser_artifacts_enabled,
+    is_browser_artifacts_include_input,
     is_browser_artifacts_redact_input,
 )
 from tabvis.utils.debug import log_for_debugging
@@ -42,6 +44,14 @@ ARTIFACTS_SUBDIR = "browser-artifacts"
 EVENTS_FILENAME = "events.jsonl"
 DOM_SUBDIR = "dom"
 _MAX_INPUT_CHARS = 500
+
+# A run of 13–19 digits (spaces/dashes allowed between them) — a credit/debit card PAN. Validated
+# with the Luhn checksum below so a plain long number (an order id, a phone) is not over-redacted.
+_CARD_RE = re.compile(r"(?:\d[ -]?){13,19}")
+# A long high-entropy token: 20+ chars from the URL-/JWT-safe alphabet, with at least one digit —
+# catches API keys, bearer tokens, JWTs, session ids. Kept deliberately conservative so ordinary
+# prose (which lacks a digit and rarely runs 20 unbroken word chars) is left intact.
+_TOKEN_RE = re.compile(r"\b(?=[A-Za-z0-9._-]*\d)[A-Za-z0-9._-]{20,}\b")
 
 # Per-session-dir monotonic event counter (single event loop, so a plain dict is race-free enough).
 _seq_by_dir: dict[str, int] = {}
@@ -108,17 +118,62 @@ def _append_event_sync(directory: str, event: dict[str, Any]) -> None:
         fh.write(json.dumps(event, default=str) + "\n")
 
 
+def _luhn_ok(digits: str) -> bool:
+    """Luhn (mod-10) checksum — the check every real card number satisfies."""
+    total, alt = 0, False
+    for ch in reversed(digits):
+        d = ord(ch) - 48
+        if alt:
+            d *= 2
+            if d > 9:
+                d -= 9
+        total += d
+        alt = not alt
+    return total % 10 == 0
+
+
+def _looks_sensitive(text: str) -> bool:
+    """Whether ``text`` looks like a secret that must never be persisted, whatever the config.
+
+    Catches the two classes the design calls out that we *can* recognise from the value alone: a
+    card number (13–19 digits passing Luhn) and a long high-entropy token / API key. Password fields
+    have no tell in the value, so those are covered by the default (redact-unless-opted-in) posture
+    rather than here.
+    """
+    for m in _CARD_RE.finditer(text):
+        digits = re.sub(r"[ -]", "", m.group())
+        if 13 <= len(digits) <= 19 and _luhn_ok(digits):
+            return True
+    return bool(_TOKEN_RE.search(text))
+
+
 def _redact_interaction(interaction: dict[str, Any]) -> dict[str, Any]:
-    """Optionally strip typed text (may be a password) down to just its length."""
-    if not is_browser_artifacts_redact_input() or "text" not in interaction:
-        text = interaction.get("text")
-        if isinstance(text, str) and len(text) > _MAX_INPUT_CHARS:
-            return {**interaction, "text": text[:_MAX_INPUT_CHARS], "text_truncated": True}
+    """Reduce typed text to just its length unless input inclusion is explicitly opted into.
+
+    Default posture (secure): the artifact keeps ``text_len`` and drops the text — keystrokes
+    routinely carry credentials. ``TABVIS_BROWSER_ARTIFACTS_INCLUDE_INPUT=1`` opts into saving the
+    (truncated) text, *except* when it looks like a card number / token, which is stripped
+    unconditionally. ``TABVIS_BROWSER_ARTIFACTS_REDACT_INPUT=1`` forces redaction even when inclusion
+    is on.
+    """
+    if "text" not in interaction:
         return interaction
     text = interaction.get("text")
+    text_len = len(text) if isinstance(text, str) else 0
+
+    include = is_browser_artifacts_include_input() and not is_browser_artifacts_redact_input()
+    if include and isinstance(text, str) and not _looks_sensitive(text):
+        out = {**interaction, "text_len": text_len}
+        if len(text) > _MAX_INPUT_CHARS:
+            out["text"] = text[:_MAX_INPUT_CHARS]
+            out["text_truncated"] = True
+        return out
+
     out = {k: v for k, v in interaction.items() if k != "text"}
     out["text_redacted"] = True
-    out["text_len"] = len(text) if isinstance(text, str) else 0
+    out["text_len"] = text_len
+    if include:  # inclusion was on but the value tripped the sensitive-content guard
+        out["text_redacted_reason"] = "sensitive"
     return out
 
 
@@ -190,6 +245,83 @@ async def record_browser_artifact(event: dict[str, Any], data: dict[str, Any]) -
             log_for_debugging(f"[ARTIFACTS] failed to index artifact in sqlite: {e}")
     except Exception as e:  # noqa: BLE001 - recording the trail must never break a browser action
         log_for_debugging(f"[ARTIFACTS] failed to record browser artifact: {e}")
+
+
+def _hash_file_sync(path: str) -> tuple[str | None, int | None]:
+    """``(sha256_hex, size_bytes)`` of a file on disk, or ``(None, None)`` if unreadable."""
+    try:
+        h = hashlib.sha256()
+        size = 0
+        with open(path, "rb") as fh:
+            for chunk in iter(lambda: fh.read(65536), b""):
+                h.update(chunk)
+                size += len(chunk)
+        return h.hexdigest(), size
+    except OSError:
+        return None, None
+
+
+async def record_download_artifact(
+    *,
+    action: str,
+    url: str | None,
+    path: str | None,
+    filename: str | None = None,
+    policy_effect: str | None = None,
+    policy_rule_id: str | None = None,
+    quarantined: bool = False,
+    extra: dict[str, Any] | None = None,
+) -> None:
+    """Record a ``type=download`` artifact event — the audit link for a fetched file (issue #5).
+
+    Stores only a *reference* to the file (``path_ref``), its ``sha256`` and ``size_bytes``, plus the
+    source URL and the policy decision that let it through — never the file's bytes (those stay in
+    the workspace / quarantine). This closes the audit chain: a download is now correlated with the
+    navigation, click and permission decision around it, exactly like the other artifact kinds.
+
+    ``action`` is one of ``explicit_download`` / ``click_download`` / ``pdf_navigation``. Best-effort:
+    a failure here never breaks a download.
+    """
+    if not is_browser_artifacts_enabled():
+        return
+    try:
+        from tabvis.browser.manager import current_agent_id
+
+        agent_id = current_agent_id()
+        directory = get_artifacts_dir()
+        sha256 = size_bytes = None
+        if path:
+            sha256, size_bytes = await asyncio.to_thread(_hash_file_sync, path)
+        record: dict[str, Any] = {
+            "seq": _next_seq(directory),
+            "ts": utc_now(),
+            "agent_id": agent_id,
+            "workspace_id": _workspace_id_for(agent_id),
+            "type": "download",
+            "action": action,
+            "url": url,
+            "filename": filename or (os.path.basename(path) if path else None),
+            "path_ref": path,
+            "sha256": sha256,
+            "size_bytes": size_bytes,
+            "policy_effect": policy_effect,
+            "policy_rule_id": policy_rule_id,
+            "quarantined": quarantined,
+        }
+        if extra:
+            record.update(extra)
+        await asyncio.to_thread(_append_event_sync, directory, record)
+        try:
+            from tabvis.bootstrap.state import get_session_id
+            from tabvis.browser.persistence import db
+
+            await asyncio.to_thread(
+                db.insert_artifact, str(get_session_id()), record.get("agent_id"), record
+            )
+        except Exception as e:  # noqa: BLE001
+            log_for_debugging(f"[ARTIFACTS] failed to index download artifact in sqlite: {e}")
+    except Exception as e:  # noqa: BLE001 - recording the trail must never break a download
+        log_for_debugging(f"[ARTIFACTS] failed to record download artifact: {e}")
 
 
 async def _capture_dom() -> str:

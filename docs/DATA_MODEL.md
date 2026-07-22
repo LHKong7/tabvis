@@ -147,10 +147,13 @@ lifecycle change and navigation; finalized with `ended_at`/`status` at close.
 
 ### 6.2 `browser-artifacts/` — the browsing trail (default on, `TABVIS_BROWSER_ARTIFACTS`)
 
-- **`events.jsonl`** — append-only, one action per line (`artifacts.py:152`): `seq` (1-based monotonic),
-  `ts`, `agent_id`, `workspace_id`, `type` (`navigation|page|interaction`), `action`, `url`, `title`,
-  `tab_count`, optional `interaction` (redacted; typed text truncated at 500 chars, or length-only when
-  `TABVIS_BROWSER_ARTIFACTS_REDACT_INPUT`), `dom_ref`, `dom_bytes`.
+- **`events.jsonl`** — append-only, one action per line (`artifacts.py`): `seq` (1-based monotonic),
+  `ts`, `agent_id`, `workspace_id`, `type` (`navigation|page|interaction|download`), `action`, `url`,
+  `title`, `tab_count`, optional `interaction`, `dom_ref`, `dom_bytes`. Typed text is **redacted by
+  default** — the `interaction` keeps only `text_len`; set `TABVIS_BROWSER_ARTIFACTS_INCLUDE_INPUT=1`
+  to persist the (truncated) text, and even then card-number / token-looking values are always
+  stripped. A `download` event records `filename`, `path_ref`, `sha256`, `size_bytes`, `policy_effect`,
+  `policy_rule_id`, and `quarantined` — a reference + hash, never the file's bytes.
 - **`dom/<hash>.html`** — the page HTML at each event, **content-addressed** so identical DOMs dedupe
   to one file (`_store_dom_sync`, `artifacts.py:82`). Capped at `TABVIS_BROWSER_ARTIFACTS_MAX_DOM_BYTES`
   (default 1 MB). ⚠ **Gotcha:** the filename is `sha256(html).hexdigest()[:16]` — the first **16 hex
@@ -216,11 +219,15 @@ replays}` dir is scaffolding — real artifacts live in the per-session `browser
 | **BrowserIdentity** | `browser-identities/<agent_id>.json` (+ `browser_identities` table) | **agent_id** | durable per-agent identity: `{agent_id (UNIQUE owner), id (id_…), status, profile/auth/network/environment/permissions}`. Secrets referenced by `*_ref` only, never inline (`identity.py:87`). Note: keyed by **agent_id**, not identity_id, despite the design tree. |
 | **IdentityBinding** | *in-memory only* | — | transient per-run acquisition (`bnd_…`); never persisted (`identity.py:121`). |
 | **Chromium profile** | `<config-home>/browser[-<engine>]/` and `…/profiles/<slug>/` | agent/profile name (1:1 with agent) | the **real** cookies/logins/tabs on disk. `resolve_profile_dir` (`manager.py:148`): `default → base`, else `<base>/profiles/<slug>`. Engine suffix (`browser-cloak`, …) prevents cross-build collisions. Override: `TABVIS_BROWSER_USER_DATA_DIR`. |
-| **Secret store** | `browser-secrets.json` (0600, **plaintext**) **or** macOS Keychain | global (by `sec_<hex16>`) | holds the plaintext behind every `*_ref`. Keychain backend opt-in via `TABVIS_BROWSER_SECRET_KEYCHAIN` (darwin). ⚠ **Empty by default** — `store_storage_state`/`store_credential`/`set_proxy` have no non-test callers today (`secret_store.py:9`). |
+| **Secret store** | macOS Keychain / system keyring **or** `browser-secrets.json` (0600, **plaintext** fallback) | global (by `sec_<hex16>`) | holds the plaintext behind every `*_ref`. **Secure backend by default** (`secret_store._resolve_backend`): macOS → Keychain, else the `keyring` package's system store if installed, else the 0600 file. Force with `TABVIS_SECRET_BACKEND=file\|keychain\|keyring`. `has_secure_backend()` gates storage-state export. `identity_store.delete_identity` cascades secret deletion. |
 
 ⚠ The design's `browser-os-data/identities/<identity_id>/{profile.snapshot, storage-state.enc}` is
-**never written**. There is no encrypted `storage-state.enc` file; the functional analogue is
-`storage_state` serialized to JSON and stored as a `sec_ref` (encrypted only on the opt-in keychain).
+**never written**. There is no encrypted `storage-state.enc` file; the functional analogue is a
+`storage_state` envelope (`{version, exported_at, storage_state}`) stored as a `sec_ref` via
+`identity_store.export_identity_state` — encrypted at rest only under a secure backend, and refused
+outright when none is present (unless `TABVIS_ALLOW_INSECURE_STORAGE_STATE=1`). It is an **explicit,
+gated export/import**, not auto-loaded at launch: the persistent Chromium profile stays the single
+live auth source (issue #7).
 
 ### 7.5 Agent registry & credentials
 
@@ -313,9 +320,11 @@ In prose:
 | `TABVIS_CONFIG_DIR` | config home (default `~/.tabvis`). Honored everywhere **except** the personal `workflows/` dir |
 | `TABVIS_BROWSER_SQLITE` | master switch for `runtime.db` (default on); off ⇒ JSON-only, no behavior change |
 | `TABVIS_BROWSER_USER_DATA_DIR` | override the Chromium profile base dir |
-| `TABVIS_BROWSER_ARTIFACTS` / `_DOM` / `_MAX_DOM_BYTES` / `_REDACT_INPUT` | artifact recording, DOM capture, DOM cap, input redaction |
+| `TABVIS_BROWSER_ARTIFACTS` / `_DOM` / `_MAX_DOM_BYTES` | artifact recording, DOM capture, DOM cap |
+| `TABVIS_BROWSER_ARTIFACTS_INCLUDE_INPUT` / `_REDACT_INPUT` | persist typed text (default off → redacted) / force redaction |
 | `TABVIS_BROWSER_REPLAY` | write `replay.json` (default off) |
-| `TABVIS_BROWSER_SECRET_KEYCHAIN` | use macOS Keychain instead of `browser-secrets.json` (darwin) |
+| `TABVIS_SECRET_BACKEND` | force the secret backend: `file` \| `keychain` \| `keyring` (blank = auto; secure by default) |
+| `TABVIS_ALLOW_INSECURE_STORAGE_STATE` | permit storage-state export to the plaintext 0600 file when no secure backend is present |
 | `TABVIS_SKIP_PROMPT_HISTORY`, `settings.cleanupPeriodDays=0` | disable conversation persistence |
 | `TABVIS_MEMORY_PATH_OVERRIDE`, `TABVIS_REMOTE_MEMORY_DIR`, `TABVIS_DISABLE_AUTO_MEMORY` | auto-memory location / disable |
 

@@ -56,6 +56,18 @@ def config_home(monkeypatch: pytest.MonkeyPatch, tmp_path) -> str:
 
 
 @pytest.fixture(autouse=True)
+def _pin_secret_backend(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Pin the secret store to its file backend so the suite never touches a real OS keystore.
+
+    ``secret_store`` now defaults to a secure backend (macOS Keychain / system keyring); without this
+    a test run on macOS — or a Linux box with ``keyring`` installed — would read/write the developer's
+    real credential store. ``TABVIS_SECRET_BACKEND`` is not ``TABVIS_BROWSER_*``-prefixed, so it
+    survives ``_clean_browser_env``. Tests that specifically exercise backend selection override it.
+    """
+    monkeypatch.setenv("TABVIS_SECRET_BACKEND", "file")
+
+
+@pytest.fixture(autouse=True)
 def settings(monkeypatch: pytest.MonkeyPatch) -> Callable[..., SettingsJson]:
     """Install a stub ``settings.json``; autouse-installs an EMPTY one so disk never leaks in.
 

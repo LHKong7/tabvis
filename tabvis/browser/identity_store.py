@@ -318,15 +318,36 @@ def set_proxy(agent_id: str, proxy_url: str) -> str:
         return ref
 
 
-def store_storage_state(agent_id: str, storage_state: dict[str, Any]) -> str:
-    """Store a Playwright ``storage_state`` (cookies + storage) as a secret and set
+# Bumped when the export envelope's shape changes, so an imported blob stays interpretable.
+_STORAGE_STATE_VERSION = 1
 
-    ``auth.storage_state_ref`` (IDP-6 / the design's ``storage-state.enc``). Returns the ref.
+
+def _insecure_storage_state_allowed() -> bool:
+    return os.environ.get("TABVIS_ALLOW_INSECURE_STORAGE_STATE", "").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+
+
+def store_storage_state(agent_id: str, storage_state: dict[str, Any]) -> str:
+    """**Low-level / experimental.** Store a raw Playwright ``storage_state`` as the identity's secret.
+
+    Prefer :func:`export_identity_state`, which enforces the safety preconditions (browser closed,
+    authorized, secure backend) and records a versioned + timestamped envelope. This bare setter
+    exists for the internal secret round-trip and does not gate on those preconditions — it only
+    *warns* when the backend is the insecure file fallback. Returns the ``secret_ref``.
+
+    Note: a persistent profile is the primary source of cookies/logins. Storage-state here is an
+    explicit export/import blob, NOT an auto-loaded second source of truth (issue #7).
     """
     import json
 
     from tabvis.browser import secret_store
 
+    if not secret_store.has_secure_backend() and not _insecure_storage_state_allowed():
+        log_for_debugging(
+            "[IDENTITY] persisting storage_state without a secure secret backend (plaintext file). "
+            "Prefer export_identity_state; set TABVIS_ALLOW_INSECURE_STORAGE_STATE=1 to silence."
+        )
     with _lock:
         identity = resolve(agent_id)
         ref = secret_store.put(json.dumps(storage_state, default=str))
@@ -335,20 +356,157 @@ def store_storage_state(agent_id: str, storage_state: dict[str, Any]) -> str:
         return ref
 
 
-def load_storage_state(agent_id: str) -> dict[str, Any] | None:
-    """Resolve the identity's stored ``storage_state`` back to a dict, or None (IDP-6)."""
+def _unwrap_storage_state(raw: str | None) -> dict[str, Any] | None:
+    """Parse a stored storage-state blob, unwrapping the export envelope if present."""
+    if not raw:
+        return None
     import json
 
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return None
+    if isinstance(data, dict) and "storage_state" in data and "version" in data:
+        return data["storage_state"]  # export envelope
+    return data  # legacy bare dict
+
+
+def load_storage_state(agent_id: str) -> dict[str, Any] | None:
+    """**Low-level.** Resolve the identity's stored ``storage_state`` back to a dict, or None.
+
+    Tolerates both the versioned export envelope (:func:`export_identity_state`) and a legacy bare
+    dict. Prefer :func:`import_identity_state` for the audited path.
+    """
+    identity = get_by_agent(agent_id)
+    if identity is None or not identity.auth.storage_state_ref:
+        return None
+    return _unwrap_storage_state(_resolve_secret(identity.auth.storage_state_ref))
+
+
+# --------------------------------------------------------------------------- explicit export/import
+
+
+def export_identity_state(
+    agent_id: str,
+    storage_state: dict[str, Any],
+    *,
+    browser_closed: bool,
+    authorized: bool = True,
+    allow_insecure: bool = False,
+) -> dict[str, Any]:
+    """Explicitly export an identity's cookies/storage into a versioned, timestamped secret (issue #7).
+
+    This is the *recommended* storage-state API. Unlike auto-restoring a second auth source at every
+    launch — which races the persistent profile — it is a deliberate, gated operation:
+
+    * ``browser_closed`` must be True — exporting while the profile is live risks a torn snapshot;
+    * ``authorized`` must be True — the caller attests this is a sanctioned export;
+    * a **secure secret backend** must be present (macOS Keychain / system keyring), unless
+      ``allow_insecure`` (or ``TABVIS_ALLOW_INSECURE_STORAGE_STATE=1``) explicitly permits the
+      plaintext file fallback.
+
+    Stores a ``{version, exported_at, storage_state}`` envelope and returns its metadata.
+    """
+    import json
+
+    from tabvis.browser import secret_store
+
+    if not browser_closed:
+        raise ValueError("export_identity_state requires the browser to be closed first.")
+    if not authorized:
+        raise PermissionError("identity state export is not authorized.")
+    if not secret_store.has_secure_backend() and not (
+        allow_insecure or _insecure_storage_state_allowed()
+    ):
+        raise RuntimeError(
+            "no secure secret backend available; refusing to persist storage state to a plaintext "
+            "file. Configure a keychain/keyring, or pass allow_insecure=True / set "
+            "TABVIS_ALLOW_INSECURE_STORAGE_STATE=1 to override."
+        )
+
+    envelope = {
+        "version": _STORAGE_STATE_VERSION,
+        "exported_at": utc_now(),
+        "storage_state": storage_state,
+    }
+    with _lock:
+        identity = resolve(agent_id)
+        old_ref = identity.auth.storage_state_ref
+        ref = secret_store.put(json.dumps(envelope, default=str))
+        identity.auth.storage_state_ref = ref
+        _save(identity)
+        if old_ref and old_ref != ref:
+            secret_store.delete(old_ref)  # don't leak the superseded blob
+    return {"ref": ref, "version": _STORAGE_STATE_VERSION, "exported_at": envelope["exported_at"]}
+
+
+def import_identity_state(agent_id: str, *, authorized: bool = True) -> dict[str, Any] | None:
+    """Import an identity's exported storage-state envelope (issue #7), or None if it has none.
+
+    Returns ``{storage_state, version, exported_at}``. This is an *explicit* restore the caller can
+    hand to ``new_context(storage_state=...)`` — it is deliberately NOT invoked automatically at
+    launch (the persistent profile stays the live auth source; see :func:`export_identity_state`).
+    """
+    if not authorized:
+        raise PermissionError("identity state import is not authorized.")
     identity = get_by_agent(agent_id)
     if identity is None or not identity.auth.storage_state_ref:
         return None
     raw = _resolve_secret(identity.auth.storage_state_ref)
     if not raw:
         return None
+    import json
+
     try:
-        return json.loads(raw)
+        data = json.loads(raw)
     except ValueError:
         return None
+    if isinstance(data, dict) and "storage_state" in data and "version" in data:
+        return {
+            "storage_state": data["storage_state"],
+            "version": data.get("version"),
+            "exported_at": data.get("exported_at"),
+        }
+    return {"storage_state": data, "version": None, "exported_at": None}  # legacy bare dict
+
+
+# --------------------------------------------------------------------------- deletion cascade
+
+
+def delete_identity(agent_id: str) -> bool:
+    """Delete an identity and every secret it references (issue #6). Returns whether one existed.
+
+    Linked cleanup: the credential refs, the proxy secret and the storage-state blob are removed from
+    the secret store, then the JSON sidecar and the SQLite mirror row, then the in-memory cache. This
+    is the counterpart to :func:`store_credential` / :func:`export_identity_state` so a deleted
+    identity never leaves an orphaned secret behind.
+    """
+    from tabvis.browser import secret_store
+
+    with _lock:
+        identity = _cache.get(agent_id) or _load(agent_id)
+        if identity is None:
+            _cache.pop(agent_id, None)
+            return False
+        for ref in list(identity.auth.credential_refs):
+            secret_store.delete(ref)
+        if identity.auth.storage_state_ref:
+            secret_store.delete(identity.auth.storage_state_ref)
+        proxy_ref = identity.network.proxy_ref
+        if proxy_ref and proxy_ref.startswith("sec_"):
+            secret_store.delete(proxy_ref)
+        _cache.pop(agent_id, None)
+        try:
+            os.remove(_path(agent_id))
+        except OSError:
+            pass
+        try:
+            from tabvis.browser.persistence import db
+
+            db.delete_identity(agent_id)
+        except Exception as e:  # noqa: BLE001
+            log_for_debugging(f"[IDENTITY] failed to delete {agent_id} from sqlite: {e}")
+        return True
 
 
 def resolve_credential(secret_ref: str) -> str | None:

@@ -649,14 +649,71 @@ class BrowserService:
 
     # ------------------------------------------------------------------ downloads / workspace
 
-    def _record_download(self, path: str, url: str | None, kind: str) -> dict[str, Any]:
-        entry = {"path": path, "url": url, "filename": os.path.basename(path), "kind": kind}
-        self._downloads.append(entry)
-        log_for_debugging(f"[BROWSER] saved {kind} to workspace: {path}")
+    def _record_download(
+        self,
+        path: str,
+        url: str | None,
+        kind: str,
+        *,
+        action: str,
+        policy_effect: str | None = None,
+        policy_rule_id: str | None = None,
+        quarantined: bool = False,
+        expose: bool = True,
+    ) -> dict[str, Any]:
+        """Record a saved file: surface it to the agent (unless quarantined) and log a download
+        artifact (issue #5) so the fetch is auditable alongside navigation/click/policy events."""
+        entry: dict[str, Any] = {
+            "path": path,
+            "url": url,
+            "filename": os.path.basename(path),
+            "kind": kind,
+        }
+        if quarantined:
+            entry["quarantined"] = True
+        # A quarantined file is deliberately NOT added to _downloads: observe() reports that list to
+        # the agent, and a file policy did not clear must not be handed to the model.
+        if expose and not quarantined:
+            self._downloads.append(entry)
+        where = "quarantine" if quarantined else "workspace"
+        log_for_debugging(f"[BROWSER] saved {kind} to {where}: {path}")
+        self._schedule_download_artifact(
+            action=action,
+            url=url,
+            path=path,
+            filename=entry["filename"],
+            policy_effect=policy_effect,
+            policy_rule_id=policy_rule_id,
+            quarantined=quarantined,
+        )
         return entry
 
+    def _schedule_download_artifact(self, **kwargs: Any) -> None:
+        """Fire-and-forget the ``type=download`` artifact write. Best-effort; never blocks a save."""
+        try:
+            from tabvis.browser.artifacts import record_download_artifact
+
+            task = asyncio.ensure_future(record_download_artifact(**kwargs))
+            self._download_tasks = getattr(self, "_download_tasks", set())
+            self._download_tasks.add(task)
+            task.add_done_callback(self._download_tasks.discard)
+        except Exception as e:  # noqa: BLE001
+            log_for_debugging(f"[BROWSER] failed to schedule download artifact: {e}")
+
+    @staticmethod
+    def _judge_download(url: str | None) -> tuple[str, str | None]:
+        """Evaluate ``browser.download`` for an *unexpected* download. Fail closed on any error."""
+        try:
+            from tabvis.browser.manager import current_agent_id
+            from tabvis.browser.policy_guard import evaluate_download
+
+            return evaluate_download(url or "", current_agent_id())
+        except Exception as e:  # noqa: BLE001 - a policy hiccup must not silently expose a file
+            log_for_debugging(f"[BROWSER] download policy evaluation failed, quarantining: {e}")
+            return "deny", None
+
     def _on_download(self, download: Any) -> None:
-        """Playwright download event — save the file into the workspace off the event loop."""
+        """Playwright download event — save the file off the event loop, policy permitting."""
         task = asyncio.ensure_future(self._save_download(download))
         # Keep a reference so the task isn't GC'd mid-flight; drop it when done.
         self._download_tasks = getattr(self, "_download_tasks", set())
@@ -664,18 +721,47 @@ class BrowserService:
         task.add_done_callback(self._download_tasks.discard)
 
     async def _save_download(self, download: Any) -> None:
-        from tabvis.browser.downloads import get_workspace_dir, unique_path
+        """Handle an *unexpected* browser download (a click that triggered one).
 
+        Issue #3: such a download is not the same as an explicit BrowserDownload — the click being
+        allowed does NOT imply the resulting file is. So it is pre-judged against ``browser.download``:
+        an ``allow`` lands it in the workspace (agent-visible); anything else is held in quarantine,
+        recorded as an artifact, and kept out of the agent's reach for a human to review.
+        """
+        from tabvis.browser.downloads import get_quarantine_dir, get_workspace_dir, unique_path
+
+        url = getattr(download, "url", None)
+        suggested = getattr(download, "suggested_filename", None)
         try:
-            dest = unique_path(get_workspace_dir(), getattr(download, "suggested_filename", None))
-            await download.save_as(dest)
-            self._record_download(dest, getattr(download, "url", None), "download")
+            effect, rule_id = self._judge_download(url)
+            if effect == "allow":
+                dest = unique_path(get_workspace_dir(), suggested)
+                await download.save_as(dest)
+                self._record_download(
+                    dest, url, "download", action="click_download",
+                    policy_effect=effect, policy_rule_id=rule_id,
+                )
+            else:
+                dest = unique_path(get_quarantine_dir(), suggested)
+                await download.save_as(dest)
+                self._record_download(
+                    dest, url, "download", action="click_download",
+                    policy_effect=effect, policy_rule_id=rule_id,
+                    quarantined=True, expose=False,
+                )
+                log_for_debugging(
+                    f"[BROWSER] unexpected download quarantined (policy={effect}): {url}"
+                )
         except Exception as e:  # noqa: BLE001 - a failed download must never break the run
             log_for_debugging(f"[BROWSER] download save failed: {e}")
 
     async def _capture_pdf_navigation(self, response: Any, url: str) -> None:
         """If a navigation landed on a PDF, save its bytes to the workspace (Chromium would only
-        render it in the built-in viewer, which the accessibility snapshot can't read)."""
+        render it in the built-in viewer, which the accessibility snapshot can't read).
+
+        The navigation itself was already policy-checked (``browser.navigate``), so the PDF the agent
+        deliberately navigated to is workspace-visible; it is still logged as a ``pdf_navigation``
+        download artifact for the audit trail."""
         if response is None:
             return
         try:
@@ -689,12 +775,25 @@ class BrowserService:
             dest = unique_path(get_workspace_dir(), filename_from_url(url, "page.pdf"))
             with open(dest, "wb") as fh:
                 fh.write(body)
-            self._record_download(dest, url, "pdf")
+            self._record_download(dest, url, "pdf", action="pdf_navigation", policy_effect="allow")
         except Exception as e:  # noqa: BLE001 - best-effort; the page still rendered
             log_for_debugging(f"[BROWSER] pdf capture failed: {e}")
 
+    async def clear_origin_data(self, origin: str) -> dict[str, Any]:
+        """Clear one origin's cookies + storage on the live context (issue #4). Browser must be up."""
+        from tabvis.browser.data_clearing import clear_origin_data
+
+        async with self._action_lock:
+            if self._context is None:
+                raise BrowserError("Browser is not running.")
+            return await clear_origin_data(self._context, origin)
+
     async def download(self, url: str, *, filename: str | None = None) -> dict[str, Any]:
-        """Fetch ``url`` through the browser context (so cookies/auth apply) into the workspace."""
+        """Fetch ``url`` through the browser context (so cookies/auth apply) into the workspace.
+
+        This is the *explicit* BrowserDownload path — the tool already cleared ``browser.download``
+        via ``check_permissions`` before we get here, so the file is agent-visible; it is recorded as
+        an ``explicit_download`` artifact."""
         from tabvis.browser.downloads import filename_from_url, get_workspace_dir, unique_path
 
         async with self._action_lock:
@@ -708,7 +807,9 @@ class BrowserService:
             dest = unique_path(get_workspace_dir(), filename or filename_from_url(url))
             with open(dest, "wb") as fh:
                 fh.write(body)
-            entry = self._record_download(dest, url, "download")
+            entry = self._record_download(
+                dest, url, "download", action="explicit_download", policy_effect="allow"
+            )
             return {"downloaded": entry, "workspace": get_workspace_dir()}
 
     def _on_page_close(self, page: Page) -> None:

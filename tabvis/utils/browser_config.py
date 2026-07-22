@@ -404,11 +404,25 @@ def get_browser_artifacts_max_dom_bytes() -> int:
     return DEFAULT_ARTIFACTS_MAX_DOM_BYTES
 
 
-def is_browser_artifacts_redact_input() -> bool:
-    """Redact typed text in interaction artifacts (default off).
+def is_browser_artifacts_include_input() -> bool:
+    """Whether to persist the *raw* typed text in interaction artifacts (default **off**).
 
-    The agent's keystrokes can include credentials typed into a login form. On => the artifact
-    stores only the length, not the text.
+    Redaction is the default posture: an interaction artifact records only ``text_len``, never the
+    keystrokes themselves — the agent's typing routinely includes passwords, tokens and card numbers
+    entered into a login/checkout form, and the artifacts log is a durable on-disk record. Set
+    ``TABVIS_BROWSER_ARTIFACTS_INCLUDE_INPUT=1`` to opt into saving the text (truncated). Even then,
+    content that *looks* secret (a card number, a long high-entropy token) is still redacted — that
+    stripping is unconditional and cannot be turned off (see ``artifacts._looks_sensitive``).
+    """
+    return is_env_truthy(os.environ.get("TABVIS_BROWSER_ARTIFACTS_INCLUDE_INPUT"))
+
+
+def is_browser_artifacts_redact_input() -> bool:
+    """Force redaction of typed text even when input inclusion is enabled (default off).
+
+    Redaction is already the default (see :func:`is_browser_artifacts_include_input`); this legacy
+    switch is a belt-and-suspenders *override* — ``TABVIS_BROWSER_ARTIFACTS_REDACT_INPUT=1`` forces
+    the redacted path regardless of ``TABVIS_BROWSER_ARTIFACTS_INCLUDE_INPUT``.
     """
     return is_env_truthy(os.environ.get("TABVIS_BROWSER_ARTIFACTS_REDACT_INPUT"))
 
