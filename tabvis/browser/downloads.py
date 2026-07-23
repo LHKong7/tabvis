@@ -34,6 +34,26 @@ def get_workspace_dir(*, create: bool = False) -> str:
     return path
 
 
+def get_quarantine_dir(*, create: bool = False) -> str:
+    """Absolute path to the download **quarantine** — where an *unexpected* download that policy did
+    not clear is held, out of the agent's reach (issue #3).
+
+    Sits beside the workspace but is deliberately NOT the workspace: the agent's Read tool targets
+    the workspace, so a quarantined file is recorded (as an artifact) and kept for a human to
+    inspect/approve/delete, without being handed to the model. Per-session, like the workspace.
+    """
+    override = (os.environ.get("TABVIS_WORKSPACE_DIR") or "").strip()
+    if override:
+        path = os.path.join(os.path.abspath(os.path.expanduser(override)), "_quarantine")
+    else:
+        from tabvis.browser.session import get_session_dir
+
+        path = os.path.join(get_session_dir(), "quarantine")
+    if create:
+        os.makedirs(path, exist_ok=True)
+    return path
+
+
 def _safe_name(name: str | None, fallback: str = "download") -> str:
     """basename-only, unsafe chars → '_', trimmed — can never contain a path separator."""
     raw = (name or "").replace("\\", "/")

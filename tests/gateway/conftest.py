@@ -13,6 +13,7 @@ import pytest
 from tabvis.gateway.events import store as event_store_mod
 from tabvis.gateway.events import subscriptions
 from tabvis.gateway.runtime import interaction_service as interaction_mod
+from tabvis.gateway.runtime import agents as agents_mod
 from tabvis.gateway.runtime import orchestrator as orchestrator_mod
 from tabvis.gateway.runtime import run_store as run_store_mod
 from tabvis.gateway.runtime.browser import runtime as browser_runtime_mod
@@ -31,6 +32,7 @@ def _reset() -> None:
     db.close()
     event_store_mod._store = None
     run_store_mod._run_store = None
+    agents_mod._agent_store = None
     interaction_mod._service = None
     interaction_mod.reset_signals()
     orchestrator_mod._orchestrator = None

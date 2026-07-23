@@ -65,18 +65,21 @@ def register(
 ) -> dict[str, str]:
     """Register a new agent and mint its credential. Returns ``{agent_id, session_id, credential}``.
 
-    The agent record is created here (empty prompt), so a later ``POST /agent`` presenting the
-    credential is picked up by the normal reuse path.
+    The durable gateway Agent is created here (design §7.2), so a later ``POST /agent`` presenting the
+    credential is picked up by the continuation path and the agent is listed/gettable before its first
+    Run. The legacy ``AgentRecord`` registry is retired from this path (Phase 6 convergence).
     """
-    from tabvis.agent.agents import registry
+    from tabvis.gateway.protocol import ids as gw_ids
+    from tabvis.gateway.runtime.agents import get_agent_store
 
     with _lock:
         _load()
-        agent_id = registry.new_agent_id()
+        agent_id = gw_ids.new_agent_id()
         session_id = str(uuid.uuid4())
-        registry.create(
-            agent_id=agent_id, session_id=session_id, prompt="", model=model, profile=profile, cwd=cwd
-        )
+        try:
+            get_agent_store().register(agent_id, principal_id=agent_id, model=model, profile=profile, cwd=cwd)
+        except Exception as e:  # noqa: BLE001 - the credential still works even if the durable write races
+            log_for_debugging(f"[CRED] durable agent register failed: {e}")
         token = "cred_" + secrets.token_urlsafe(24)
         _by_token[token] = agent_id
         _save()

@@ -61,13 +61,11 @@ import asyncio
 import contextlib
 import json
 import os
-import uuid
 from typing import Any
 
+from starlette.requests import Request
+
 from tabvis.ui.entry import config_api
-from tabvis.agent.agents import registry
-from tabvis.agent.agents.registry import AgentRecord
-from tabvis.utils.debug import log_for_debugging
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
@@ -199,115 +197,6 @@ def _count_tool_uses(message: dict[str, Any]) -> int:
     return sum(1 for b in content if isinstance(b, dict) and b.get("type") == "tool_use")
 
 
-async def _run_agent(record: AgentRecord, queue: asyncio.Queue[Any]) -> None:
-    """Drive one agent run, pushing SSE frames onto ``queue``. Runs as its own task.
-
-    Decoupling the run from the HTTP connection is what makes the lifecycle real: the registry
-    holds this task, so ``POST /agents/<id>/cancel`` can actually stop it, and the run survives a
-    client disconnect long enough to record a terminal state.
-    """
-    from tabvis.ui.cli.print import stream_agent
-    from tabvis.browser.manager import get_session_summary
-
-    result_text: str | None = None
-    is_error = False
-
-    # OBS-5: when the Event Bus is on, forward THIS run's semantic observations as `observation` SSE
-    # frames (filtered by agent_id). No-op with the flag off, so the default stream is unchanged.
-    unsubscribe = None
-    try:
-        from tabvis.browser.event_bus import get_event_bus, is_event_bus_enabled
-
-        if is_event_bus_enabled():
-            from tabvis.browser.observation import (
-                OBSERVATION_TYPES,
-                install_observation_pipeline,
-            )
-
-            install_observation_pipeline()
-
-            async def _observation_sink(event: Any) -> None:
-                if event.agent_id == record.agent_id and event.type in OBSERVATION_TYPES:
-                    await queue.put(_sse("observation", event.to_dict()))
-
-            unsubscribe = get_event_bus().subscribe(_observation_sink)
-    except Exception:  # noqa: BLE001 - the observation stream is best-effort
-        unsubscribe = None
-
-    try:
-        await registry.mark_running(record)
-        await queue.put(_sse("agent", record.to_dict()))  # so the client learns its agent_id
-
-        async for message in stream_agent(
-            record.prompt,
-            model=record.model,
-            max_turns=record.max_turns,
-            include_partial_messages=record.stream_partials,
-            agent_id=record.agent_id,
-            profile=record.profile,
-            session_id=record.session_id,
-            resume=record.resume,  # a reused agent replays its session's prior turns
-            teardown=False,  # close only this agent's browser; registry drains at shutdown
-        ):
-            mtype = message.get("type")
-            if mtype == "assistant":
-                record.turns += 1
-                record.tool_calls += _count_tool_uses(message)
-            elif mtype == "result":
-                result_text = message.get("result")
-                is_error = bool(message.get("is_error"))
-            record.browser = get_session_summary(record.agent_id)
-
-            for frame in _flatten(message):
-                await queue.put(frame)
-
-        await registry.mark_finished(
-            record,
-            status="failed" if is_error else "completed",
-            result=result_text,
-            error=result_text if is_error else None,
-            is_error=is_error,
-        )
-    except asyncio.CancelledError:
-        await registry.mark_finished(record, status="cancelled", error="cancelled by request")
-        await queue.put(_sse("cancelled", {"agent_id": record.agent_id}))
-        raise
-    except Exception as e:  # noqa: BLE001 - surface to the client, don't 500 mid-stream
-        log_for_debugging(f"[SERVER] agent {record.agent_id} failed: {e}")
-        await registry.mark_finished(
-            record, status="failed", error=f"{type(e).__name__}: {e}", is_error=True
-        )
-        await queue.put(_sse("error", {"message": f"{type(e).__name__}: {e}"}))
-    finally:
-        if unsubscribe is not None:
-            unsubscribe()  # OBS-5: stop forwarding observations for this finished run
-        await queue.put(_sse("done", {"agent_id": record.agent_id, "status": record.status}))
-        await queue.put(None)  # sentinel: closes the SSE stream
-
-
-async def _agent_events(record: AgentRecord) -> Any:
-    """Drain the run's queue into SSE frames.
-
-    The run lives in its own task (see :func:`_run_agent`), so a client disconnect here does not
-    kill it — the agent finishes and records a terminal state either way. Nothing is ever yielded
-    from a ``finally``: during teardown that raises "async generator ignored GeneratorExit" and
-    aborts the unwind.
-    """
-    queue: asyncio.Queue[Any] = asyncio.Queue()
-    task = asyncio.ensure_future(_run_agent(record, queue))
-    registry.bind_task(record.agent_id, task)
-    try:
-        while True:
-            frame = await queue.get()
-            if frame is None:
-                return
-            yield frame
-    finally:
-        # Client hung up (or the stream closed). The run itself keeps going — that is deliberate:
-        # cancel it explicitly via POST /agents/<id>/cancel if you want it stopped.
-        pass
-
-
 def config_readiness() -> dict[str, Any]:
     """Can this server actually run an agent? Booleans only — never echo the credential.
 
@@ -406,14 +295,27 @@ def _gateway_enabled() -> bool:
     return val.strip().lower() not in ("0", "false", "no", "off", "")
 
 
-def _gateway_agents_enabled() -> bool:
-    """Whether the legacy ``/agents`` surface is served by the gateway (retiring the registry).
+def _gateway_of(request: Request):
+    """The durable Agent/Run gateway that backs the ``/agents`` surface (design §7, Phase 6 convergence).
 
-    ``TABVIS_GATEWAY_AGENTS`` (default OFF). When on (and the gateway is mounted), the agent lifecycle
-    endpoints are backed by gateway Run data instead of the ``AgentRecord`` registry (design §9.8).
+    The legacy ``AgentRecord`` registry has been retired from the public control path: the gateway's
+    durable Agent + Run stores are authoritative for the agent lifecycle.
     """
-    val = os.environ.get("TABVIS_GATEWAY_AGENTS")
-    return bool(val) and val.strip().lower() not in ("0", "false", "no", "off", "")
+    return getattr(request.app.state, "gateway", None)
+
+
+def _durable_agent_exists(request: Request, agent_id: str) -> bool:
+    gateway = _gateway_of(request)
+    if gateway is None:
+        return False
+    return gateway.agents.get(agent_id) is not None or gateway.runs.latest_run_for_agent(agent_id) is not None
+
+
+def _durable_agent_session(request: Request, agent_id: str) -> str | None:
+    """The agent's latest Run's session id — the key for its browsing artifacts."""
+    gateway = _gateway_of(request)
+    run = gateway.runs.latest_run_for_agent(agent_id) if gateway is not None else None
+    return run.session_id if run is not None else None
 
 
 def create_app(auth_required: bool = False, dev: bool = False) -> Any:
@@ -430,16 +332,14 @@ def create_app(auth_required: bool = False, dev: bool = False) -> Any:
     """
     from sse_starlette.sse import EventSourceResponse
     from starlette.applications import Starlette
-    from starlette.requests import Request
     from starlette.responses import JSONResponse
     from starlette.routing import Route, WebSocketRoute
 
     from tabvis.browser.server_auth import SecurityMiddleware, resolve_principal
-    from tabvis.policy.runtime_adapter import authorize_agent, filter_visible_agents
+    from tabvis.policy.runtime_adapter import authorize_agent
     from tabvis.browser.manager import (
         close_browser,
         get_profile_holder,
-        get_workspace_owner,
         list_workspaces,
         resolve_profile_dir,
     )
@@ -482,27 +382,24 @@ def create_app(auth_required: bool = False, dev: bool = False) -> Any:
         )
 
     async def health(_request: Request) -> JSONResponse:
-        running = registry.running_count()
+        # Counts come from the gateway's durable Run/Agent stores (design §7 Phase 6 convergence).
+        from tabvis.gateway.runtime import runs as _gw_runs
+        from tabvis.gateway.store import db as _gw_db
+
+        gateway = _gateway_of(_request)
+        running = _gw_db.count_active_runs(tuple(sorted(_gw_runs.ACTIVE))) if gateway is not None else 0
+        agent_count = len(gateway.agents.list()) if gateway is not None else 0
         return JSONResponse(
             {
                 "status": "ok",
                 "running": running,
                 "max_agents": max_concurrent_agents(),
                 "capacity": max(0, max_concurrent_agents() - running),
-                "agents": len(registry.list_agents()),
+                "agents": agent_count,
                 "browsers": len(list_workspaces()),   # persistent workspaces still open
                 "config": config_readiness(),
             }
         )
-
-    def _fresh(record: AgentRecord) -> dict[str, Any]:
-        """Record + a live browser view (the stored copy only refreshes on each message)."""
-        from tabvis.browser.manager import get_session_summary
-
-        data = record.to_dict()
-        if not record.is_terminal:
-            data["browser"] = get_session_summary(record.agent_id) or data.get("browser") or {}
-        return data
 
     async def get_config(request: Request) -> JSONResponse:
         """Current settings. Secrets report set/not-set + a mask — never the value."""
@@ -623,46 +520,8 @@ def create_app(auth_required: bool = False, dev: bool = False) -> Any:
         closed = await close_browser(user_data_dir)
         return JSONResponse({"closed": closed, "profile": profile or "isolated"})
 
-    async def list_agents(request: Request) -> JSONResponse:
-        status = request.query_params.get("status")
-        limit_raw = request.query_params.get("limit")
-        try:
-            limit = int(limit_raw) if limit_raw else None
-        except ValueError:
-            limit = None
-        principal = _principal(request)
-        if principal is None:
-            return JSONResponse({"error": "authentication required"}, status_code=401)
-        records = registry.list_agents(status=status, limit=limit)
-        # Enforce visibility by ownership, not by a query filter — a caller sees only its own runs.
-        visible = set(filter_visible_agents(principal, [r.agent_id for r in records]))
-        records = [r for r in records if r.agent_id in visible]
-        return JSONResponse({"agents": [_fresh(r) for r in records], "count": len(records)})
-
-    async def get_agent(request: Request) -> JSONResponse:
-        denied = _guard_agent(request, "runtime.read", request.path_params["agent_id"])
-        if denied is not None:
-            return denied
-        record = registry.get(request.path_params["agent_id"])
-        if record is None:
-            return JSONResponse({"error": "unknown agent_id"}, status_code=404)
-        return JSONResponse(_fresh(record))
-
-    async def cancel_agent(request: Request) -> JSONResponse:
-        agent_id = request.path_params["agent_id"]
-        denied = _guard_agent(request, "runtime.cancel", agent_id)
-        if denied is not None:
-            return denied
-        record = registry.get(agent_id)
-        if record is None:
-            return JSONResponse({"error": "unknown agent_id"}, status_code=404)
-        if record.is_terminal:
-            return JSONResponse(
-                {"error": f"agent is already {record.status}", "status": record.status},
-                status_code=409,
-            )
-        await registry.cancel(agent_id)
-        return JSONResponse({"agent_id": agent_id, "status": record.status})
+    # list_agents / get_agent / cancel_agent are served by the gateway (design §7 Phase 6); the
+    # registry-backed handlers were retired. See gateway_agent_handlers() below.
 
     async def quit_agent(request: Request) -> JSONResponse:
         """Quit an agent and close its bundled browser — the 'user quit them' action.
@@ -670,15 +529,27 @@ def create_app(auth_required: bool = False, dev: bool = False) -> Any:
         Unlike cancel this also works on a *finished* agent that is still holding its browser open
         (the bundle outlives the run): it closes the browser and frees the profile for a new agent.
         """
+        from tabvis.browser.manager import quit_agent_browser
+        from tabvis.gateway.protocol.compatibility import legacy_status
+
         agent_id = request.path_params["agent_id"]
         denied = _guard_agent(request, "runtime.manage", agent_id)
         if denied is not None:
             return denied
-        record = registry.get(agent_id)
-        if record is None:
+        if not _durable_agent_exists(request, agent_id):
             return JSONResponse({"error": "unknown agent_id"}, status_code=404)
-        await registry.quit(agent_id)
-        return JSONResponse({"agent_id": agent_id, "status": record.status, "quit": True})
+        # Cancel the active Run (if any) and close the bundled browser — the "user quit" action.
+        gateway = _gateway_of(request)
+        run = gateway.runs.latest_run_for_agent(agent_id) if gateway is not None else None
+        status = legacy_status(run.status) if run is not None else "cancelled"
+        if run is not None and not run.is_terminal:
+            try:
+                await gateway.orchestrator.cancel(run.run_id)
+                status = "cancelled"
+            except Exception:  # noqa: BLE001 - quit still closes the browser even if cancel races
+                pass
+        await quit_agent_browser(agent_id)
+        return JSONResponse({"agent_id": agent_id, "status": status, "quit": True})
 
     async def agent_artifacts(request: Request) -> JSONResponse:
         """The agent's browsing trail: navigation / page / interaction / DOM artifacts.
@@ -696,18 +567,18 @@ def create_app(auth_required: bool = False, dev: bool = False) -> Any:
         denied = _guard_agent(request, "runtime.read", agent_id)
         if denied is not None:
             return denied
-        record = registry.get(agent_id)
-        if record is None:
+        if not _durable_agent_exists(request, agent_id):
             return JSONResponse({"error": "unknown agent_id"}, status_code=404)
+        session_id = _durable_agent_session(request, agent_id) or ""
 
         dom_ref = request.query_params.get("dom")
         if dom_ref:
-            html = read_dom(dom_ref, record.session_id)
+            html = read_dom(dom_ref, session_id)
             if html is None:
                 return JSONResponse({"error": "unknown dom_ref"}, status_code=404)
             return JSONResponse({"dom_ref": dom_ref, "html": html})
 
-        events = load_artifacts(record.session_id)
+        events = load_artifacts(session_id)
         limit_raw = request.query_params.get("limit")
         if limit_raw:
             try:
@@ -717,7 +588,7 @@ def create_app(auth_required: bool = False, dev: bool = False) -> Any:
         return JSONResponse(
             {
                 "agent_id": agent_id,
-                "summary": artifacts_summary(record.session_id),
+                "summary": artifacts_summary(session_id),
                 "artifacts": events,
                 "count": len(events),
             }
@@ -731,7 +602,7 @@ def create_app(auth_required: bool = False, dev: bool = False) -> Any:
         denied = _guard_agent(request, "runtime.read", agent_id)
         if denied is not None:
             return denied
-        if registry.get(agent_id) is None:
+        if not _durable_agent_exists(request, agent_id):
             return JSONResponse({"error": "unknown agent_id"}, status_code=404)
         record = get_session_record(agent_id)
         return JSONResponse(record.to_dict() if record is not None else {})
@@ -790,6 +661,7 @@ def create_app(auth_required: bool = False, dev: bool = False) -> Any:
             payload = await request.json()
         except Exception:  # noqa: BLE001
             payload = {}
+        # credentials.register creates the durable gateway Agent (design §7.2) + mints the credential.
         result = credentials.register(
             cwd=payload.get("cwd") or os.getcwd(),
             model=payload.get("model"),
@@ -900,111 +772,9 @@ def create_app(auth_required: bool = False, dev: bool = False) -> Any:
             with contextlib.suppress(Exception):
                 await websocket.close()
 
-    async def run_agent(request: Request) -> Any:
-        try:
-            payload = await request.json()
-        except Exception:  # noqa: BLE001
-            return JSONResponse({"error": "body must be JSON"}, status_code=400)
-        if not (payload.get("prompt") or "").strip():
-            return JSONResponse({"error": "'prompt' is required"}, status_code=400)
-
-        # RT-3: a registration credential (X-Tabvis-Agent-Credential) supplies the agent_id from an
-        # authenticated Agent Context — a body agent_id may not override it. Without a credential the
-        # server behaves exactly as before. A registered agent already exists, so the reuse path picks
-        # it up.
-        from tabvis.agent.agents import credentials
-
-        cred_agent = credentials.agent_id_from_request_headers(request.headers)
-        if cred_agent:
-            body_agent = (payload.get("agent_id") or "").strip()
-            if body_agent and body_agent != cred_agent:
-                return JSONResponse(
-                    {"error": "agent_id in the body does not match the presented credential"},
-                    status_code=403,
-                )
-            payload = {**payload, "agent_id": cred_agent}
-
-        def _at_capacity() -> JSONResponse | None:
-            # Each running agent owns a real Chromium — cap how many run at once.
-            if registry.running_count() >= max_concurrent_agents():
-                return JSONResponse(
-                    {
-                        "error": "at capacity — too many agents running",
-                        "running": registry.running_count(),
-                        "max_agents": max_concurrent_agents(),
-                    },
-                    status_code=429,
-                )
-            return None
-
-        # --- REUSE an existing agent -------------------------------------------------------
-        # An agent is a durable, reusable entity: pass its `agent_id` to run another prompt on the
-        # SAME agent — same session (transcript continues) and same bundled browser/profile. Its id
-        # and session persist across process restarts (records are loaded from disk on demand).
-        requested_id = (payload.get("agent_id") or "").strip()
-        if requested_id:
-            existing = registry.get(requested_id)
-            if existing is None:
-                return JSONResponse(
-                    {"error": f"unknown agent_id {requested_id!r}; omit it to create a new agent"},
-                    status_code=404,
-                )
-            if existing.status == "running":
-                return JSONResponse(
-                    {"error": f"agent {requested_id!r} is already running", "status": "running"},
-                    status_code=409,
-                )
-            cap = _at_capacity()
-            if cap is not None:
-                return cap
-            # Its profile is its own bundle, so no profile-conflict check — reuse keeps it.
-            record = registry.reuse(
-                requested_id,
-                prompt=payload["prompt"],
-                model=payload.get("model"),
-                max_turns=payload.get("max_turns"),
-                stream_partials=bool(payload.get("stream", False)),
-            )
-            return EventSourceResponse(
-                _agent_events(record), headers={"X-Agent-Id": record.agent_id}
-            )
-
-        # --- CREATE a new agent ------------------------------------------------------------
-        cap = _at_capacity()
-        if cap is not None:
-            return cap
-
-        # An agent BUNDLES a browser profile for its whole life, so a profile is off-limits while
-        # any agent owns it — not just while a run is mid-flight. Two agents can run in parallel iff
-        # they own different Chromium profile dirs (Chromium locks a profile to one process). An
-        # isolated (omitted) profile is per-agent, so it never collides.
-        profile = payload.get("profile")
-        agent_id = registry.new_agent_id()
-        owner = get_workspace_owner(resolve_profile_dir(agent_id, profile))
-        if owner is not None:
-            return JSONResponse(
-                {
-                    "error": f"browser profile {profile or 'default'!r} is bundled to agent "
-                    f"{owner!r} for its whole life. Use a different profile, omit it for an "
-                    f"isolated one, or quit that agent (POST /agents/{owner}/quit).",
-                    "held_by": owner,
-                },
-                status_code=409,
-            )
-
-        record = registry.create(
-            agent_id=agent_id,  # the id we reserved for the profile-conflict check above
-            session_id=str(uuid.uuid4()),  # minted here so it's on the record before the run
-            prompt=payload["prompt"],
-            model=payload.get("model"),
-            max_turns=payload.get("max_turns"),
-            profile=profile,
-            cwd=os.getcwd(),
-            stream_partials=bool(payload.get("stream", False)),
-        )
-        return EventSourceResponse(
-            _agent_events(record), headers={"X-Agent-Id": record.agent_id}
-        )
+    # run_agent (POST /agent, /agents) is served by the gateway's run_agent_gw (design §7 Phase 6):
+    # it creates a durable gateway Run executed by the AgentRunLauncher and streams legacy SSE frames.
+    # The registry-backed create/reuse driver was retired. See gateway_agent_handlers() below.
 
     # --dev: the Vite dev server subprocess, started/stopped by the lifespan below.
     _dev_server = None
@@ -1018,12 +788,20 @@ def create_app(auth_required: bool = False, dev: bool = False) -> Any:
         try:
             if _dev_server is not None:
                 await _dev_server.start()  # fail loud if npm/web deps are missing
+            _gw = getattr(_app.state, "gateway", None)
+            if _gw is not None and getattr(_gw, "channels", None) is not None:
+                await _gw.channels.start()  # subscribe outbound delivery + start client-loop read loops
             yield
         finally:
+            gw = getattr(_app.state, "gateway", None)
+            if gw is not None and getattr(gw, "channels", None) is not None:
+                try:
+                    await gw.channels.stop()
+                except Exception:  # noqa: BLE001 - best-effort
+                    pass
             if _dev_server is not None:
                 await _dev_server.stop()
             # Drain the gateway (stop accepting, close its store) before the browser cleanup.
-            gw = getattr(_app.state, "gateway", None)
             if gw is not None:
                 try:
                     gw.drain()
@@ -1038,17 +816,15 @@ def create_app(auth_required: bool = False, dev: bool = False) -> Any:
             except Exception:  # noqa: BLE001 - best-effort
                 pass
 
-    # Registry-retirement cutover (design §9.8): when TABVIS_GATEWAY_AGENTS is on and the gateway is
-    # mounted, the agent lifecycle endpoints are served by gateway Run data instead of the AgentRecord
-    # registry. Default off, so the registry-backed path above is unchanged.
-    if _gateway_enabled() and _gateway_agents_enabled():
-        from tabvis.gateway.access.legacy_agents import gateway_agent_handlers
+    # Registry retirement (design §7, Phase 6): the /agents lifecycle is ALWAYS served by the gateway's
+    # durable Agent/Run stores. The AgentRecord registry is off the public control path.
+    from tabvis.gateway.access.legacy_agents import gateway_agent_handlers
 
-        _gw_agent = gateway_agent_handlers()
-        run_agent = _gw_agent["run_agent"]
-        list_agents = _gw_agent["list_agents"]
-        get_agent = _gw_agent["get_agent"]
-        cancel_agent = _gw_agent["cancel_agent"]
+    _gw_agent = gateway_agent_handlers()
+    run_agent = _gw_agent["run_agent"]
+    list_agents = _gw_agent["list_agents"]
+    get_agent = _gw_agent["get_agent"]
+    cancel_agent = _gw_agent["cancel_agent"]
 
     # RT-1: one declarative table of API routes, each mounted at BOTH its legacy path and a ``/v1``
     # alias (same handler, byte-identical response), so the versioned Runtime API surface can grow
@@ -1104,23 +880,32 @@ def create_app(auth_required: bool = False, dev: bool = False) -> Any:
     # gateway health lives at /v1/gateway/health so the legacy /v1/health is untouched, and the SSE
     # GET /v1/events coexists with the legacy WebSocket at the same path (different scope types). Set
     # TABVIS_GATEWAY=0 to disable.
-    gateway_app = None
-    if _gateway_enabled():
-        from tabvis.gateway.access.http import gateway_routes
-        from tabvis.gateway.lifecycle import GatewayApplication
-        from tabvis.gateway.runtime.agent import AgentRunLauncher
-        from tabvis.gateway.runtime.context.sources import SourceCollector
+    # The gateway's durable Agent/Run stores back the /agents surface (design §7 Phase 6), so the
+    # gateway is ALWAYS built. TABVIS_GATEWAY only gates the additional /v1 control-plane routes
+    # (/v1/runs, /v1/events SSE, interactions, conversations).
+    from tabvis.gateway.access.http import gateway_routes
+    from tabvis.gateway.lifecycle import GatewayApplication
+    from tabvis.gateway.runtime.agent import AgentRunLauncher
+    from tabvis.gateway.runtime.context.sources import SourceCollector
 
-        # The launcher assembles a Context Pack from live sources and injects its situational sections
-        # into the model's system prompt (design §11 → model call path), observable via context.pack.built.
-        gateway_app = GatewayApplication.build(
-            host="0.0.0.0" if auth_required else "127.0.0.1",
-            launcher=AgentRunLauncher(context_collector=SourceCollector()),
-        )
-        gateway_app.startup()
-        # include_compat=False: the legacy server still owns /v1/agents with its registry-backed
-        # handlers; the gateway's projection of that surface (design §9.8) is served by the standalone
-        # gateway app until a deliberate cutover.
+    # The launcher assembles a Context Pack from live sources and injects its situational sections
+    # into the model's system prompt (design §11 → model call path), observable via context.pack.built.
+    gateway_app = GatewayApplication.build(
+        host="0.0.0.0" if auth_required else "127.0.0.1",
+        launcher=AgentRunLauncher(context_collector=SourceCollector()),
+    )
+    gateway_app.startup()
+    # Mount the IM channel plugins (design §4 Phase 4) when TABVIS_CHANNELS is set: inbound webhooks
+    # (POST /v1/channels/{plugin}/webhook) start Runs, and a finished Run's result is delivered back
+    # to its originating channel. The read loops + outbound subscriber start in the lifespan below.
+    try:
+        from tabvis.gateway.runtime.channels import ChannelRuntime
+
+        gateway_app.channels = ChannelRuntime.from_env()
+    except Exception:  # noqa: BLE001 - a channel-config problem must never stop the server
+        gateway_app.channels = None
+    if _gateway_enabled():
+        # /agents is now gateway-backed; the standalone /v1 command surface is the additional plane.
         routes.extend(gateway_routes(health_path="/v1/gateway/health", include_compat=False))
 
     if dev:

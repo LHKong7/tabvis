@@ -38,6 +38,7 @@ from tabvis.browser.manager import (
     DEFAULT_PROFILE,
     bind_agent,
     detach_agent,
+    get_browser_service,
     init_browser_session,
     start_browser_warmup,
     unbind_agent,
@@ -177,6 +178,25 @@ def _skill_listing_reminder(commands: list[Any]) -> str | None:
     )
 
 
+def _prepend_context_block(message: dict[str, Any], text: str) -> None:
+    """Insert ``text`` as a leading content block in a user message envelope (Resume Plus §11.4).
+
+    Keeps the memory context inside the current user turn — before the prompt, one valid user turn,
+    never the system prompt — so the model reads it as low-privilege reference data.
+    """
+    inner = message.get("message")
+    if not isinstance(inner, dict):
+        return
+    block = {"type": "text", "text": text}
+    content = inner.get("content")
+    if isinstance(content, str):
+        inner["content"] = [block, {"type": "text", "text": content}]
+    elif isinstance(content, list):
+        inner["content"] = [block, *content]
+    else:
+        inner["content"] = [block]
+
+
 async def run_headless(
     prompt: str,
     *,
@@ -186,13 +206,52 @@ async def run_headless(
     tools: Any | None = None,
     deps: QueryDeps | None = None,
     max_turns: int | None = None,
+    resume_target: Any | None = None,
 ) -> dict[str, Any] | None:
     """Run a single headless turn and write the result to stdout. Returns the result message.
 
     Thin consumer of :func:`stream_agent` — the session machinery (browser warm-up, session
     record, cleanup drain) lives there so the SSE server (``tabvis.browser.server``) can reuse
     the exact same path.
+
+    ``resume_target`` (a ``tabvis.agent.resume_plus.ResumeTarget``) continues an existing session:
+    its resolved ``session_id`` / ``project_dir`` / ``run_id`` are threaded into ``stream_agent`` and
+    the prior conversation is replayed. A one-shot CLI is never resident, so the resolver already
+    reports a cold ``relaunched_profile`` recovery — this path never claims a live browser.
     """
+    rt = resume_target
+    if rt is not None:
+        # Announce, on stderr, what was actually restored (§5.2) — separate from the stdout result.
+        from tabvis.agent.resume_plus import ResumeResult
+
+        result = ResumeResult(
+            resume_mode=rt.mode, agent_id=rt.agent_id, session_id=rt.session_id,
+            run_id=rt.run_id, browser_recovery=rt.browser_recovery,
+            warnings=list(rt.warnings),
+        )
+        print(
+            f"tabvis: resuming session {rt.session_id} (mode={rt.mode}, "
+            f"browser={rt.browser_recovery}, run={rt.run_id}).",
+            file=sys.stderr,
+        )
+        for w in result.warnings:
+            print(f"tabvis: warning: {w}", file=sys.stderr)
+
+    # Resume Plus §11: for a `plus` resume that reads memory, assemble the Agent Memory context block
+    # and inject it as low-privilege context (see stream_agent). Best-effort — never blocks a run.
+    context_preamble = None
+    if rt is not None and rt.mode == "plus" and getattr(rt, "read_memory", False):
+        try:
+            from tabvis.agent.mem.provider import build_memory_context
+
+            ctx = build_memory_context(
+                rt.principal_id, rt.agent_id, rt.session_id, prompt,
+                live_snapshot={"recovery_mode": rt.browser_recovery},
+            )
+            context_preamble = ctx.to_preamble()
+        except Exception as e:  # noqa: BLE001 - memory context is additive, never fatal
+            print(f"tabvis: warning: could not load agent memory: {e}", file=sys.stderr)
+
     last_result: dict[str, Any] | None = None
     async for message in stream_agent(
         prompt,
@@ -203,6 +262,15 @@ async def run_headless(
         max_turns=max_turns,
         include_partial_messages=(output_format == "stream-json"),
         teardown=True,
+        session_id=(rt.session_id if rt is not None else None),
+        resume=(rt is not None and rt.mode != "fresh"),
+        profile=(rt.profile if rt is not None else DEFAULT_PROFILE),
+        project_dir=(rt.project_dir if rt is not None else None),
+        run_id=(rt.run_id if rt is not None else None),
+        resume_mode=(rt.mode if rt is not None else "fresh"),
+        principal_id=(rt.principal_id if rt is not None else "principal_local"),
+        context_preamble=context_preamble,
+        write_memory=(rt.write_memory if rt is not None else True),
     ):
         if output_format == "stream-json":
             _write_ndjson(message)
@@ -234,6 +302,13 @@ async def stream_agent(
     resume: bool = False,
     extra_system_context: str | None = None,
     owns_system_context: bool = False,
+    project_dir: str | None = None,
+    run_id: str | None = None,
+    resume_mode: str = "fresh",
+    principal_id: str = "principal_local",
+    skip_browser_init: bool = False,
+    context_preamble: str | None = None,
+    write_memory: bool = True,
 ) -> Any:
     """Run one agent session, yielding each SDKMessage as it is produced.
 
@@ -267,12 +342,37 @@ async def stream_agent(
     # Callers that need to know the session id up-front (the server, so it can put it on the agent
     # record before the run starts) pass it in; everyone else gets a fresh one.
     session_id = session_id or str(uuid.uuid4())
+    if not run_id:
+        from tabvis.agent.agents.registry import new_run_id
+
+        run_id = new_run_id()  # every run is separately identifiable, incl. a fresh CLI run
+    # Terminal status for post-run consolidation; overwritten when the result frame arrives. Defaults
+    # to "interrupted" so a cancel/crash before the result still records a truthful digest (§10.4).
+    run_status = "interrupted"
     # Register the session id in bootstrap state so the persistence layer agrees with the id we
     # advertise to the SDK stream. record_transcript / get_transcript_path both derive the on-disk
     # file name and the stamped "sessionId" from get_session_id() — NOT from this local variable —
     # so without switch_session() the transcript would land under the bootstrap-default uuid and
-    # resume-by-id could not find it.
-    switch_session(as_session_id(session_id))
+    # resume-by-id could not find it. On a Resume Plus the resolver supplies ``project_dir`` (the
+    # ORIGINAL session's project directory, possibly under a different cwd), so the transcript is read
+    # and written where it actually lives rather than re-derived from the current cwd.
+    switch_session(as_session_id(session_id), project_dir=project_dir)
+
+    # Bind the immutable per-Run locator (Resume Plus §4.1) for this task. Additive: writers that
+    # still read process-global session state are unaffected; this is the seam they migrate onto.
+    from tabvis.agent.run_context import RunContext, set_run_context
+
+    set_run_context(
+        RunContext(
+            principal_id=principal_id,
+            agent_id=agent_id,
+            session_id=session_id,
+            run_id=run_id or "",
+            cwd=get_cwd(),
+            project_dir=project_dir,
+            resume_mode=resume_mode,
+        )
+    )
 
     # --- Bundle the browser to the agent, at spawn ----------------------------------------
     # init_browser_session RESERVES the workspace for this agent now (it owns it for its whole life),
@@ -282,14 +382,21 @@ async def stream_agent(
     # `get_or_create_browser_service` memoizes the in-flight launch, so a tool call awaits this very
     # task — there is never a double launch. TABVIS_BROWSER_EAGER=0 opts out of the eager launch (the
     # reservation still holds; the browser then launches lazily on the first browser tool call).
-    init_browser_session(
-        session_id=session_id,
-        model=model,
-        cwd=get_cwd(),
-        agent_id=agent_id,
-        profile=profile,
-    )
-    warmup_task = start_browser_warmup()
+    #
+    # ``skip_browser_init`` (Resume Plus item 2): when the caller already acquired the browser binding
+    # — the Gateway's BrowserRuntime reserves the workspace and owns the lease — this path must NOT
+    # reserve/launch/detach a second time. Exactly one runtime owns browser init and release; here we
+    # only bind the agent ContextVar (done above) so the loop's tools target the right workspace.
+    warmup_task = None
+    if not skip_browser_init:
+        init_browser_session(
+            session_id=session_id,
+            model=model,
+            cwd=get_cwd(),
+            agent_id=agent_id,
+            profile=profile,
+        )
+        warmup_task = start_browser_warmup()
 
     # NOTE: `mcp_clients` / `mcp_resources` are bound BEFORE the try so the finally can always
     # reach them, and the try now opens here (not just before the model call) so that a failure
@@ -346,17 +453,25 @@ async def stream_agent(
         # above produced (a slash/skill expansion) or the plain prompt — `ask` won't add the prompt
         # itself once `seed_messages` is set, so we include it. Prior envelopes keep their uuids, so
         # record_transcript dedups them and nothing is duplicated on disk.
+        prior: list[Any] = []
         if resume and should_query:
             from tabvis.utils.session_storage import load_conversation_for_resume
 
             prior = await load_conversation_for_resume(session_id)
-            if prior:
-                new_turn = (
-                    seed_messages
-                    if seed_messages is not None
-                    else [create_user_message(content=prompt)]
-                )
-                seed_messages = [*prior, *new_turn]
+
+        # Resume Plus §11.4: inject Agent Memory as LOW-PRIVILEGE contextual data — a leading text
+        # block in the CURRENT user turn, before the prompt, so the model sees it as reference data
+        # below the user's current instruction. It goes into the conversation, NOT the system prompt
+        # (that would promote it to an instruction). It is distinct from the raw transcript replay
+        # above, so nothing is duplicated.
+        if should_query and (prior or context_preamble):
+            new_turn = (
+                seed_messages if seed_messages is not None
+                else [create_user_message(content=prompt)]
+            )
+            if context_preamble and new_turn:
+                _prepend_context_block(new_turn[-1], context_preamble)
+            seed_messages = [*prior, *new_turn]
 
         # A caller (the gateway's Context Runtime) may own project-context assembly: it supplies a
         # pre-assembled block (``extra_system_context``, deterministic and observable via
@@ -389,6 +504,8 @@ async def stream_agent(
             should_query=should_query,
             result_text=result_text,
         ):
+            if message.get("type") == "result":
+                run_status = "failed" if message.get("is_error") else "completed"
             yield message
     finally:
         # Flush the batched transcript write queue to disk before the loop/process exits. The
@@ -399,6 +516,33 @@ async def stream_agent(
 
             await flush_session_storage()
         except Exception:  # noqa: BLE001 - flushing is best-effort
+            pass
+
+        # Resume Plus glue (§7.2/§10.4): after the transcript is on disk, consolidate this Run's
+        # evidence into Agent Memory. Doubly gated (write_memory + TABVIS_BROWSER_MEMORY + per-agent
+        # consent) and fully best-effort — a consolidation failure never affects the Run. One point
+        # here covers the CLI, the legacy server, and the Gateway (all drive stream_agent).
+        try:
+            from tabvis.agent.mem.extractor import is_browser_memory_enabled
+
+            if write_memory and is_browser_memory_enabled():
+                from tabvis.agent.mem.integration import consolidate_after_run
+
+                live_tabs: list[Any] = []
+                try:
+                    svc = get_browser_service(agent_id)
+                    if svc is not None and svc.is_alive():
+                        live_tabs = svc.tabs()
+                except Exception:  # noqa: BLE001 - a tab read is best-effort
+                    live_tabs = []
+                await asyncio.wait_for(
+                    consolidate_after_run(
+                        principal_id=principal_id, agent_id=agent_id, session_id=session_id,
+                        run_id=run_id, status=run_status, tabs=live_tabs, write_memory=write_memory,
+                    ),
+                    timeout=30.0,
+                )
+        except Exception:  # noqa: BLE001 - consolidation never breaks a run
             pass
 
         # Settle the browser warm-up BEFORE draining cleanups. The browser only registers its
@@ -421,12 +565,15 @@ async def stream_agent(
                 await asyncio.wait_for(run_cleanup_functions(), timeout=10.0)
             except Exception:  # noqa: BLE001 - best-effort; gather() does not swallow
                 pass
-        else:
+        elif not skip_browser_init:
             # Server path: the run is over, but the BUNDLED BROWSER STAYS OPEN and still owned by
             # this agent. It is the agent's environment, not a per-run resource — the window keeps
             # its tabs and its logins for the agent's next run. detach_agent only drops the
             # *actively-driving* claim; the bundle is not idle-reaped and lives until the user quits
             # the agent (POST /agents/<id>/quit) or the process exits (cleanup registry).
+            #
+            # Skipped when ``skip_browser_init``: the caller (the Gateway BrowserRuntime) acquired the
+            # binding, so it — not this loop — releases the Run's driving claim (§7.2 terminal barrier).
             try:
                 await asyncio.wait_for(detach_agent(agent_id), timeout=10.0)
             except Exception:  # noqa: BLE001 - best-effort

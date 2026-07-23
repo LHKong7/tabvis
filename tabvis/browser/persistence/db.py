@@ -271,6 +271,15 @@ def get_identity_by_agent(agent_id: str) -> dict[str, Any] | None:
     return _run(op)
 
 
+def delete_identity(agent_id: str) -> None:
+    """Remove an identity's row from the mirror (part of the delete-identity cascade)."""
+    def op(conn: sqlite3.Connection) -> None:
+        conn.execute("DELETE FROM browser_identities WHERE agent_id = ?", (agent_id,))
+        conn.commit()
+
+    _run(op)
+
+
 # --------------------------------------------------------------------------- workspaces
 
 

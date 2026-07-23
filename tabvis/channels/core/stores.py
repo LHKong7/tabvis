@@ -66,3 +66,8 @@ class BindingStore:
     def get(self, channel_account_id: str, external_conversation_id: str) -> ConversationBinding | None:
         data = db.get_binding(channel_account_id, external_conversation_id)
         return ConversationBinding.from_dict(data) if data else None
+
+    def get_by_conversation(self, conversation_id: str) -> ConversationBinding | None:
+        """Reverse lookup used by outbound delivery to recover a channel's external thread id."""
+        data = db.get_binding_by_conversation(conversation_id)
+        return ConversationBinding.from_dict(data) if data else None

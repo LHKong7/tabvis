@@ -10,7 +10,7 @@ Phase 3 control-plane slice needs: open the store, register handlers, report rea
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Any, Literal
 
 from tabvis.gateway.events.store import EventStore, get_event_store
 from tabvis.gateway.methods.conversations import ConversationCreateHandler
@@ -18,6 +18,7 @@ from tabvis.gateway.methods.interactions import InteractionRespondHandler
 from tabvis.gateway.methods.router import CommandRouter
 from tabvis.gateway.methods.runs import RunCancelHandler, RunCreateHandler
 from tabvis.gateway.runtime import runs
+from tabvis.gateway.runtime.agents import AgentStore
 from tabvis.gateway.runtime.interaction_service import InteractionService, get_interaction_service
 from tabvis.gateway.runtime.orchestrator import RunLauncher, RunOrchestrator
 from tabvis.gateway.runtime.run_store import RunStore, get_run_store
@@ -44,12 +45,16 @@ class GatewayApplication:
     ) -> None:
         self.events = event_store
         self.runs = run_store
+        # The durable Agent aggregate (design §7.2), sharing the same event log as runs.
+        self.agents = AgentStore(event_store)
         self.interactions = interaction_service
         self.orchestrator = orchestrator
         self.router = router
         self.host = host
         self.max_runs = max_runs
         self.status: GatewayStatus = "starting"
+        # Optional IM channel runtime, attached by the server when TABVIS_CHANNELS is set (design §4).
+        self.channels: Any = None
 
     # --- construction ---------------------------------------------------------------------------
 
@@ -78,6 +83,14 @@ class GatewayApplication:
         """Open the store (applying migrations) and become ready/degraded (design §2.1)."""
         self.status = "migrating"
         db.connect()  # opens the connection and runs forward-only migrations
+        # Converge legacy AgentRecord envelopes into the durable Agent/Run stores (design §7, Phase 6).
+        # Idempotent and best-effort — a migration hiccup must never block the control plane from serving.
+        try:
+            from tabvis.gateway.runtime.legacy_migration import migrate_legacy_agents
+
+            migrate_legacy_agents(self.events)
+        except Exception:  # noqa: BLE001
+            pass
         self.status = "loading"
         self.status = "ready" if self.orchestrator.has_launcher else "degraded"
 
@@ -114,7 +127,7 @@ class GatewayApplication:
                 "event_store": store_state,
                 "agent_runtime": agent_state,
                 "browser_runtime": "not_configured",
-                "channels": {},
+                "channels": self.channels.health() if self.channels is not None else {},
             },
             "capacity": {"runs": self.max_runs, "available": max(0, self.max_runs - active)},
         }

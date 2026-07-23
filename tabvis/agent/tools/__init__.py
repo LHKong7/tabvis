@@ -1,6 +1,6 @@
 """Built-in tool registry, filtering, and MCP tool-pool assembly.
 
-``get_all_base_tools`` is the source of truth for the 19 built-in tools implemented by this
+``get_all_base_tools`` is the source of truth for the built-in tools implemented by this
 runtime. ``BrowserIntent`` is included but disabled unless its feature flag is enabled. Connected
 MCP tools are created dynamically and merged with the enabled built-ins by
 :func:`assemble_tool_pool`.
@@ -20,7 +20,9 @@ from tabvis.agent.tools.bash_tool import bash_tool as _bash_tool
 from tabvis.agent.tools.browser_click_tool import browser_click_tool as _browser_click_tool
 from tabvis.agent.tools.browser_download_tool import browser_download_tool as _browser_download_tool
 from tabvis.agent.tools.browser_intent_tool import browser_intent_tool as _browser_intent_tool
+from tabvis.agent.tools.browser_keys_tool import browser_keys_tool as _browser_keys_tool
 from tabvis.agent.tools.browser_navigate_tool import browser_navigate_tool as _browser_navigate_tool
+from tabvis.agent.tools.browser_scroll_tool import browser_scroll_tool as _browser_scroll_tool
 from tabvis.agent.tools.browser_snapshot_tool import browser_snapshot_tool as _browser_snapshot_tool
 from tabvis.agent.tools.browser_type_tool import browser_type_tool as _browser_type_tool
 from tabvis.agent.tools.browser_wait_tool import browser_wait_tool as _browser_wait_tool
@@ -68,6 +70,8 @@ def get_all_base_tools() -> list[Tool]:
         _browser_snapshot_tool,
         _browser_click_tool,
         _browser_type_tool,
+        _browser_scroll_tool,
+        _browser_keys_tool,
         _browser_wait_tool,
         _browser_download_tool,
         _browser_intent_tool,  # flag-gated (TABVIS_BROWSER_INTENTS); is_enabled() filters it off by default

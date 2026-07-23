@@ -415,6 +415,45 @@ def session_id_exists(session_id: str) -> bool:
         return False
 
 
+# A session id used to build a transcript filename must be a plain, path-safe token (a uuid or the
+# ``token_hex`` ids tabvis mints). This gate keeps a caller-supplied id from reaching the filesystem
+# with ``/``, ``..`` or other separators — a Resume selector is untrusted input (§4.4).
+_SAFE_SESSION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+
+
+def is_safe_session_id(session_id: str) -> bool:
+    """Whether ``session_id`` is a path-safe token usable in a transcript filename."""
+    return bool(session_id) and bool(_SAFE_SESSION_ID_RE.match(session_id)) and ".." not in session_id
+
+
+def find_session_project_dir(session_id: str) -> str | None:
+    """Locate the project directory holding ``<session_id>.jsonl``, scanning across projects.
+
+    Resume is project-path sensitive (design §2.2): a transcript lives under
+    ``<projects>/<sanitized-cwd>/<session_id>.jsonl``, and looking only under the *current* cwd makes
+    a session started elsewhere appear empty. This read-only scan recovers the original project dir so
+    the resolver can hand it to ``switch_session`` — the current-cwd location is checked first (the
+    common case), then every sibling project dir. Returns None if no transcript exists anywhere.
+    """
+    if not is_safe_session_id(session_id):
+        return None
+    filename = f"{session_id}.jsonl"
+    # Fast path: the session's own project (current cwd).
+    here = get_project_dir(get_original_cwd())
+    if os.path.exists(os.path.join(here, filename)):
+        return here
+    projects = get_projects_dir()
+    try:
+        entries = os.listdir(projects)
+    except OSError:
+        return None
+    for name in entries:
+        candidate = os.path.join(projects, name)
+        if os.path.exists(os.path.join(candidate, filename)):
+            return candidate
+    return None
+
+
 def get_node_env() -> str:
     """Return the node env."""
     return os.environ.get("NODE_ENV") or "development"

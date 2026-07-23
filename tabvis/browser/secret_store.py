@@ -1,18 +1,27 @@
-"""Browser secret store (IDP-6) — ``secret_ref`` indirection over the OS Keychain or a 0600 file.
+"""Browser secret store (IDP-6) — ``secret_ref`` indirection over a real OS credential store.
 
 ``design.md`` §"数据存储": passwords / tokens / proxy keys and the data-encryption key live in the OS
 Keychain; the DB and records keep only a ``secret_ref``. This is that store: :func:`put` returns an
 opaque ref, :func:`get` resolves it, so an identity/record never holds the plaintext.
 
-Backend: the macOS Keychain (via the ``security`` CLI) when ``TABVIS_BROWSER_SECRET_KEYCHAIN`` is set —
-opt-in so tests and non-macOS hosts use the file backend and never touch the real keychain; otherwise
-a ``0600`` JSON file at ``<config-home>/browser-secrets.json``. Nothing calls this by default, so it
-is purely additive. (Keychain-by-default is the north-star; the file fallback carries the same
-posture as today's ``0600`` ``.env``.)
+Backend selection (issue #6). A **secure OS-backed store is the default**, not opt-in:
+
+* ``TABVIS_SECRET_BACKEND=file|keychain|keyring`` forces a specific backend (used by the test suite
+  to pin ``file`` so it never touches the developer's real keystore).
+* otherwise **macOS → the login Keychain** (via the ``security`` CLI);
+* otherwise, if the ``keyring`` package is importable, the **system keyring** (Secret Service /
+  Windows Credential Manager);
+* otherwise a ``0600`` JSON file at ``<config-home>/browser-secrets.json``.
+
+The file backend is an **insecure fallback**: ``0600`` only stops *other local users* from reading it —
+it is plaintext at rest, not encryption. :func:`has_secure_backend` reports whether a real OS store is
+in play, so callers that persist cookies / credentials (storage-state) can refuse or warn when it is
+not (see ``identity_store.export_identity_state``).
 """
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 import subprocess
@@ -24,18 +33,54 @@ from tabvis.utils.debug import log_for_debugging
 from tabvis.utils.env_utils import get_tabvis_config_home_dir
 
 _KEYCHAIN_SERVICE = "tabvis-browser-secret"
+_BACKEND_ENV = "TABVIS_SECRET_BACKEND"
 _lock = threading.RLock()
+_keyring_available: bool | None = None
+_warned_insecure = False
 
 
 def new_secret_ref() -> str:
     return "sec_" + uuid.uuid4().hex[:16]
 
 
-def _use_keychain() -> bool:
-    if sys.platform != "darwin":
-        return False
-    val = os.environ.get("TABVIS_BROWSER_SECRET_KEYCHAIN", "")
-    return val.strip().lower() in ("1", "true", "yes", "on")
+def _has_keyring() -> bool:
+    global _keyring_available
+    if _keyring_available is None:
+        _keyring_available = importlib.util.find_spec("keyring") is not None
+    return _keyring_available
+
+
+def _resolve_backend() -> str:
+    """Which backend to use: ``keychain`` | ``keyring`` | ``file`` (see module docstring)."""
+    explicit = os.environ.get(_BACKEND_ENV, "").strip().lower()
+    if explicit in ("file", "keychain", "keyring"):
+        return explicit
+    # Back-compat: the old opt-in still forces a secure backend when set.
+    legacy = os.environ.get("TABVIS_BROWSER_SECRET_KEYCHAIN", "").strip().lower()
+    force_secure = legacy in ("1", "true", "yes", "on")
+    if sys.platform == "darwin":
+        return "keychain"
+    if _has_keyring():
+        return "keyring"
+    if force_secure:
+        # Asked for a secure backend but none is available — warn and degrade rather than crash.
+        _warn_insecure_once()
+    return "file"
+
+
+def has_secure_backend() -> bool:
+    """Whether secrets are held in a real OS credential store (not the plaintext ``0600`` file)."""
+    return _resolve_backend() in ("keychain", "keyring")
+
+
+def _warn_insecure_once() -> None:
+    global _warned_insecure
+    if not _warned_insecure:
+        _warned_insecure = True
+        log_for_debugging(
+            "[SECRET] no secure OS keystore available; using the plaintext 0600 file fallback. "
+            "This is NOT encryption at rest — storage-state / credential persistence is discouraged."
+        )
 
 
 # --------------------------------------------------------------------------- file backend
@@ -102,6 +147,30 @@ def _kc_delete(ref: str) -> None:
     )
 
 
+# --------------------------------------------------------------------------- keyring backend
+
+
+def _kr_set(ref: str, value: str) -> None:
+    import keyring  # type: ignore[import-untyped]
+
+    keyring.set_password(_KEYCHAIN_SERVICE, ref, value)
+
+
+def _kr_get(ref: str) -> str | None:
+    import keyring  # type: ignore[import-untyped]
+
+    return keyring.get_password(_KEYCHAIN_SERVICE, ref)
+
+
+def _kr_delete(ref: str) -> None:
+    import keyring  # type: ignore[import-untyped]
+
+    try:
+        keyring.delete_password(_KEYCHAIN_SERVICE, ref)
+    except Exception:  # noqa: BLE001 - deleting a missing entry raises on some backends
+        pass
+
+
 # --------------------------------------------------------------------------- public API
 
 
@@ -109,9 +178,12 @@ def put(value: str, *, ref: str | None = None) -> str:
     """Store a secret; returns its ``secret_ref``. Best-effort — never raises."""
     ref = ref or new_secret_ref()
     with _lock:
+        backend = _resolve_backend()
         try:
-            if _use_keychain():
+            if backend == "keychain":
                 _kc_set(ref, value)
+            elif backend == "keyring":
+                _kr_set(ref, value)
             else:
                 data = _file_load()
                 data[ref] = value
@@ -127,8 +199,13 @@ def get(ref: str | None) -> str | None:
     if not ref:
         return None
     with _lock:
+        backend = _resolve_backend()
         try:
-            return _kc_get(ref) if _use_keychain() else _file_load().get(ref)
+            if backend == "keychain":
+                return _kc_get(ref)
+            if backend == "keyring":
+                return _kr_get(ref)
+            return _file_load().get(ref)
         except Exception:  # noqa: BLE001 - fixed message only, never the exception (see put)
             log_for_debugging("[SECRET] get failed")
             return None
@@ -139,9 +216,12 @@ def delete(ref: str) -> None:
     if not ref:
         return
     with _lock:
+        backend = _resolve_backend()
         try:
-            if _use_keychain():
+            if backend == "keychain":
                 _kc_delete(ref)
+            elif backend == "keyring":
+                _kr_delete(ref)
             else:
                 data = _file_load()
                 data.pop(ref, None)

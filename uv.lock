@@ -2132,14 +2132,38 @@ camoufox = [
 cloak = [
     { name = "cloakbrowser" },
 ]
+discord = [
+    { name = "websockets" },
+]
+feishu = [
+    { name = "cryptography" },
+]
 gemini = [
     { name = "google-genai" },
+]
+google-chat = [
+    { name = "cryptography" },
+]
+mattermost = [
+    { name = "websockets" },
 ]
 ocr = [
     { name = "tesserocr" },
 ]
 openai = [
     { name = "openai" },
+]
+qq = [
+    { name = "cryptography" },
+]
+simplex = [
+    { name = "websockets" },
+]
+teams = [
+    { name = "cryptography" },
+]
+wecom = [
+    { name = "cryptography" },
 ]
 
 [package.dev-dependencies]
@@ -2152,6 +2176,11 @@ requires-dist = [
     { name = "anthropic", specifier = ">=0.40" },
     { name = "camoufox", marker = "extra == 'camoufox'", specifier = ">=0.4" },
     { name = "cloakbrowser", marker = "extra == 'cloak'", specifier = ">=0.4.10" },
+    { name = "cryptography", marker = "extra == 'feishu'", specifier = ">=41" },
+    { name = "cryptography", marker = "extra == 'google-chat'", specifier = ">=41" },
+    { name = "cryptography", marker = "extra == 'qq'", specifier = ">=41" },
+    { name = "cryptography", marker = "extra == 'teams'", specifier = ">=41" },
+    { name = "cryptography", marker = "extra == 'wecom'", specifier = ">=41" },
     { name = "google-genai", marker = "extra == 'gemini'", specifier = ">=0.3" },
     { name = "httpcore", specifier = ">=1.0" },
     { name = "httpx", specifier = ">=0.27" },
@@ -2168,8 +2197,11 @@ requires-dist = [
     { name = "tesserocr", marker = "extra == 'ocr'", specifier = ">=2.6" },
     { name = "uvicorn", specifier = ">=0.30" },
     { name = "wcwidth", specifier = ">=0.2" },
+    { name = "websockets", marker = "extra == 'discord'", specifier = ">=12" },
+    { name = "websockets", marker = "extra == 'mattermost'", specifier = ">=12" },
+    { name = "websockets", marker = "extra == 'simplex'", specifier = ">=12" },
 ]
-provides-extras = ["camoufox", "cloak", "gemini", "ocr", "openai"]
+provides-extras = ["camoufox", "cloak", "discord", "feishu", "gemini", "google-chat", "mattermost", "ocr", "openai", "qq", "simplex", "teams", "wecom"]
 
 [package.metadata.requires-dev]
 dev = [{ name = "pytest", specifier = ">=8.0" }]

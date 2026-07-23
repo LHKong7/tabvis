@@ -19,7 +19,7 @@ from tabvis.agent.tools.browser_common import (
 
 _DESCRIPTION = """Capture the current browser page as an accessibility snapshot: a compact list
 of interactive and named elements, each tagged with a stable [ref=eN] you pass to
-BrowserClick / BrowserType.
+BrowserClick / BrowserType / BrowserScroll / BrowserKeys.
 
 Usage:
  - Call this first (after BrowserNavigate) to see the page before acting.

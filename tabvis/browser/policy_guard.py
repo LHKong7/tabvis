@@ -9,7 +9,7 @@ an *adapter* — it maps a tool call to a ``(action, resource)`` pair, evaluates
 
 Behavior is deliberately preserved (``standard`` posture unchanged):
 
-* The five current tools (navigate / click / type / snapshot / wait) map to ``browser.navigate`` or
+* Browser navigation and interaction tools map to ``browser.navigate`` or
   ``browser.interact``, both of which a **browser baseline** allows — so with no identity or
   settings policy, the decision is ``allow`` exactly as before.
 * Navigation ``goto`` still runs :func:`check_navigation_permission` first, preserving the domain
@@ -28,11 +28,15 @@ gating interaction on an already-open denied page needs the live page URL and is
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from typing import Any
 
 from tabvis.constants.tools import (
     BROWSER_CLICK_TOOL_NAME,
+    BROWSER_DOWNLOAD_TOOL_NAME,
+    BROWSER_KEYS_TOOL_NAME,
     BROWSER_NAVIGATE_TOOL_NAME,
+    BROWSER_SCROLL_TOOL_NAME,
     BROWSER_SNAPSHOT_TOOL_NAME,
     BROWSER_TYPE_TOOL_NAME,
     BROWSER_WAIT_TOOL_NAME,
@@ -127,8 +131,15 @@ def _action_and_resource(tool_name: str, input: Any) -> tuple[str, str]:
             return "browser.navigate", f"url:{get_field(input, 'url') or ''}"
         # back / forward / reload act on already-visited pages — no target origin to gate.
         return "browser.navigate", "session:page"
+    if tool_name == BROWSER_DOWNLOAD_TOOL_NAME:
+        # An explicit file fetch is a ``browser.download`` — the standard baseline asks for it, an
+        # identity ``denied_origins`` denies it, a grant can upgrade it. Without this branch the tool
+        # fell through to the ``browser.interact`` catch-all and was silently always-allowed.
+        return "browser.download", f"url:{get_field(input, 'url') or ''}"
     if tool_name in (
         BROWSER_CLICK_TOOL_NAME,
+        BROWSER_KEYS_TOOL_NAME,
+        BROWSER_SCROLL_TOOL_NAME,
         BROWSER_TYPE_TOOL_NAME,
         BROWSER_SNAPSHOT_TOOL_NAME,
         BROWSER_WAIT_TOOL_NAME,
@@ -252,6 +263,29 @@ def evaluate(tool_name: str, input: Any, context: Any) -> PermissionDecision:
     served = _apply_shadow(result, input)
     _emit_audit(context, action, resource, decision.effect, decision.matched_rule_id, decision.mode, served)
     return served
+
+
+def evaluate_download(url: str, agent_id: str | None) -> tuple[str, str | None]:
+    """Evaluate ``browser.download`` for a URL against the engine → ``(effect, rule_id)``.
+
+    A non-tool entry point for the download side of the browser service, where an *unexpected*
+    download (a click that turned out to trigger one) must be judged without a ``ToolUseContext``.
+    Returns the raw engine effect (``allow`` / ``ask`` / ``deny``) so the caller can decide whether
+    to expose the file to the agent or quarantine it — there is no user to answer an ``ask`` at this
+    point, so the caller treats anything other than ``allow`` as "not cleared".
+    """
+    context = SimpleNamespace(agent_id=agent_id)
+    decision = _browser_engine(context).evaluate("browser.download", f"url:{url or ''}")
+    _emit_audit(
+        context,
+        "browser.download",
+        f"url:{url or ''}",
+        decision.effect,
+        decision.matched_rule_id,
+        decision.mode,
+        {"behavior": decision.effect},
+    )
+    return decision.effect, decision.matched_rule_id
 
 
 class PolicyGuard:

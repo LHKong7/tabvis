@@ -48,10 +48,30 @@ def _duration_ms(run: RunRecord) -> int | None:
     return int((b - a).total_seconds() * 1000)
 
 
-def project_run_as_agent(run: RunRecord) -> dict[str, Any]:
-    """A legacy agent view derived from a Run (design §9.8 GET /agents/{id})."""
+def _merge_durable_agent(view: dict[str, Any], agent: dict[str, Any] | None) -> dict[str, Any]:
+    """Overlay the durable Agent's fields onto a Run-derived view — the "durable Agent + latest Run"
+    projection (design §7.2 convergence). Purely **additive**: the legacy execution keys (including the
+    5-value ``status``) are untouched for wire-compatibility; the durable half is exposed under new keys
+    (``agent_status`` is the ``active/disabled/deleted`` lifecycle, distinct from the run ``status``)."""
+    if not agent:
+        return view
+    view["agent_status"] = agent.get("status")
+    view["name"] = agent.get("name")
+    view["tenant_id"] = agent.get("tenant_id")
+    view["profile"] = agent.get("profile")
+    view["cwd"] = agent.get("cwd")
+    view["default_model"] = agent.get("default_model")
+    view["default_max_turns"] = agent.get("default_max_turns")
+    view["profile_generation"] = agent.get("profile_generation")
+    view["agent_created_at"] = agent.get("created_at")
+    view["updated_at"] = agent.get("updated_at")
+    return view
+
+
+def project_run_as_agent(run: RunRecord, agent: dict[str, Any] | None = None) -> dict[str, Any]:
+    """A legacy agent view = the durable Agent merged over its latest Run (design §9.8, §7.2)."""
     status = legacy_status(run.status)
-    return {
+    view = {
         "agent_id": run.agent_id,
         "session_id": run.session_id,
         "status": status,
@@ -75,11 +95,49 @@ def project_run_as_agent(run: RunRecord) -> dict[str, Any]:
         "attempt": run.attempt,
         "latest_run": run.to_dict(),
     }
+    return _merge_durable_agent(view, agent)
 
 
-def project_agent_list(latest_runs: list[RunRecord], *, status: str | None = None, limit: int | None = None) -> dict[str, Any]:
-    """The legacy ``GET /agents`` envelope from the latest Run per agent."""
-    agents = [project_run_as_agent(r) for r in latest_runs]
+def project_agent_only(agent: dict[str, Any]) -> dict[str, Any]:
+    """A legacy agent view for a durable Agent that has **no** Run yet (design §7.2 zero-run agent).
+
+    The execution fields are empty; ``status`` is the neutral ``queued`` (nothing has run) and the
+    durable half is merged in. Lets a registered-but-never-run agent be read instead of 404'ing."""
+    view = {
+        "agent_id": agent.get("agent_id"),
+        "session_id": None,
+        "status": "queued",
+        "model": agent.get("default_model"),
+        "max_turns": agent.get("default_max_turns"),
+        "turns": 0,
+        "tool_calls": 0,
+        "created_at": agent.get("created_at"),
+        "started_at": None,
+        "ended_at": None,
+        "duration_ms": None,
+        "result": None,
+        "result_message_id": None,
+        "error": None,
+        "is_error": False,
+        "run_id": None,
+        "conversation_id": None,
+        "workspace_id": None,
+        "attempt": 0,
+        "latest_run": None,
+    }
+    return _merge_durable_agent(view, agent)
+
+
+def project_agent_list(
+    latest_runs: list[RunRecord],
+    *,
+    agents_by_id: dict[str, dict[str, Any]] | None = None,
+    status: str | None = None,
+    limit: int | None = None,
+) -> dict[str, Any]:
+    """The legacy ``GET /agents`` envelope: each agent's latest Run merged with its durable Agent."""
+    by_id = agents_by_id or {}
+    agents = [project_run_as_agent(r, by_id.get(r.agent_id)) for r in latest_runs]
     if status:
         agents = [a for a in agents if a["status"] == status]
     if limit:

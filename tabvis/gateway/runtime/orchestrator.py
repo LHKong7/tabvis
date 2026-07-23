@@ -31,6 +31,7 @@ class LaunchContext:
     prompt: str = ""
     profile: str | None = None
     resume: bool = False
+    resume_mode: str = "fresh"  # fresh | conversation_only | plus (Resume Plus §5.1)
     stream_partials: bool = False
     extra: dict[str, Any] = field(default_factory=dict)
 
@@ -72,7 +73,10 @@ class RunOrchestrator:
         attempt: int = 1,
         prompt: str = "",
         profile: str | None = None,
+        cwd: str | None = None,
+        principal_id: str | None = None,
         resume: bool = False,
+        resume_mode: str = "fresh",
         stream_partials: bool = False,
     ) -> RunRecord:
         """Create a Run and, if a launcher is wired, start executing it (design §7)."""
@@ -80,11 +84,15 @@ class RunOrchestrator:
             agent_id=agent_id, session_id=session_id, command_id=command_id, model=model,
             prompt_message_id=prompt_message_id, conversation_id=conversation_id,
             workspace_id=workspace_id, max_turns=max_turns, attempt=attempt, correlation_id=command_id,
+            profile=profile, cwd=cwd, principal_id=principal_id,
         )
         if self._launcher is not None:
             await self._launcher.launch(
                 run,
-                LaunchContext(prompt=prompt, profile=profile, resume=resume, stream_partials=stream_partials),
+                LaunchContext(
+                    prompt=prompt, profile=profile, resume=resume, resume_mode=resume_mode,
+                    stream_partials=stream_partials,
+                ),
             )
         return run
 

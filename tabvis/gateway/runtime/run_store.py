@@ -25,6 +25,7 @@ from tabvis.gateway.protocol.errors import GatewayError
 from tabvis.gateway.protocol.events import AGGREGATE_RUN, EventScope, EventType
 from tabvis.gateway.protocol import ids
 from tabvis.gateway.runtime import runs
+from tabvis.gateway.runtime.agents import AgentStore
 from tabvis.gateway.runtime.runs import RunRecord
 from tabvis.gateway.store import db
 
@@ -56,6 +57,9 @@ def _utc_now() -> str:
 class RunStore:
     def __init__(self, events: EventStore | None = None) -> None:
         self._events = events or get_event_store()
+        # The durable Agent aggregate, sharing this store's event store so agent + run events commit
+        # together on the same log (design §7.2 convergence).
+        self._agents = AgentStore(self._events)
 
     # --- create ---------------------------------------------------------------------------------
 
@@ -73,10 +77,17 @@ class RunStore:
         attempt: int = 1,
         allow_concurrent: bool = False,
         correlation_id: str | None = None,
+        profile: str | None = None,
+        cwd: str | None = None,
+        principal_id: str | None = None,
+        tenant_id: str = "local",
     ) -> RunRecord:
-        """Create a Run and emit ``run.created`` atomically.
+        """Create a Run (and ensure its durable Agent) emitting the events atomically.
 
-        Rejects a second active run for the same agent unless ``allow_concurrent`` (design §7.5).
+        Rejects a second active run for the same agent unless ``allow_concurrent`` (design §7.5). The
+        durable Agent aggregate (§7.2) is created on the agent's first Run and refreshed thereafter, in
+        the *same* transaction as the run row + ``run.created`` — so an Agent never exists without its
+        creation fact and a Run never exists without its Agent.
         """
         record = RunRecord(
             run_id=ids.new_run_id(),
@@ -104,6 +115,11 @@ class RunStore:
                         message="Agent already has an active run",
                         details={"agent_id": agent_id},
                     )
+            agent_envelopes = self._agents.ensure_in(
+                conn, agent_id, model=model, max_turns=max_turns, profile=profile, cwd=cwd,
+                principal_id=principal_id, tenant_id=tenant_id,
+                scope=EventScope(agent_id=agent_id, session_id=session_id),
+            )
             db.insert_run(conn, record.to_dict())
             envelope = self._events.append(
                 AGGREGATE_RUN,
@@ -114,6 +130,8 @@ class RunStore:
                 correlation_id=correlation_id or command_id,
                 conn=conn,
             )
+        for agent_envelope in agent_envelopes:
+            self._events.notify_live(agent_envelope)
         self._events.notify_live(envelope)
         return record
 

@@ -73,20 +73,49 @@ def test_summary_counts_by_type(monkeypatch: pytest.MonkeyPatch) -> None:
 # --------------------------------------------------------------------------- interaction redaction
 
 
-def test_type_text_truncated_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_text_redacted_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Secure default: the raw text is NOT persisted, only its length.
     monkeypatch.setenv("TABVIS_BROWSER_ARTIFACTS_DOM", "0")
-    long = "x" * (A._MAX_INPUT_CHARS + 50)
+    _record({"type": "interaction", "action": "type", "interaction": {"ref": "e1", "text": "hunter2"}}, {"url": "u"})
+    inter = A.load_artifacts()[0]["interaction"]
+    assert "text" not in inter and inter["text_redacted"] is True and inter["text_len"] == 7
+
+
+def test_include_input_persists_truncated_text(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("TABVIS_BROWSER_ARTIFACTS_DOM", "0")
+    monkeypatch.setenv("TABVIS_BROWSER_ARTIFACTS_INCLUDE_INPUT", "1")
+    long = "hello world " * 60  # long, but ordinary prose (not sensitive-looking)
     _record({"type": "interaction", "action": "type", "interaction": {"ref": "e1", "text": long}}, {"url": "u"})
     inter = A.load_artifacts()[0]["interaction"]
     assert len(inter["text"]) == A._MAX_INPUT_CHARS and inter["text_truncated"] is True
+    assert inter["text_len"] == len(long)
 
 
-def test_redact_input_hides_text(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_redact_input_overrides_include(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("TABVIS_BROWSER_ARTIFACTS_DOM", "0")
+    monkeypatch.setenv("TABVIS_BROWSER_ARTIFACTS_INCLUDE_INPUT", "1")
     monkeypatch.setenv("TABVIS_BROWSER_ARTIFACTS_REDACT_INPUT", "1")
     _record({"type": "interaction", "action": "type", "interaction": {"ref": "e1", "text": "hunter2"}}, {"url": "u"})
     inter = A.load_artifacts()[0]["interaction"]
     assert "text" not in inter and inter["text_redacted"] is True and inter["text_len"] == 7
+
+
+@pytest.mark.parametrize(
+    "secret",
+    [
+        "4111111111111111",          # a Luhn-valid test card number
+        "4111 1111 1111 1111",       # ...with the usual spacing
+        "sk_live_0123456789abcdefghij",  # a long high-entropy token
+    ],
+)
+def test_sensitive_text_redacted_even_with_include(monkeypatch: pytest.MonkeyPatch, secret: str) -> None:
+    # Card numbers / tokens are stripped unconditionally, even when inclusion is opted in.
+    monkeypatch.setenv("TABVIS_BROWSER_ARTIFACTS_DOM", "0")
+    monkeypatch.setenv("TABVIS_BROWSER_ARTIFACTS_INCLUDE_INPUT", "1")
+    _record({"type": "interaction", "action": "type", "interaction": {"ref": "e1", "text": secret}}, {"url": "u"})
+    inter = A.load_artifacts()[0]["interaction"]
+    assert "text" not in inter
+    assert inter["text_redacted"] is True and inter["text_redacted_reason"] == "sensitive"
 
 
 # --------------------------------------------------------------------------- DOM content-addressing
@@ -120,8 +149,12 @@ def test_config_accessors(monkeypatch: pytest.MonkeyPatch) -> None:
 
     assert bc.is_browser_artifacts_enabled() is True         # default on
     assert bc.is_browser_artifacts_dom_enabled() is True
+    assert bc.is_browser_artifacts_include_input() is False   # secure default: text not persisted
     assert bc.is_browser_artifacts_redact_input() is False
     assert bc.get_browser_artifacts_max_dom_bytes() == 1_000_000
+
+    monkeypatch.setenv("TABVIS_BROWSER_ARTIFACTS_INCLUDE_INPUT", "1")
+    assert bc.is_browser_artifacts_include_input() is True
 
     monkeypatch.setenv("TABVIS_BROWSER_ARTIFACTS", "0")
     assert bc.is_browser_artifacts_enabled() is False

@@ -122,13 +122,14 @@ def test_server_flag_routes_agents_to_the_gateway(monkeypatch: pytest.MonkeyPatc
     assert detail["status"] == "completed" and detail["run_id"] == run.run_id
 
 
-def test_server_flag_off_uses_registry(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_registry_only_agent_is_invisible_after_retirement(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Phase 6 convergence: the AgentRecord registry is retired from the public path. An agent that
+    # exists ONLY in the legacy registry (no durable gateway Agent/Run) is not served by /agents.
     monkeypatch.delenv("TABVIS_GATEWAY_AGENTS", raising=False)
     from tabvis.agent.agents import registry as reg
     from tabvis.browser.server import create_app
 
-    # a registry agent that has NO gateway run — visible only if the registry path is in use.
     reg.create(agent_id="ag_reg", session_id="s", prompt="p")
     client = TestClient(create_app(auth_required=False))
     body = client.get("/v1/agents").json()
-    assert any(a["agent_id"] == "ag_reg" for a in body["agents"])   # default: registry-backed
+    assert not any(a["agent_id"] == "ag_reg" for a in body["agents"])   # registry is off the public path

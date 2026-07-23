@@ -45,9 +45,29 @@ class RunCreateHandler:
         if existing is not None:
             return CommandResult(command.command_id, data={"run": existing}, duplicate=True)
 
+        # Resume Plus (§12.3): a resume MUST continue the prior transcript lineage. Honor
+        # ``resume_from_session_id`` (or an explicit ``session_id``) and only mint a fresh session for
+        # a genuinely new conversation — the previous behavior of always minting a new session_id made
+        # ``resume=True`` unable to find the earlier transcript.
+        resume_mode = str(data.get("resume_mode") or "").strip()
+        resume_from = data.get("resume_from_session_id")
+        resume = bool(data.get("resume", False)) or bool(resume_from) or resume_mode in (
+            "plus", "conversation_only",
+        )
+        session_id = resume_from or data.get("session_id")
+        if not session_id:
+            if resume:
+                raise GatewayError(
+                    "VALIDATION_FAILED",
+                    message="a resume run requires 'resume_from_session_id' or 'session_id'",
+                )
+            session_id = ids.new_session_id()
+        if resume and not resume_mode:
+            resume_mode = "plus"
+
         run = await self._orch.create_and_start(
             agent_id=agent_id,
-            session_id=data.get("session_id") or ids.new_session_id(),
+            session_id=session_id,
             command_id=command.command_id,
             model=data.get("model") or "",
             prompt_message_id=data.get("prompt_message_id") or "",
@@ -56,7 +76,10 @@ class RunCreateHandler:
             max_turns=data.get("max_turns"),
             prompt=_prompt_text(data),
             profile=data.get("profile"),
-            resume=bool(data.get("resume", False)),
+            cwd=data.get("cwd"),
+            principal_id=ctx.principal.principal_id,
+            resume=resume,
+            resume_mode=resume_mode or "fresh",
             stream_partials=bool(data.get("stream", False)),
         )
         return CommandResult(command.command_id, data={"run": run.to_dict()})
