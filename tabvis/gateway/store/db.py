@@ -27,7 +27,7 @@ from typing import Any, Iterator
 
 from tabvis.browser.persistence.paths import get_browser_os_data_dir
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 GATEWAY_DB_FILENAME = "gateway.db"
 
 _lock = threading.RLock()
@@ -178,6 +178,27 @@ _DDL = (
         data      TEXT NOT NULL
     )""",
     "CREATE INDEX IF NOT EXISTS idx_placements_worker ON run_placements(worker_id, status)",
+    # v6: the durable Agent aggregate (design §7.2). The convergence of the legacy AgentRecord registry
+    # onto the gateway — a durable identity (profile/cwd/principal/defaults/lifecycle) that outlives its
+    # Runs, so an "agent" is no longer merely the projection of its latest Run. One row per agent_id;
+    # `data` is the full record blob (lossless), the columns are the queryable projection.
+    """CREATE TABLE IF NOT EXISTS agents (
+        agent_id            TEXT PRIMARY KEY,
+        tenant_id           TEXT,
+        name                TEXT,
+        status              TEXT NOT NULL,
+        principal_id        TEXT,
+        default_model       TEXT,
+        default_max_turns   INTEGER,
+        profile             TEXT,
+        cwd                 TEXT,
+        browser_identity_id TEXT,
+        profile_generation  INTEGER,
+        created_at          TEXT,
+        updated_at          TEXT,
+        data                TEXT NOT NULL
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_agents_status ON agents(status)",
 )
 
 
@@ -345,6 +366,70 @@ def get_run_by_command(command_id: str) -> dict[str, Any] | None:
             "SELECT data FROM runs WHERE command_id = ? ORDER BY created_at ASC LIMIT 1", (command_id,)
         ).fetchone()
     return json.loads(row["data"]) if row else None
+
+
+# --------------------------------------------------------------------------- agents (durable aggregate)
+
+_AGENT_UPSERT = (
+    "INSERT INTO agents (agent_id, tenant_id, name, status, principal_id, default_model, "
+    "default_max_turns, profile, cwd, browser_identity_id, profile_generation, created_at, updated_at, "
+    "data) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+    # On conflict, keep the original created_at (durable identity) and refresh everything else.
+    "ON CONFLICT(agent_id) DO UPDATE SET tenant_id=excluded.tenant_id, name=excluded.name, "
+    "status=excluded.status, principal_id=excluded.principal_id, default_model=excluded.default_model, "
+    "default_max_turns=excluded.default_max_turns, profile=excluded.profile, cwd=excluded.cwd, "
+    "browser_identity_id=excluded.browser_identity_id, profile_generation=excluded.profile_generation, "
+    "updated_at=excluded.updated_at, data=excluded.data"
+)
+
+
+def _agent_params(record: dict[str, Any]) -> tuple[Any, ...]:
+    return (
+        record["agent_id"], record.get("tenant_id"), record.get("name"), record["status"],
+        record.get("principal_id"), record.get("default_model"), record.get("default_max_turns"),
+        record.get("profile"), record.get("cwd"), record.get("browser_identity_id"),
+        record.get("profile_generation"), record.get("created_at"), record.get("updated_at"),
+        json.dumps(record, default=str),
+    )
+
+
+def upsert_agent_in(conn: sqlite3.Connection, record: dict[str, Any]) -> None:
+    """Insert-or-update the durable agent within an open transaction (created_at is preserved)."""
+    conn.execute(_AGENT_UPSERT, _agent_params(record))
+
+
+def upsert_agent(record: dict[str, Any]) -> None:
+    with _lock:
+        conn = connect()
+        upsert_agent_in(conn, record)
+        conn.commit()
+
+
+def get_agent(agent_id: str) -> dict[str, Any] | None:
+    with _lock:
+        conn = connect()
+        row = conn.execute("SELECT data FROM agents WHERE agent_id = ?", (agent_id,)).fetchone()
+    return json.loads(row["data"]) if row else None
+
+
+def get_agent_in(conn: sqlite3.Connection, agent_id: str) -> dict[str, Any] | None:
+    row = conn.execute("SELECT data FROM agents WHERE agent_id = ?", (agent_id,)).fetchone()
+    return json.loads(row["data"]) if row else None
+
+
+def list_agents(statuses: tuple[str, ...] | None = None) -> list[dict[str, Any]]:
+    """Every durable agent, newest first — optionally filtered to a set of lifecycle statuses."""
+    with _lock:
+        conn = connect()
+        if statuses:
+            placeholders = ",".join("?" for _ in statuses)
+            rows = conn.execute(
+                f"SELECT data FROM agents WHERE status IN ({placeholders}) ORDER BY created_at DESC, rowid DESC",
+                tuple(statuses),
+            ).fetchall()
+        else:
+            rows = conn.execute("SELECT data FROM agents ORDER BY created_at DESC, rowid DESC").fetchall()
+    return [json.loads(r["data"]) for r in rows]
 
 
 # --------------------------------------------------------------------------- events / outbox

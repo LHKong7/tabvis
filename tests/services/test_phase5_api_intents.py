@@ -111,10 +111,13 @@ def test_int5_disabled_records_nothing() -> None:
 
 
 def test_register_creates_agent_and_credential() -> None:
+    from tabvis.gateway.runtime.agents import get_agent_store
+
     result = credentials.register(cwd="/repo", model="m")
     assert result["agent_id"].startswith("ag_")
     assert result["credential"].startswith("cred_")
-    assert r.get(result["agent_id"]) is not None                       # agent record created
+    # Phase 6: register creates the DURABLE gateway Agent (the registry is retired), not a registry record.
+    assert get_agent_store().get(result["agent_id"]) is not None
     assert credentials.resolve_agent_id(result["credential"]) == result["agent_id"]
     assert credentials.resolve_agent_id("cred_bogus") is None
 

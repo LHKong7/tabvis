@@ -76,6 +76,8 @@ class RunCreateHandler:
             max_turns=data.get("max_turns"),
             prompt=_prompt_text(data),
             profile=data.get("profile"),
+            cwd=data.get("cwd"),
+            principal_id=ctx.principal.principal_id,
             resume=resume,
             resume_mode=resume_mode or "fresh",
             stream_partials=bool(data.get("stream", False)),

@@ -1,14 +1,12 @@
-"""Gateway-backed legacy `/agents` endpoints — the registry-retirement cutover (design §9.8).
+"""Gateway-backed legacy `/agents` endpoints — the registry retirement (design §7, §9.8, Phase 6).
 
-When enabled (`TABVIS_GATEWAY_AGENTS`), the legacy agent surface is served by the **gateway** instead of
-the `AgentRecord` registry: `POST /agent` creates a gateway Run (executed by the wired `AgentRunLauncher`)
+The legacy agent surface is served by the **gateway's durable Agent/Run stores**, not the retired
+`AgentRecord` registry: `POST /agent` creates a gateway Run (executed by the wired `AgentRunLauncher`)
 and streams its events projected to legacy SSE frames; `GET /agents`, `GET /agents/{id}`, and
-`POST /agents/{id}/cancel` are the Run-data projections. This makes the gateway the single source of
-truth for the agent lifecycle — the registry is no longer on the public control path.
-
-It is off by default: flipping the flag on, observing, then deleting the registry is the operational
-rollout. The browser-bundle endpoints (`/quit`, `/browser`, `/artifacts`, `/identity`) remain
-registry-backed pending their own migration.
+`POST /agents/{id}/cancel` are the durable-Agent + latest-Run projections. This is now the only path —
+the gateway is the single source of truth for the agent lifecycle, and the registry is off the public
+control path (the browser-bundle endpoints `/quit`, `/browser`, `/artifacts`, `/identity` resolve
+existence through the durable Agent + browser subsystem, in `tabvis/browser/server.py`).
 """
 
 from __future__ import annotations

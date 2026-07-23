@@ -28,7 +28,7 @@ from tabvis.gateway.protocol.commands import Command, CommandType
 from tabvis.gateway.protocol.compatibility import (
     legacy_frames_for,
     legacy_status,
-    project_agent_list,
+    project_agent_only,
     project_run_as_agent,
 )
 from tabvis.gateway.protocol.errors import GatewayError
@@ -217,9 +217,31 @@ async def list_agents_compat(request: Request) -> Response:
     try:
         principal = await _principal(request)
         gateway: GatewayApplication = request.app.state.gateway
-        latest = [r for r in gateway.runs.latest_run_per_agent() if principal.can_access_agent(r.agent_id)]
-        body = project_agent_list(latest, status=request.query_params.get("status"), limit=_int_param(request, "limit"))
-        return JSONResponse(body)
+        views: list = []
+        seen: set[str] = set()
+        # Durable agents first (so a registered/zero-run agent is listed), each merged with its latest Run.
+        for agent in gateway.agents.list():
+            if not principal.can_access_agent(agent.agent_id):
+                continue
+            seen.add(agent.agent_id)
+            run = gateway.runs.latest_run_for_agent(agent.agent_id)
+            views.append(
+                project_run_as_agent(run, agent.to_dict()) if run is not None
+                else project_agent_only(agent.to_dict())
+            )
+        # Any run whose agent has no durable row (pre-convergence data) — belt-and-suspenders.
+        for run in gateway.runs.latest_run_per_agent():
+            if run.agent_id in seen or not principal.can_access_agent(run.agent_id):
+                continue
+            seen.add(run.agent_id)
+            views.append(project_run_as_agent(run, None))
+        status = request.query_params.get("status")
+        if status:
+            views = [v for v in views if v["status"] == status]
+        limit = _int_param(request, "limit")
+        if limit:
+            views = views[:limit]
+        return JSONResponse({"agents": views, "count": len(views)})
     except GatewayError as e:
         return _error_response(e)
 
@@ -231,10 +253,14 @@ async def read_agent_compat(request: Request) -> Response:
         # Ownership before existence, so a non-owner cannot probe which agent ids exist (matches legacy).
         if not principal.can_access_agent(agent_id):
             raise GatewayError("FORBIDDEN", details={"agent_id": agent_id})
-        run = request.app.state.gateway.runs.latest_run_for_agent(agent_id)
+        gateway: GatewayApplication = request.app.state.gateway
+        run = gateway.runs.latest_run_for_agent(agent_id)
+        agent = gateway.agents.get(agent_id)
         if run is None:
+            if agent is not None:  # a durable agent that has not run yet (design §7.2 zero-run agent)
+                return JSONResponse(project_agent_only(agent.to_dict()))
             return JSONResponse({"error": "unknown agent_id"}, status_code=404)
-        return JSONResponse(project_run_as_agent(run))
+        return JSONResponse(project_run_as_agent(run, agent.to_dict() if agent else None))
     except GatewayError as e:
         return _error_response(e)
 

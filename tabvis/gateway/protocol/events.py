@@ -39,6 +39,11 @@ class EventType:
     SESSION_CREATED = "session.created"
     SESSION_COMPACTION_COMPLETED = "session.compaction.completed"
     SESSION_FORKED = "session.forked"
+    # agent (durable aggregate, design §7.2)
+    AGENT_CREATED = "agent.created"
+    AGENT_UPDATED = "agent.updated"
+    AGENT_DISABLED = "agent.disabled"
+    AGENT_DELETED = "agent.deleted"
     # run
     RUN_CREATED = "run.created"
     RUN_QUEUED = "run.queued"
@@ -74,6 +79,7 @@ class EventType:
 
 # Aggregate kinds an event can be scoped to (the ``aggregate.type`` field).
 AGGREGATE_GATEWAY = "gateway"
+AGGREGATE_AGENT = "agent"
 AGGREGATE_RUN = "run"
 AGGREGATE_SESSION = "session"
 AGGREGATE_CONVERSATION = "conversation"

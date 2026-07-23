@@ -18,6 +18,7 @@ from tabvis.gateway.methods.interactions import InteractionRespondHandler
 from tabvis.gateway.methods.router import CommandRouter
 from tabvis.gateway.methods.runs import RunCancelHandler, RunCreateHandler
 from tabvis.gateway.runtime import runs
+from tabvis.gateway.runtime.agents import AgentStore
 from tabvis.gateway.runtime.interaction_service import InteractionService, get_interaction_service
 from tabvis.gateway.runtime.orchestrator import RunLauncher, RunOrchestrator
 from tabvis.gateway.runtime.run_store import RunStore, get_run_store
@@ -44,6 +45,8 @@ class GatewayApplication:
     ) -> None:
         self.events = event_store
         self.runs = run_store
+        # The durable Agent aggregate (design §7.2), sharing the same event log as runs.
+        self.agents = AgentStore(event_store)
         self.interactions = interaction_service
         self.orchestrator = orchestrator
         self.router = router
@@ -80,6 +83,14 @@ class GatewayApplication:
         """Open the store (applying migrations) and become ready/degraded (design §2.1)."""
         self.status = "migrating"
         db.connect()  # opens the connection and runs forward-only migrations
+        # Converge legacy AgentRecord envelopes into the durable Agent/Run stores (design §7, Phase 6).
+        # Idempotent and best-effort — a migration hiccup must never block the control plane from serving.
+        try:
+            from tabvis.gateway.runtime.legacy_migration import migrate_legacy_agents
+
+            migrate_legacy_agents(self.events)
+        except Exception:  # noqa: BLE001
+            pass
         self.status = "loading"
         self.status = "ready" if self.orchestrator.has_launcher else "degraded"
 

@@ -73,6 +73,8 @@ class RunOrchestrator:
         attempt: int = 1,
         prompt: str = "",
         profile: str | None = None,
+        cwd: str | None = None,
+        principal_id: str | None = None,
         resume: bool = False,
         resume_mode: str = "fresh",
         stream_partials: bool = False,
@@ -82,6 +84,7 @@ class RunOrchestrator:
             agent_id=agent_id, session_id=session_id, command_id=command_id, model=model,
             prompt_message_id=prompt_message_id, conversation_id=conversation_id,
             workspace_id=workspace_id, max_turns=max_turns, attempt=attempt, correlation_id=command_id,
+            profile=profile, cwd=cwd, principal_id=principal_id,
         )
         if self._launcher is not None:
             await self._launcher.launch(
