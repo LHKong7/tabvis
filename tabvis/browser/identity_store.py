@@ -510,5 +510,23 @@ def delete_identity(agent_id: str) -> bool:
 
 
 def resolve_credential(secret_ref: str) -> str | None:
-    """Resolve a credential ``secret_ref`` to its plaintext — for runtime injection ONLY (IDP-7)."""
+    """Resolve a credential ``secret_ref`` to its plaintext — for runtime injection ONLY (IDP-7).
+
+    .. deprecated::
+        **Internal, deprecated interface** (CREDENTIAL_INJECTION_DESIGN.md §3.2 gap #1, §15 Phase 0).
+        This returns a *plaintext* secret in the Agent's own process, which is exactly the trust-domain
+        collapse the credential-injection design removes: model decisions and secret use must live in
+        two domains, and a resolved secret must only ever exist inside the trusted Credential Executor
+        as a :class:`~tabvis.authentication.secrets.SecretValue` (design §5.8, §4.1). New code MUST NOT
+        call this — go through the Credential Broker. It survives only for the legacy IDP-7 path until
+        the Broker split (design Phase 2) removes the Agent-process access entirely.
+    """
+    import warnings
+
+    warnings.warn(
+        "identity_store.resolve_credential returns plaintext in the agent process and is deprecated; "
+        "use the Credential Broker (see docs/CREDENTIAL_INJECTION_DESIGN.md §4, §15 Phase 0).",
+        DeprecationWarning,
+        stacklevel=2,
+    )
     return _resolve_secret(secret_ref)

@@ -73,6 +73,44 @@ def has_secure_backend() -> bool:
     return _resolve_backend() in ("keychain", "keyring")
 
 
+class InsecureSecretBackendError(RuntimeError):
+    """Raised when production mode requires a secure backend but only the plaintext file is available.
+
+    Production MUST fail closed rather than silently degrade to a plaintext ``0600`` JSON file
+    (CREDENTIAL_INJECTION_DESIGN.md §6.1, §15 Phase 0, §17). The managed-authentication feature refuses
+    to run rather than lower its security level.
+    """
+
+
+def _production_secure_backend_required() -> bool:
+    """Whether the current config demands a secure secret backend (managed-auth production gate).
+
+    True when either the broker runs in production mode (``TABVIS_CREDENTIAL_BROKER_MODE=production``)
+    or the explicit requirement flag is set (``TABVIS_MANAGED_AUTH_REQUIRE_SECURE_SECRET_BACKEND=1``).
+    Off by default so existing non-managed flows (and the test suite's pinned ``file`` backend) are
+    unaffected.
+    """
+    mode = os.environ.get("TABVIS_CREDENTIAL_BROKER_MODE", "").strip().lower()
+    if mode == "production":
+        return True
+    from tabvis.utils.env_utils import is_env_truthy
+
+    return is_env_truthy(os.environ.get("TABVIS_MANAGED_AUTH_REQUIRE_SECURE_SECRET_BACKEND"))
+
+
+def assert_production_backend() -> None:
+    """Fail closed if a secure backend is required but not available (design §6.1, §17 startup check).
+
+    Called by managed-authentication code paths before touching the secret store. In non-production
+    configurations this is a no-op, so ordinary browser flows keep the best-effort behavior.
+    """
+    if _production_secure_backend_required() and not has_secure_backend():
+        raise InsecureSecretBackendError(
+            "managed authentication requires a secure OS secret backend (keychain/keyring); the "
+            "plaintext file fallback is disabled in production mode."
+        )
+
+
 def _warn_insecure_once() -> None:
     global _warned_insecure
     if not _warned_insecure:
@@ -174,11 +212,24 @@ def _kr_delete(ref: str) -> None:
 # --------------------------------------------------------------------------- public API
 
 
+def _guard_backend(backend: str) -> None:
+    """In production mode, refuse to touch the plaintext file backend at all (design §6.1)."""
+    if backend == "file" and _production_secure_backend_required():
+        raise InsecureSecretBackendError(
+            "plaintext file secret backend is disabled in production mode."
+        )
+
+
 def put(value: str, *, ref: str | None = None) -> str:
-    """Store a secret; returns its ``secret_ref``. Best-effort — never raises."""
+    """Store a secret; returns its ``secret_ref``. Best-effort — never raises.
+
+    Exception: in production mode a plaintext file backend fails closed with
+    :class:`InsecureSecretBackendError` rather than silently persisting plaintext (design §6.1).
+    """
     ref = ref or new_secret_ref()
     with _lock:
         backend = _resolve_backend()
+        _guard_backend(backend)
         try:
             if backend == "keychain":
                 _kc_set(ref, value)
@@ -200,6 +251,7 @@ def get(ref: str | None) -> str | None:
         return None
     with _lock:
         backend = _resolve_backend()
+        _guard_backend(backend)
         try:
             if backend == "keychain":
                 return _kc_get(ref)
@@ -217,6 +269,7 @@ def delete(ref: str) -> None:
         return
     with _lock:
         backend = _resolve_backend()
+        _guard_backend(backend)
         try:
             if backend == "keychain":
                 _kc_delete(ref)

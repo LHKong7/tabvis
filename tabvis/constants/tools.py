@@ -61,6 +61,7 @@ BROWSER_KEYS_TOOL_NAME = "BrowserKeys"  # tabvis.agent.tools.browser_keys_tool
 BROWSER_WAIT_TOOL_NAME = "BrowserWait"  # tabvis.agent.tools.browser_wait_tool
 BROWSER_DOWNLOAD_TOOL_NAME = "BrowserDownload"  # tabvis.agent.tools.browser_download_tool
 BROWSER_INTENT_TOOL_NAME = "BrowserIntent"  # tabvis.agent.tools.browser_intent_tool (flag-gated: TABVIS_BROWSER_INTENTS)
+BROWSER_AUTHENTICATE_TOOL_NAME = "BrowserAuthenticate"  # tabvis.agent.tools.browser_authenticate_tool (flag-gated: TABVIS_AUTHENTICATION_ENABLED)
 
 # ``SHELL_TOOL_NAMES`` (utils/shell/shellToolUtils): [BASH_TOOL_NAME, POWERSHELL_TOOL_NAME].
 # Inlined to keep this module standalone (the shell util pulls bash/powershell tool names).
