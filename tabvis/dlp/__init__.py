@@ -8,6 +8,16 @@ API) through this scan is Phase 5 (design §11.1).
 
 from __future__ import annotations
 
-from tabvis.dlp import canary
+from tabvis.dlp import canary, image, text, url
+from tabvis.dlp.gateway import SURFACES, DLPBlockEvent, DLPDecision, DLPGateway
 
-__all__ = ["canary"]
+__all__ = [
+    "DLPBlockEvent",
+    "DLPDecision",
+    "DLPGateway",
+    "SURFACES",
+    "canary",
+    "image",
+    "text",
+    "url",
+]
