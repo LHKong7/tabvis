@@ -241,6 +241,21 @@ def evaluate(tool_name: str, input: Any, context: Any) -> PermissionDecision:
     """
     action, resource = _action_and_resource(tool_name, input)
 
+    # Authentication lock (design §4.2, §13.1): while a credential authentication holds the browser,
+    # every ordinary Agent browser RPC is refused — no navigation, click, type, snapshot or download,
+    # and no observation — so the Agent can neither interfere with nor watch the login. The dedicated
+    # BrowserAuthenticate tool is exempt (it *is* the authentication).
+    from tabvis.constants.tools import BROWSER_AUTHENTICATE_TOOL_NAME
+
+    if tool_name != BROWSER_AUTHENTICATE_TOOL_NAME:
+        from tabvis.browser import auth_lease
+
+        session_id = getattr(context, "browser_session_id", None) if context is not None else None
+        if auth_lease.is_authentication_locked(session_id) if session_id else auth_lease.any_authentication_locked():
+            from tabvis.browser.host import BROWSER_AUTHENTICATION_LOCKED
+
+            return {"behavior": "deny", "message": BROWSER_AUTHENTICATION_LOCKED}
+
     if tool_name == BROWSER_NAVIGATE_TOOL_NAME:
         from tabvis.agent.tools.browser_common import get_field
 
