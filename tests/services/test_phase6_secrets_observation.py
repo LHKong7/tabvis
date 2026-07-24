@@ -59,7 +59,10 @@ def test_identity_store_credential_and_proxy_refs() -> None:
     ref = identity_store.store_credential("ag_sec", "s3cret")
     identity = identity_store.get_by_agent("ag_sec")
     assert ref in identity.auth.credential_refs
-    assert identity_store.resolve_credential(ref) == "s3cret"      # resolvable for injection only
+    with pytest.warns(DeprecationWarning):
+        # resolve_credential returns plaintext in the agent process; it is the legacy IDP-7 path and is
+        # now a deprecated internal interface (CREDENTIAL_INJECTION_DESIGN.md §3.2 gap #1, §15 Phase 0).
+        assert identity_store.resolve_credential(ref) == "s3cret"
 
     proxy_ref = identity_store.set_proxy("ag_sec", "http://proxy.local:8080")
     assert identity_store.get_by_agent("ag_sec").network.proxy_ref == proxy_ref
@@ -75,8 +78,45 @@ def test_identity_storage_state_round_trip() -> None:
 
 
 # --------------------------------------------------------------------------- IDP-7: credential injection
+#
+# CREDENTIAL_INJECTION_DESIGN.md §15 Phase 0: no automatic login yet, but the new authentication surface
+# MUST NOT be able to receive or emit a plaintext secret. These are failure-first security assertions
+# for the boundary; the full flow lands in later phases.
 
 
+def test_credential_injection_agent_schema_has_no_secret_fields() -> None:
+    from tabvis.agent.tools.browser_authenticate_tool import BrowserAuthenticateInput
+
+    fields = set(BrowserAuthenticateInput.model_fields)
+    assert fields == {"credential_profile_id"}                      # §16.4: only the profile id
+    forbidden = {"username", "password", "totp", "secret_ref", "cookie", "text", "storage_state"}
+    assert not (fields & forbidden)
+
+
+def test_credential_injection_agent_request_rejects_smuggled_secret() -> None:
+    from pydantic import ValidationError
+
+    from tabvis.authentication.models import AgentAuthenticationRequest
+
+    AgentAuthenticationRequest(credential_profile_id="work_sso")    # the only accepted shape
+    with pytest.raises(ValidationError):
+        AgentAuthenticationRequest(credential_profile_id="work_sso", password="hunter2")
+
+
+def test_credential_injection_resolved_secret_never_stringifies() -> None:
+    from tabvis.authentication.secrets import SecretLeakError, secret_from_str
+
+    secret = secret_from_str("hunter2")
+    with pytest.raises(SecretLeakError):
+        str(secret)
+    with pytest.raises(SecretLeakError):
+        _ = f"{secret}"
+    assert "hunter2" not in repr(secret)
+    # the sanctioned path still works, then scrubs
+    assert bytes(secret.borrow_bytes()) == b"hunter2"
+    secret.release()
+    with pytest.raises(SecretLeakError):
+        secret.borrow_bytes()
 
 
 # --------------------------------------------------------------------------- OBS-6 / OBS-7
