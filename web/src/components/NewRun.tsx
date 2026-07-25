@@ -75,7 +75,7 @@ export function NewRun({ onLaunched, busy, ready, agents, config, runOn, onRunOn
             <option value="">New agent (fresh session + browser)</option>
             {agents.map((a) => (
               <option key={a.agent_id} value={a.agent_id}>
-                Continue {a.agent_id} · {a.status} · {a.prompt.slice(0, 40)}
+                Continue {a.agent_id} · {a.status} · {(a.prompt || 'previous run').slice(0, 40)}
               </option>
             ))}
           </select>

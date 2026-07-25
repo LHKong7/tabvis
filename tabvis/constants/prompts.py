@@ -216,6 +216,7 @@ _BROWSER_TOOL_NAMES = frozenset(
     {
         "BrowserNavigate",
         "BrowserSnapshot",
+        "BrowserExtract",
         "BrowserClick",
         "BrowserType",
         "BrowserScroll",
@@ -268,6 +269,20 @@ def _get_browsing_section(enabled_tools: set[str]) -> str | None:
         "changed: call BrowserSnapshot to get fresh refs.\n"
         " - Use BrowserSnapshot with include_screenshot=true only when you must visually verify "
         "something; the text snapshot is what carries the refs you act on.\n"
+        " - Use BrowserExtract when you need reliable page content, absolute links, dates, or table "
+        "rows. Do not guess or reconstruct URLs from visible text, and do not request a full HTML "
+        "dump when the structured extraction is sufficient.\n"
+        " - For requests involving 'latest', 'current', 'recent', or 'today', assume your model "
+        "knowledge may be stale. Prefer an official primary-source listing, use BrowserExtract to "
+        "collect more than one plausible candidate, compare publication dates and reporting periods "
+        "against the current Environment date, and only then select and summarize the newest item. "
+        "Browser evidence overrides your training-data cutoff; never dismiss a page merely because "
+        "its date is newer than your remembered knowledge.\n"
+        " - If a downloadable report requires approval and approval is unavailable, use an official "
+        "HTML release when it contains the requested facts. For a direct PDF URL already discovered "
+        "on the page, BrowserNavigate can open it and will announce the captured workspace file for "
+        "Read. Otherwise report the blocked document clearly; never substitute an older item and "
+        "call it the latest.\n"
         " - On a visual page the accessibility tree can't describe (a canvas app, a map, an image-"
         "only page), the snapshot is automatically supplemented with a screenshot and the page's raw "
         "HTML — reason from those when the ref list is sparse.\n"

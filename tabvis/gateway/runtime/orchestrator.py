@@ -82,7 +82,7 @@ class RunOrchestrator:
         """Create a Run and, if a launcher is wired, start executing it (design §7)."""
         run = self._runs.create_run(
             agent_id=agent_id, session_id=session_id, command_id=command_id, model=model,
-            prompt_message_id=prompt_message_id, conversation_id=conversation_id,
+            prompt_message_id=prompt_message_id, prompt=prompt, conversation_id=conversation_id,
             workspace_id=workspace_id, max_turns=max_turns, attempt=attempt, correlation_id=command_id,
             profile=profile, cwd=cwd, principal_id=principal_id,
         )

@@ -31,11 +31,13 @@ def test_legacy_status_mapping() -> None:
 
 def test_project_run_as_agent_shape() -> None:
     run = RunRecord(run_id="run_1", agent_id="ag_1", session_id="ses_1", command_id="cmd_1",
-                    model="m", status=runs.RUNNING, turns=3, tool_calls=2)
-    view = compat.project_run_as_agent(run)
+                    prompt="find the latest report", model="m", status=runs.RUNNING,
+                    turns=3, tool_calls=2)
+    view = compat.project_run_as_agent(run, result="done")
     assert view["agent_id"] == "ag_1" and view["session_id"] == "ses_1"
     assert view["status"] == "running" and view["run_id"] == "run_1"
     assert view["turns"] == 3 and view["tool_calls"] == 2
+    assert view["prompt"] == "find the latest report" and view["result"] == "done"
     assert view["latest_run"]["run_id"] == "run_1"  # full gateway record embedded
 
 
@@ -47,8 +49,17 @@ def test_legacy_frames_for_maps_lifecycle_events() -> None:
         )
 
     assert compat.legacy_frames_for(ev(EventType.RUN_CREATED, {"agent_id": "ag_1"}))[0]["event"] == "agent"
-    assert compat.legacy_frames_for(ev(EventType.ASSISTANT_MESSAGE_COMPLETED, {"text_preview": "hi"}))[0]["event"] == "assistant"
-    assert compat.legacy_frames_for(ev(EventType.TOOL_COMPLETED))[0]["event"] == "tool_use"
+    assistant = compat.legacy_frames_for(
+        ev(EventType.ASSISTANT_MESSAGE_COMPLETED, {"text_preview": "hi"})
+    )[0]
+    assert assistant["event"] == "assistant"
+    assert assistant["data"]["message"]["content"][0]["text"] == "hi"
+    tool = compat.legacy_frames_for(
+        ev(EventType.TOOL_COMPLETED, {"name": "BrowserExtract", "input": {"query": "2026"}})
+    )[0]
+    assert tool["event"] == "tool_use"
+    assert tool["data"]["name"] == "BrowserExtract"
+    assert tool["data"]["input"] == {"query": "2026"}
     completed = [f["event"] for f in compat.legacy_frames_for(ev(EventType.RUN_COMPLETED, {"result_preview": "x"}))]
     assert completed == ["result", "done"]
     assert compat.legacy_frames_for(ev(EventType.RUN_STARTED)) == []  # not a legacy frame

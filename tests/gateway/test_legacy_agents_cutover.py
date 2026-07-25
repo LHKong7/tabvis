@@ -66,9 +66,12 @@ def test_post_agent_then_list_and_read_from_gateway() -> None:
 
     listing = client.get("/agents").json()
     assert listing["count"] == 1 and listing["agents"][0]["agent_id"] == agent_id
+    assert listing["agents"][0]["prompt"] == "go"
+    assert listing["agents"][0]["result"] == "all done"
     detail = client.get(f"/agents/{agent_id}")
     assert detail.status_code == 200 and detail.json()["agent_id"] == agent_id
     assert detail.json()["status"] == "completed"
+    assert detail.json()["prompt"] == "go" and detail.json()["result"] == "all done"
 
 
 def test_post_agent_requires_prompt() -> None:

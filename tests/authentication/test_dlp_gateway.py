@@ -51,6 +51,29 @@ def test_mask_identifiers() -> None:
     assert "555" not in mask_identifiers("call +1 555-123-4567 please")
 
 
+def test_mask_identifiers_preserves_numeric_web_identifiers() -> None:
+    alibaba = "https://home.alibabagroup.com/en-US/document-1991237455038119936"
+    sec = "https://www.sec.gov/Archives/edgar/data/1577551/000110465926000001/report.htm"
+    html = '<a href="/en-US/document-1991237455038119936">report</a>'
+    assert mask_identifiers(alibaba) == alibaba
+    assert mask_identifiers(sec) == sec
+    assert mask_identifiers(html) == html
+
+
+def test_gateway_preserves_numeric_document_paths_in_nested_browser_data() -> None:
+    url = "https://home.alibabagroup.com/en-US/document-1991237455038119936"
+    decision = DLPGateway().scrub(
+        "model_request",
+        {
+            "snapshot": f'- link "Press Releases" href="{url}"',
+            "links": [{"text": "Press Releases", "href": url}],
+        },
+    )
+    assert not decision.blocked
+    assert decision.payload["snapshot"].endswith(f'href="{url}"')
+    assert decision.payload["links"][0]["href"] == url
+
+
 def test_redact_mapping_sensitive_keys() -> None:
     out = redact_mapping({"password": "hunter2", "user": "alice", "nested": {"api_key": "k"}})
     assert out["password"] == "[redacted]"

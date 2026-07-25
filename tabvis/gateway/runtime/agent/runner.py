@@ -63,6 +63,38 @@ def _assistant_text(message: dict[str, Any]) -> str:
     return ""
 
 
+def _tool_uses(message: dict[str, Any]) -> list[dict[str, Any]]:
+    """Bounded, DLP-safe tool summaries for the durable diagnostic stream."""
+    inner = message.get("message") or {}
+    content = inner.get("content") if isinstance(inner, dict) else None
+    if not isinstance(content, list):
+        return []
+    out: list[dict[str, Any]] = []
+    from tabvis.dlp.gateway import get_dlp_gateway
+
+    for block in content:
+        if not isinstance(block, dict) or block.get("type") != "tool_use":
+            continue
+        payload = {
+            "name": str(block.get("name") or "tool")[:120],
+            "input": block.get("input") if isinstance(block.get("input"), dict) else {},
+        }
+        decision = get_dlp_gateway().scrub("audit", payload)
+        if decision.blocked or not isinstance(decision.payload, dict):
+            out.append({"name": payload["name"], "input": {"error": "dlp_blocked"}})
+        else:
+            safe = decision.payload
+            # Inputs are diagnostic hints, not a transcript replacement. Bound them before storing.
+            import json
+
+            encoded = json.dumps(safe.get("input") or {}, ensure_ascii=False, default=str)
+            out.append({
+                "name": str(safe.get("name") or "tool")[:120],
+                "input": safe.get("input") if len(encoded) <= 1500 else {"preview": encoded[:1500]},
+            })
+    return out
+
+
 def _safe_preview(surface: str, value: str | None) -> str:
     """DLP-gate content before it enters the durable event log / API projection."""
     from tabvis.dlp.gateway import get_dlp_gateway
@@ -161,17 +193,18 @@ class AgentRunLauncher:
                     mtype = message.get("type")
                     if mtype == "assistant":
                         turns += 1
-                        tool_calls += _count_tool_uses(message)
+                        tool_summaries = _tool_uses(message)
+                        tool_calls += len(tool_summaries)
                         self._events.append(
                             AGGREGATE_RUN, run.run_id, EventType.ASSISTANT_MESSAGE_COMPLETED, scope=scope,
                             data={"turn": turns, "text_preview": _safe_preview(
                                 "transcript", _assistant_text(message)
                             )},
                         )
-                        for _ in range(_count_tool_uses(message)):
+                        for summary in tool_summaries:
                             self._events.append(
                                 AGGREGATE_RUN, run.run_id, EventType.TOOL_COMPLETED, scope=scope,
-                                data={"turn": turns},
+                                data={"turn": turns, **summary},
                             )
                     elif mtype == "result":
                         result_text = message.get("result")

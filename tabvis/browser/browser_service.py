@@ -74,6 +74,10 @@ _TEXT_BUDGET = 22_000
 # Small on purpose: it is a *reasoning aid* alongside the screenshot, not the primary observation,
 # and the sparse-aria case leaves plenty of the result budget free anyway.
 _HTML_BUDGET = 12_000
+# Structured page extraction is requested explicitly, so it can spend most of one tool-result
+# budget while still leaving room for the URL/title envelope.
+_EXTRACT_TEXT_BUDGET = 18_000
+_EXTRACT_CHAR_BUDGET = 44_000
 
 # When is the accessibility snapshot "not enough"? A canvas game / maps / whiteboard / image-only
 # page yields an aria tree with almost no named nodes and almost no text — below both thresholds we
@@ -88,6 +92,9 @@ _SCROLL_INTO_VIEW_DELAY = 0.05
 _MOUSE_MOVE_DELAY = 0.05
 _MOUSE_HOLD_DELAY = 0.08
 _SCROLL_STEP_DELAY = 0.15
+# A target=_blank popup is not guaranteed to appear in the same event-loop tick as the click.
+# Ordinary clicks retain the fast path; only links that advertise a new browsing context wait.
+_POPUP_WAIT_SECONDS = 1.5
 
 # One pass to lift a trimmed copy of the page HTML: drop non-content/heavy nodes and defuse inline
 # data: URIs (base64 images blow the budget and say nothing). Operates on a clone — no DOM mutation.
@@ -104,6 +111,113 @@ _HTML_EXTRACT_JS = r"""
     }
   });
   return clone.outerHTML || '';
+}
+"""
+
+# Extract the parts of a rendered page that matter for research and navigation while keeping URLs
+# as dedicated ``href`` fields.  Structured URL fields are important: the DLP gateway can safely
+# clean their credentials/query values without confusing opaque numeric path identifiers for phone
+# numbers.  The model gets useful document candidates, dates and table data without receiving a
+# noisy full-DOM dump.
+_PAGE_EXTRACT_JS = r"""
+(args) => {
+  const clean = (value, limit = 1000) =>
+    String(value || '').replace(/\s+/g, ' ').trim().slice(0, limit);
+  const visible = (el) => {
+    const style = window.getComputedStyle(el);
+    const rect = el.getBoundingClientRect();
+    return style.display !== 'none' && style.visibility !== 'hidden' &&
+      style.opacity !== '0' && (rect.width > 0 || rect.height > 0);
+  };
+  let root;
+  try {
+    root = document.querySelector(args.scope || 'main, article, [role="main"]') ||
+      document.body || document.documentElement;
+  } catch (error) {
+    return {error: `Invalid CSS scope: ${String(error && error.message || error)}`};
+  }
+  if (!root) return {error: 'The page has no readable document root.'};
+
+  const maxItems = Math.max(1, Math.min(Number(args.max_items) || 100, 200));
+  const query = clean(args.query || '', 200).toLocaleLowerCase();
+  const contextFor = (el) => {
+    const holder = el.closest('article, li, tr, section, [role="listitem"], div') || el.parentElement;
+    return clean(holder ? holder.innerText || holder.textContent : '', 500);
+  };
+  const links = Array.from(root.querySelectorAll('a[href]'))
+    .filter(visible)
+    .map((el) => ({
+      text: clean(el.innerText || el.textContent || el.getAttribute('aria-label') ||
+        el.getAttribute('title'), 300),
+      href: el.href,
+      title: clean(el.getAttribute('title'), 200),
+      target: clean(el.getAttribute('target'), 30),
+      kind: /\.pdf(?:$|[?#])/i.test(el.href) ? 'pdf' :
+        (el.hasAttribute('download') ? 'download' : 'page'),
+      context: contextFor(el),
+    }))
+    .filter((item) => item.text || item.title || item.context)
+    .filter((item) => !query ||
+      `${item.text} ${item.title} ${item.context} ${item.href}`.toLocaleLowerCase().includes(query))
+    .slice(0, maxItems);
+
+  const headings = Array.from(root.querySelectorAll('h1,h2,h3,h4,h5,h6,[role="heading"]'))
+    .filter(visible)
+    .map((el) => ({
+      level: Number((el.tagName || '').slice(1)) || Number(el.getAttribute('aria-level')) || null,
+      text: clean(el.innerText || el.textContent, 500),
+    }))
+    .filter((item) => item.text && (!query || item.text.toLocaleLowerCase().includes(query)))
+    .slice(0, Math.min(maxItems, 80));
+
+  const dates = [];
+  for (const el of root.querySelectorAll('time, [itemprop="datePublished"], [itemprop="dateModified"]')) {
+    const value = clean(el.getAttribute('datetime') || el.getAttribute('content') ||
+      el.innerText || el.textContent, 200);
+    if (value && !dates.includes(value)) dates.push(value);
+    if (dates.length >= 50) break;
+  }
+  for (const selector of [
+    'meta[property="article:published_time"]',
+    'meta[property="article:modified_time"]',
+    'meta[name="date"]',
+    'meta[name="pubdate"]',
+  ]) {
+    const value = clean(document.querySelector(selector)?.getAttribute('content'), 200);
+    if (value && !dates.includes(value)) dates.push(value);
+  }
+
+  const tables = Array.from(root.querySelectorAll('table')).filter(visible).slice(0, 12).map((table) => ({
+    caption: clean(table.querySelector('caption')?.innerText, 300),
+    rows: Array.from(table.querySelectorAll('tr')).slice(0, 40).map((row) =>
+      Array.from(row.querySelectorAll('th,td')).slice(0, 16).map((cell) =>
+        clean(cell.innerText || cell.textContent, 500)
+      )
+    ).filter((row) => row.some(Boolean)),
+  })).filter((table) => table.caption || table.rows.length);
+
+  const text = clean(root.innerText || root.textContent, Number(args.max_text_chars) || 18000);
+  const matches = [];
+  if (query && text) {
+    const lower = text.toLocaleLowerCase();
+    let offset = 0;
+    while (matches.length < 20) {
+      const index = lower.indexOf(query, offset);
+      if (index < 0) break;
+      matches.push(text.slice(Math.max(0, index - 240), Math.min(text.length, index + query.length + 360)));
+      offset = index + Math.max(1, query.length);
+    }
+  }
+  return {
+    scope: args.scope || 'main/article/body',
+    query: args.query || null,
+    text: query ? matches.join('\n...\n') : text,
+    matches,
+    headings,
+    dates,
+    links,
+    tables,
+  };
 }
 """
 
@@ -799,6 +913,19 @@ class BrowserService:
             if not is_pdf:
                 return
             body = await response.body()
+            # Chromium's built-in PDF viewer can make page.goto() resolve to its extension HTML
+            # shell even though the requested URL is a PDF. Never persist that shell as *.pdf:
+            # retry the original URL through the same browser context (cookies/auth preserved) and
+            # require the PDF magic bytes before exposing the file to the agent.
+            if not body.startswith(b"%PDF-") and self._context is not None:
+                direct = await self._context.request.get(url)
+                if direct.ok:
+                    body = await direct.body()
+            if not body.startswith(b"%PDF-"):
+                log_for_debugging(
+                    f"[BROWSER] pdf capture rejected non-PDF response for {url}"
+                )
+                return
             from tabvis.browser.downloads import filename_from_url, get_workspace_dir, unique_path
 
             dest = unique_path(get_workspace_dir(), filename_from_url(url, "page.pdf"))
@@ -1045,6 +1172,57 @@ class BrowserService:
         if len(html) > _HTML_BUDGET:
             html = html[:_HTML_BUDGET] + " …[html truncated]"
         return html
+
+    async def extract_page(
+        self,
+        *,
+        query: str | None = None,
+        scope: str | None = None,
+        max_items: int = 100,
+    ) -> dict[str, Any]:
+        """Return rendered page content as bounded, structured research data.
+
+        This is deliberately separate from :meth:`observe`: ordinary browser actions stay compact
+        and ref-driven, while a research task can explicitly request stable absolute links, dates,
+        headings, readable text and tables.  It is not a full HTML dump.
+        """
+        async with self._action_lock:
+            page = self.active_page
+            args = {
+                "query": (query or "").strip(),
+                "scope": (scope or "").strip() or None,
+                "max_items": max(1, min(int(max_items), 200)),
+                "max_text_chars": _EXTRACT_TEXT_BUDGET,
+            }
+            try:
+                extracted = await asyncio.wait_for(
+                    page.evaluate(_PAGE_EXTRACT_JS, args), timeout=self._timeout_s()
+                )
+            except Exception as e:  # noqa: BLE001 - expose a recoverable browser error
+                raise BrowserError(f"Page extraction failed: {e}") from e
+            if not isinstance(extracted, dict):
+                raise BrowserError("Page extraction returned an invalid result.")
+            if extracted.get("error"):
+                raise BrowserError(str(extracted["error"]))
+
+            data: dict[str, Any] = {
+                "url": page.url,
+                "title": await _safe_title(page),
+                "tab_count": len([p for p in self._pages() if not p.is_closed()]),
+                **extracted,
+            }
+            # The JavaScript caps every collection, but table-heavy pages can still exceed the
+            # persisted tool-result limit.  Reduce the lossy fields in a deterministic order.
+            import json
+
+            if len(json.dumps(data, ensure_ascii=False, default=str)) > _EXTRACT_CHAR_BUDGET:
+                data["tables"] = (data.get("tables") or [])[:4]
+            if len(json.dumps(data, ensure_ascii=False, default=str)) > _EXTRACT_CHAR_BUDGET:
+                data["links"] = (data.get("links") or [])[:50]
+            if len(json.dumps(data, ensure_ascii=False, default=str)) > _EXTRACT_CHAR_BUDGET:
+                text = str(data.get("text") or "")
+                data["text"] = text[:8_000] + " …[structured extraction truncated]"
+            return data
 
     async def _evaluate_snapshot(self, page: Page) -> dict[str, Any]:
         """Run the snapshot JS, tolerating a navigation that lands mid-evaluate.
@@ -1340,13 +1518,44 @@ class BrowserService:
         except Exception as e:  # noqa: BLE001
             raise BrowserError(f"JavaScript click fallback failed: {e}") from e
 
+    @staticmethod
+    async def _opens_new_page(locator: Locator) -> bool:
+        """Best-effort hint that clicking ``locator`` should create a popup/new tab."""
+        try:
+            return bool(
+                await locator.evaluate(
+                    """el => {
+                      const link = el.closest && el.closest('a[href]');
+                      if (link && String(link.target || '').toLowerCase() === '_blank') return true;
+                      const onclick = String(el.getAttribute && el.getAttribute('onclick') || '');
+                      return /window\\.open\\s*\\(/i.test(onclick);
+                    }"""
+                )
+            )
+        except Exception:  # noqa: BLE001 - absence of the hint keeps the ordinary fast path
+            return False
+
     async def _observe_action_change(
-        self, page: Page, before_url: str, before_pages: set[int]
+        self,
+        page: Page,
+        before_url: str,
+        before_pages: set[int],
+        *,
+        expect_new_page: bool = False,
     ) -> tuple[dict[str, Any], bool, bool]:
         """Switch to a newly opened tab, settle navigation, and return a fresh observation."""
-        await asyncio.sleep(0.1)
-        open_pages = [p for p in self._pages() if not p.is_closed()]
-        new_pages = [p for p in open_pages if id(p) not in before_pages]
+        deadline = asyncio.get_running_loop().time() + (
+            _POPUP_WAIT_SECONDS if expect_new_page else 0.1
+        )
+        new_pages: list[Page] = []
+        while True:
+            await asyncio.sleep(0.05)
+            open_pages = [p for p in self._pages() if not p.is_closed()]
+            new_pages = [p for p in open_pages if id(p) not in before_pages]
+            if new_pages or page.url != before_url:
+                break
+            if asyncio.get_running_loop().time() >= deadline:
+                break
         new_tab = bool(new_pages)
         if new_pages:
             self._active_page = new_pages[-1]
@@ -1379,6 +1588,9 @@ class BrowserService:
 
             page = self.active_page
             locator = await self._resolve_visible(ref) if ref else None
+            expect_new_page = (
+                await self._opens_new_page(locator) if locator is not None else False
+            )
             # A click frequently triggers a request (link/submit/XHR); pace it per host too.
             await get_request_pacer().pace(host_of(self._current_url()), counts_as_request=True)
             before_url = page.url
@@ -1423,7 +1635,10 @@ class BrowserService:
                 executed_via += "+javascript-retry"
 
             data, page_changed, new_tab = await self._observe_action_change(
-                page, before_url, before_pages
+                page,
+                before_url,
+                before_pages,
+                expect_new_page=expect_new_page,
             )
             data["action_result"] = {
                 "action": "double_click" if double else "click",

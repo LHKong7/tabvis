@@ -45,7 +45,7 @@ export function AgentList({ agents, selected, onSelect }: Props) {
                 <span className={`status s-${a.status}`}>{a.status}</span>
                 <span className="id">{a.agent_id}</span>
               </div>
-              <p className="p">{a.prompt}</p>
+              <p className="p">{a.prompt || 'No prompt recorded'}</p>
               <div className="meta">
                 {a.turns} turns · {a.tool_calls} tools · {ms(a.duration_ms)}
                 {a.profile ? ` · ${a.profile}` : ' · isolated'}

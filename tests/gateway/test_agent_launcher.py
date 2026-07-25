@@ -20,7 +20,15 @@ from tabvis.gateway.runtime.run_store import RunStore
 
 def _assistant(text: str, tool_uses: int = 0) -> dict:
     content = [{"type": "text", "text": text}]
-    content += [{"type": "tool_use", "name": "click", "id": f"t{i}"} for i in range(tool_uses)]
+    content += [
+        {
+            "type": "tool_use",
+            "name": "BrowserExtract",
+            "id": f"t{i}",
+            "input": {"url": "https://example.test/document-1991237455038119936"},
+        }
+        for i in range(tool_uses)
+    ]
     return {"type": "assistant", "message": {"content": content}}
 
 
@@ -57,6 +65,12 @@ def test_launch_drives_run_to_completed_with_counters() -> None:
         assert "assistant.message.completed" in types
         assert "tool.completed" in types
         assert types[-1] == "run.completed"
+        tool_event = next(
+            e for e in get_event_store().read(aggregate_id=run.run_id)
+            if e.type == "tool.completed"
+        )
+        assert tool_event.data["name"] == "BrowserExtract"
+        assert tool_event.data["input"]["url"].endswith("1991237455038119936")
 
     asyncio.run(scenario())
 

@@ -226,7 +226,11 @@ async def list_agents_compat(request: Request) -> Response:
             seen.add(agent.agent_id)
             run = gateway.runs.latest_run_for_agent(agent.agent_id)
             views.append(
-                project_run_as_agent(run, agent.to_dict()) if run is not None
+                project_run_as_agent(
+                    run,
+                    agent.to_dict(),
+                    result=gateway.runs.get_result(run.run_id),
+                ) if run is not None
                 else project_agent_only(agent.to_dict())
             )
         # Any run whose agent has no durable row (pre-convergence data) — belt-and-suspenders.
@@ -234,7 +238,13 @@ async def list_agents_compat(request: Request) -> Response:
             if run.agent_id in seen or not principal.can_access_agent(run.agent_id):
                 continue
             seen.add(run.agent_id)
-            views.append(project_run_as_agent(run, None))
+            views.append(
+                project_run_as_agent(
+                    run,
+                    None,
+                    result=gateway.runs.get_result(run.run_id),
+                )
+            )
         status = request.query_params.get("status")
         if status:
             views = [v for v in views if v["status"] == status]
@@ -260,7 +270,13 @@ async def read_agent_compat(request: Request) -> Response:
             if agent is not None:  # a durable agent that has not run yet (design §7.2 zero-run agent)
                 return JSONResponse(project_agent_only(agent.to_dict()))
             return JSONResponse({"error": "unknown agent_id"}, status_code=404)
-        return JSONResponse(project_run_as_agent(run, agent.to_dict() if agent else None))
+        return JSONResponse(
+            project_run_as_agent(
+                run,
+                agent.to_dict() if agent else None,
+                result=gateway.runs.get_result(run.run_id),
+            )
+        )
     except GatewayError as e:
         return _error_response(e)
 

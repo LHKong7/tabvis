@@ -19,6 +19,7 @@ from tabvis.agent.tools.ask_user_question_tool import ask_user_question_tool as 
 from tabvis.agent.tools.bash_tool import bash_tool as _bash_tool
 from tabvis.agent.tools.browser_click_tool import browser_click_tool as _browser_click_tool
 from tabvis.agent.tools.browser_download_tool import browser_download_tool as _browser_download_tool
+from tabvis.agent.tools.browser_extract_tool import browser_extract_tool as _browser_extract_tool
 from tabvis.agent.tools.browser_intent_tool import browser_intent_tool as _browser_intent_tool
 from tabvis.agent.tools.browser_keys_tool import browser_keys_tool as _browser_keys_tool
 from tabvis.agent.tools.browser_authenticate_tool import browser_authenticate_tool as _browser_authenticate_tool
@@ -69,6 +70,7 @@ def get_all_base_tools() -> list[Tool]:
         _notebook_edit_tool,
         _browser_navigate_tool,
         _browser_snapshot_tool,
+        _browser_extract_tool,
         _browser_click_tool,
         _browser_type_tool,
         _browser_scroll_tool,

@@ -30,7 +30,13 @@ _SENSITIVE_KEYS = re.compile(
     re.IGNORECASE,
 )
 _EMAIL = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
-_PHONE = re.compile(r"(?<!\d)(\+?\d[\d\-\s]{7,}\d)(?!\d)")
+# Do not start a phone match in a URL/path/query token.  The old digit-only boundary treated
+# opaque web identifiers as phone numbers, so paths such as ``/document-1991237455038119936`` and
+# ``/Archives/edgar/data/1577551/...`` were rewritten to ``[redacted]`` before the browser result
+# reached the model.  A later digit cannot become a partial match because the preceding character
+# is itself a digit.  Natural-language phone numbers (including the formatted form covered by the
+# policy) still match.
+_PHONE = re.compile(r"(?<![\w/=?#&.\-])(\+?\d[\d\-\s]{7,}\d)(?![\w/?#&.\-])")
 
 REDACTED = "[redacted]"
 

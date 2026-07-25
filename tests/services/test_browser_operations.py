@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from types import MethodType, SimpleNamespace
 
 import pytest
 from pydantic import ValidationError
@@ -112,3 +113,56 @@ def test_page_scroll_reaches_javascript_fallback() -> None:
     )
     assert mechanism == "javascript"
     assert page.scrolls == [500]
+
+
+class _Tab:
+    def __init__(self, url: str) -> None:
+        self.url = url
+
+    def is_closed(self) -> bool:
+        return False
+
+    async def wait_for_load_state(self, *_args, **_kwargs) -> None:
+        return None
+
+
+class _TargetBlankLocator:
+    async def evaluate(self, script: str) -> bool:
+        assert "target" in script and "window" in script
+        return True
+
+
+def test_target_blank_hint_is_detected() -> None:
+    assert asyncio.run(BrowserService._opens_new_page(_TargetBlankLocator())) is True  # type: ignore[arg-type]
+
+
+def test_observe_action_waits_for_delayed_popup_and_switches_to_it() -> None:
+    async def scenario() -> tuple[dict, bool, bool, BrowserService, _Tab]:
+        service = BrowserService()
+        old = _Tab("https://example.test/list")
+        popup = _Tab("https://example.test/report")
+        context = SimpleNamespace(pages=[old])
+        service._context = context  # type: ignore[assignment]
+        service._active_page = old  # type: ignore[assignment]
+
+        async def observe(_self: BrowserService, *, include_screenshot: bool = False) -> dict:
+            assert include_screenshot is False
+            return {"url": _self.active_page.url}
+
+        service.observe = MethodType(observe, service)  # type: ignore[method-assign]
+
+        async def open_later() -> None:
+            await asyncio.sleep(0.2)
+            context.pages.append(popup)
+
+        task = asyncio.create_task(open_later())
+        result = await service._observe_action_change(
+            old, old.url, {id(old)}, expect_new_page=True  # type: ignore[arg-type]
+        )
+        await task
+        return *result, service, popup
+
+    data, changed, new_tab, service, popup = asyncio.run(scenario())
+    assert (changed, new_tab) == (True, True)
+    assert data["url"] == popup.url
+    assert service.active_page is popup
