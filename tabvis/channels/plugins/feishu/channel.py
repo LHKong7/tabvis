@@ -96,6 +96,11 @@ class FeishuChannel:
         ``url_verification`` challenge → signature. Any failure returns ``rejected=True`` and nothing
         is ingested.
         """
+        # Fail closed: with neither a verification token nor an encrypt key configured there is nothing
+        # to authenticate the sender, so every check below is skipped — reject rather than accept
+        # spoofable events on a misconfigured channel.
+        if not self._config.verification_token and not self._config.encrypt_key:
+            return FeishuWebhookResult(rejected=True, reason="channel not configured for verification")
         lower = {k.lower(): v for k, v in headers.items()}
         try:
             payload = json.loads(raw_body.decode("utf-8"))

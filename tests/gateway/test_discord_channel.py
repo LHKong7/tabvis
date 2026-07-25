@@ -67,6 +67,22 @@ def test_to_inbound_and_skips() -> None:
     assert ch._to_inbound(_message("m4", "chan1", "")) is None  # empty content (no MESSAGE_CONTENT)
 
 
+def test_own_message_dropped_even_when_allow_bots_on() -> None:
+    # Bug #10: with allow_bots on, our own message must still be dropped (bot_user_id is learned from
+    # the gateway READY dispatch) — otherwise the bot answers itself in an endless self-echo loop.
+    cfg = DiscordConfig(bot_token="s", bot_user_id=BOT_ID, allow_bots=True, channel_account_id=ACCOUNT)
+    ch = DiscordChannel(cfg, client=_FakeClient())
+    assert ch._to_inbound(_message("m1", "chan1", "loop", author_id=BOT_ID, bot=True)) is None  # ours
+    assert ch._to_inbound(_message("m2", "chan1", "hi", author_id="777", bot=True)) is not None  # other bot ok
+
+
+def test_id_less_message_is_dropped() -> None:
+    # Bug #18: an id-less MESSAGE_CREATE can't be deduped; drop it rather than collapse every id-less
+    # message onto one ledger key.
+    ch = _channel()
+    assert ch._to_inbound({"channel_id": "chan1", "content": "no id", "author": {"id": "111"}}) is None
+
+
 def test_client_loop_creates_run() -> None:
     async def scenario() -> None:
         gw = ChannelGateway()

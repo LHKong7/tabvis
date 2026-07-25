@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import pytest
 
+from tabvis.authentication import runtime as authentication_runtime_mod
+from tabvis.dlp import gateway as dlp_gateway_mod
 from tabvis.gateway.events import store as event_store_mod
 from tabvis.gateway.events import subscriptions
 from tabvis.gateway.runtime import interaction_service as interaction_mod
@@ -38,4 +40,6 @@ def _reset() -> None:
     orchestrator_mod._orchestrator = None
     context_mod._runtime = None
     browser_runtime_mod._runtime = None
+    authentication_runtime_mod.set_managed_authentication_runtime(None)
+    dlp_gateway_mod.set_dlp_gateway(None)
     subscriptions.reset_live_bus()

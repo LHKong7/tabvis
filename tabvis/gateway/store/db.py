@@ -27,7 +27,7 @@ from typing import Any, Iterator
 
 from tabvis.browser.persistence.paths import get_browser_os_data_dir
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 GATEWAY_DB_FILENAME = "gateway.db"
 
 _lock = threading.RLock()
@@ -199,6 +199,14 @@ _DDL = (
         data                TEXT NOT NULL
     )""",
     "CREATE INDEX IF NOT EXISTS idx_agents_status ON agents(status)",
+    # v7: the full final result text of a Run, kept out of the runs row (which is loaded on every
+    # list/projection) and out of events (bounded to a preview by §7.9). Read only when a finished Run's
+    # result must be delivered in full — e.g. a chat channel reply that must not be truncated.
+    """CREATE TABLE IF NOT EXISTS run_results (
+        run_id     TEXT PRIMARY KEY,
+        result     TEXT NOT NULL,
+        created_at TEXT
+    )""",
 )
 
 
@@ -311,6 +319,28 @@ def get_run_in(conn: sqlite3.Connection, run_id: str) -> dict[str, Any] | None:
     """Load a run within an open transaction (sees that transaction's uncommitted writes)."""
     row = conn.execute("SELECT data FROM runs WHERE run_id = ?", (run_id,)).fetchone()
     return json.loads(row["data"]) if row else None
+
+
+# --------------------------------------------------------------------------- run results (full text)
+
+
+def put_run_result(run_id: str, result: str, created_at: str | None = None) -> None:
+    """Persist (or replace) a Run's full result text — the untruncated final assistant message."""
+    with _lock:
+        conn = connect()
+        conn.execute(
+            "INSERT INTO run_results (run_id, result, created_at) VALUES (?, ?, ?) "
+            "ON CONFLICT(run_id) DO UPDATE SET result=excluded.result, created_at=excluded.created_at",
+            (run_id, result, created_at),
+        )
+        conn.commit()
+
+
+def get_run_result(run_id: str) -> str | None:
+    with _lock:
+        conn = connect()
+        row = conn.execute("SELECT result FROM run_results WHERE run_id = ?", (run_id,)).fetchone()
+    return row["result"] if row else None
 
 
 def get_run_status(conn: sqlite3.Connection, run_id: str) -> str | None:

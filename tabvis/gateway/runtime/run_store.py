@@ -25,7 +25,7 @@ from tabvis.gateway.protocol.errors import GatewayError
 from tabvis.gateway.protocol.events import AGGREGATE_RUN, EventScope, EventType
 from tabvis.gateway.protocol import ids
 from tabvis.gateway.runtime import runs
-from tabvis.gateway.runtime.agents import AgentStore
+from tabvis.gateway.runtime.agents import DELETED, DISABLED, AgentStore
 from tabvis.gateway.runtime.runs import RunRecord
 from tabvis.gateway.store import db
 
@@ -107,6 +107,22 @@ class RunStore:
             conversation_id=conversation_id, workspace_id=workspace_id,
         )
         with db.transaction() as conn:
+            # A disabled/deleted Agent cannot start new runs (design §7.2 lifecycle). A brand-new agent
+            # (no row yet) is created by ensure_in below on its first run, so the gate only fires for a
+            # pre-existing agent that has been taken out of service.
+            existing_agent = db.get_agent_in(conn, agent_id)
+            if existing_agent is not None:
+                agent_status = existing_agent.get("status")
+                if agent_status == DELETED:
+                    raise GatewayError(
+                        "NOT_FOUND", message="agent has been deleted",
+                        details={"agent_id": agent_id},
+                    )
+                if agent_status == DISABLED:
+                    raise GatewayError(
+                        "CONFLICT", message="agent is disabled and cannot start new runs",
+                        details={"agent_id": agent_id, "status": agent_status},
+                    )
             if not allow_concurrent:
                 active = db.count_active_runs_for_agent(conn, agent_id, _ACTIVE_STATES)
                 if active > 0:
@@ -230,6 +246,13 @@ class RunStore:
     def get_run(self, run_id: str) -> RunRecord | None:
         data = db.get_run(run_id)
         return RunRecord.from_dict(data) if data else None
+
+    def record_result(self, run_id: str, result: str) -> None:
+        """Persist a Run's full result text (out of the run row and events) for full-fidelity delivery."""
+        db.put_run_result(run_id, result, created_at=_utc_now())
+
+    def get_result(self, run_id: str) -> str | None:
+        return db.get_run_result(run_id)
 
     def list_runs_for_agent(self, agent_id: str, limit: int | None = None) -> list[RunRecord]:
         return [RunRecord.from_dict(d) for d in db.list_runs_for_agent(agent_id, limit)]

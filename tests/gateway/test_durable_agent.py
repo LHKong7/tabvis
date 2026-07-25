@@ -9,11 +9,11 @@ from tabvis.gateway.runtime.run_store import get_run_store
 from tabvis.gateway.store import db
 
 
-def test_schema_is_v6_with_agents_table() -> None:
-    assert db.SCHEMA_VERSION == 6
+def test_schema_is_v7_with_agents_and_run_results_tables() -> None:
+    assert db.SCHEMA_VERSION == 7
     conn = db.connect()
     names = {r["name"] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-    assert "agents" in names and "runs" in names
+    assert "agents" in names and "runs" in names and "run_results" in names
 
 
 def _agent_events(agent_id: str):
@@ -51,6 +51,55 @@ def test_second_run_refreshes_agent_without_duplicating() -> None:
     assert refreshed.default_model == "m2"                    # defaults refreshed
     types = [e.type for e in _agent_events("ag_a2")]
     assert EventType.AGENT_CREATED in types and EventType.AGENT_UPDATED in types
+
+
+def test_disabled_or_deleted_agent_cannot_start_new_run() -> None:
+    # Bug #6: create_run must gate on the durable Agent lifecycle. A disabled agent is a CONFLICT; a
+    # deleted one is NOT_FOUND. A brand-new agent (first run) is never gated.
+    import pytest
+
+    from tabvis.gateway.protocol.errors import GatewayError
+    from tabvis.gateway.runtime.agents import DELETED, DISABLED, get_agent_store
+
+    store = get_run_store()
+    store.create_run(agent_id="ag_gate", session_id="s", command_id="c1")  # creates ACTIVE agent
+    get_agent_store().set_status("ag_gate", DISABLED)
+    with pytest.raises(GatewayError) as disabled_err:
+        store.create_run(agent_id="ag_gate", session_id="s", command_id="c2", allow_concurrent=True)
+    assert disabled_err.value.code == "CONFLICT"
+
+    get_agent_store().set_status("ag_gate", DELETED)
+    with pytest.raises(GatewayError) as deleted_err:
+        store.create_run(agent_id="ag_gate", session_id="s", command_id="c3", allow_concurrent=True)
+    assert deleted_err.value.code == "NOT_FOUND"
+
+
+def test_noop_refresh_emits_no_agent_updated() -> None:
+    # Bug #15: a refresh that changes no durable field (the common case — same agent, same config, next
+    # run) must not churn the row or fan out an agent.updated event.
+    store = get_run_store()
+    store.create_run(agent_id="ag_same", session_id="s", command_id="c1", model="m", profile="p")
+    store.create_run(agent_id="ag_same", session_id="s", command_id="c2", model="m", profile="p",
+                     allow_concurrent=True)
+    types = [e.type for e in _agent_events("ag_same")]
+    assert types.count(EventType.AGENT_CREATED) == 1
+    assert EventType.AGENT_UPDATED not in types  # nothing durable changed → no update event
+
+
+def test_list_agents_limit_zero_and_negative_return_all() -> None:
+    # Bug #13: a 0 or negative ?limit is meaningless and must not truncate/slice-from-end.
+    from starlette.testclient import TestClient
+
+    from tabvis.gateway.access.http import create_gateway_app
+
+    app = create_gateway_app()
+    rs = app.state.gateway.runs
+    rs.create_run(agent_id="ag_lim1", session_id="s", command_id="c1")
+    rs.create_run(agent_id="ag_lim2", session_id="s", command_id="c2")
+    with TestClient(app) as client:
+        assert client.get("/v1/agents?limit=0").json()["count"] == 2
+        assert client.get("/v1/agents?limit=-1").json()["count"] == 2
+        assert client.get("/v1/agents?limit=1").json()["count"] == 1
 
 
 def test_zero_run_agent_and_lifecycle() -> None:

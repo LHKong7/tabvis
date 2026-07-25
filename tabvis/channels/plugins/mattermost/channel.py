@@ -168,9 +168,14 @@ class MattermostChannel(ClientLoopChannel):
         )
         if not text:
             return None  # empty or attachment-only post — nothing to run
+        post_id = post.get("id")
+        if not post_id:
+            # An id-less post can't be deduped; drop it rather than collapse every id-less post onto
+            # one ledger key (which would discard all but the first as "duplicates").
+            return None
         return InboundMessage(
             # post.id is the platform's per-message id → the gateway's dedupe key.
-            external_event_id=str(post.get("id") or ""),
+            external_event_id=str(post_id),
             external_conversation_id=channel_id,
             external_account_ref=self._account_id,
             text=text,

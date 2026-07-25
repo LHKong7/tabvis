@@ -165,3 +165,42 @@ def test_max_uses_enforced() -> None:
     assert _run(broker.authenticate(_request())).success
     second = _run(broker.authenticate(_request()))
     assert second.error_code == AuthErrorCode.PROFILE_EXPIRED.value
+
+
+def test_concurrent_authentication_is_atomically_exclusive() -> None:
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    class BlockingBrowser(FakeAuthBrowser):
+        async def inspect_context(self):
+            entered.set()
+            await release.wait()
+            return await super().inspect_context()
+
+    browser = BlockingBrowser()
+    broker = _make_broker(browser)
+
+    async def scenario():
+        first = asyncio.create_task(broker.authenticate(_request(browser_session_id="b1")))
+        await entered.wait()
+        second = await broker.authenticate(_request(browser_session_id="b2"))
+        release.set()
+        first_result = await first
+        return first_result, second
+
+    first, second = _run(scenario())
+    assert first.success
+    assert second.error_code == AuthErrorCode.BROWSER_LOCKED.value
+
+
+def test_audit_failure_prevents_success_when_fail_closed(monkeypatch) -> None:
+    browser = FakeAuthBrowser()
+
+    def broken_audit(_event):
+        raise OSError("audit unavailable")
+
+    monkeypatch.setenv("TABVIS_AUTH_AUDIT_FAIL_CLOSED", "1")
+    broker = _make_broker(browser, audit=broken_audit)
+    result = _run(broker.authenticate(_request()))
+    assert not result.success
+    assert result.error_code == AuthErrorCode.INTERNAL_AUTHENTICATION_ERROR.value

@@ -72,6 +72,10 @@ def _build_tool_use_context(
     agent_definitions: Any,
     commands: list[Any],
     store: Any,
+    agent_id: str,
+    principal_id: str,
+    session_id: str,
+    run_id: str,
 ) -> ToolUseContext:
     """Build the headless ``ToolUseContext`` used for slash-command processing and the model turn.
 
@@ -89,6 +93,23 @@ def _build_tool_use_context(
         agent_definitions=agent_definitions,
         commands=commands,
     )
+    browser_session_id = session_id
+    try:
+        from tabvis.gateway.runtime.browser.binding_context import current_binding_id
+
+        browser_session_id = current_binding_id() or session_id
+    except Exception:  # noqa: BLE001 - the legacy CLI has no Gateway BrowserBinding
+        pass
+
+    authentication_service = None
+    if is_env_truthy(os.environ.get("TABVIS_AUTHENTICATION_ENABLED")):
+        try:
+            from tabvis.authentication.runtime import get_managed_authentication_runtime
+
+            authentication_service = get_managed_authentication_runtime()
+        except Exception:  # noqa: BLE001 - the tool remains fail-closed when composition is invalid
+            authentication_service = None
+
     return ToolUseContext(
         options=options,
         abort_controller=AbortController(),
@@ -96,6 +117,12 @@ def _build_tool_use_context(
         set_app_state=store.set_state,
         messages=[],
         set_in_progress_tool_use_ids=lambda _f: None,
+        agent_id=agent_id,
+        principal_id=principal_id,
+        session_id=session_id,
+        run_id=run_id,
+        browser_session_id=browser_session_id,
+        authentication_service=authentication_service,
     )
 
 
@@ -404,6 +431,7 @@ async def stream_agent(
     # skipped the finally entirely, orphaning the browser AND leaking MCP clients.
     mcp_clients: list[Any] = []
     mcp_resources: dict[str, Any] = {}
+    authentication_service: Any = None
     try:
         if tools is None:
             tools, mcp_clients, mcp_resources = await _build_tools_with_mcp(permission_context)
@@ -426,7 +454,12 @@ async def stream_agent(
             agent_definitions=agent_definitions,
             commands=get_commands(get_cwd()),
             store=store,
+            agent_id=agent_id,
+            principal_id=principal_id,
+            session_id=session_id,
+            run_id=run_id,
         )
+        authentication_service = context.authentication_service
         slash_result = await _maybe_process_slash_command(prompt, context)
         seed_messages = slash_result["seed_messages"] if slash_result else None
         should_query = slash_result["should_query"] if slash_result else True
@@ -508,6 +541,14 @@ async def stream_agent(
                 run_status = "failed" if message.get("is_error") else "completed"
             yield message
     finally:
+        # Session Vault task isolation: terminal, failed, and cancelled runs all remove sessions that
+        # were not explicitly marked reusable by their credential profile.
+        if authentication_service is not None:
+            try:
+                await authentication_service.end_task(run_id)
+            except Exception:  # noqa: BLE001 - cleanup is fail-safe and must not mask the run result
+                pass
+
         # Flush the batched transcript write queue to disk before the loop/process exits. The
         # headless path has no graceful-shutdown hook, so the 100ms-batched appends queued by
         # record_transcript would otherwise be dropped when asyncio.run() closes the loop.

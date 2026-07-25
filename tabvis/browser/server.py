@@ -79,7 +79,11 @@ _ELIDED = "<elided:image-bytes>"
 
 def _sse(event: str, data: Any) -> dict[str, str]:
     """One SSE frame, in the shape sse-starlette's EventSourceResponse expects."""
-    return {"event": event, "data": json.dumps(data, default=str)}
+    from tabvis.dlp.gateway import get_dlp_gateway
+
+    decision = get_dlp_gateway().scrub("api", data)
+    safe = {"error": "dlp_blocked"} if decision.blocked else decision.payload
+    return {"event": event, "data": json.dumps(safe, default=str)}
 
 
 async def _ws_pump(websocket: Any, queue: "asyncio.Queue[Any]") -> None:
@@ -541,7 +545,9 @@ def create_app(auth_required: bool = False, dev: bool = False) -> Any:
         # Cancel the active Run (if any) and close the bundled browser — the "user quit" action.
         gateway = _gateway_of(request)
         run = gateway.runs.latest_run_for_agent(agent_id) if gateway is not None else None
-        status = legacy_status(run.status) if run is not None else "cancelled"
+        # A never-run agent has nothing to cancel — report the zero-run status GET /agents/{id} also
+        # projects ("queued"), not a false "cancelled".
+        status = legacy_status(run.status) if run is not None else "queued"
         if run is not None and not run.is_terminal:
             try:
                 await gateway.orchestrator.cancel(run.run_id)
@@ -569,7 +575,17 @@ def create_app(auth_required: bool = False, dev: bool = False) -> Any:
             return denied
         if not _durable_agent_exists(request, agent_id):
             return JSONResponse({"error": "unknown agent_id"}, status_code=404)
-        session_id = _durable_agent_session(request, agent_id) or ""
+        session_id = _durable_agent_session(request, agent_id)
+        if not session_id:
+            # The agent has no Run/session yet, so it has no artifacts. Crucially, never pass an empty
+            # session id down: artifacts.py resolves "" to the process's *current* session, which would
+            # leak another agent's browsing trail (cross-agent / cross-principal disclosure).
+            if request.query_params.get("dom"):
+                return JSONResponse({"error": "unknown dom_ref"}, status_code=404)
+            return JSONResponse(
+                {"agent_id": agent_id, "summary": {"count": 0, "by_type": {}, "last_url": None},
+                 "artifacts": [], "count": 0}
+            )
 
         dom_ref = request.query_params.get("dom")
         if dom_ref:
@@ -801,6 +817,11 @@ def create_app(auth_required: bool = False, dev: bool = False) -> Any:
                     pass
             if _dev_server is not None:
                 await _dev_server.stop()
+            if gw is not None and getattr(gw, "authentication", None) is not None:
+                try:
+                    await gw.authentication.close()
+                except Exception:  # noqa: BLE001 - best-effort
+                    pass
             # Drain the gateway (stop accepting, close its store) before the browser cleanup.
             if gw is not None:
                 try:

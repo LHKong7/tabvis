@@ -187,7 +187,202 @@ RPC、任务历史、Session Transcript、Browser Artifact、普通日志、审�
   AAD 绑定 user+task+profile+session、任务级隔离与跨任务复用门控、级联删除）。
 - **Phase 5 ✅**：全链路 DLP 与外部 Provider。`tabvis/dlp/`（gateway、url、text、image）、
   Canary 命中即失败关闭、1Password/Vault Provider。DLP 接入现有各出口的落地为后续集成工作。
+- **Phase 6 🚧**：Managed Authentication Runtime Integration。首批运行时集成已落地（可信上下文、
+  Tool→Broker 调用链、Playwright Controller、租约心跳/取消、Vault 生命周期和主要 DLP 出口）；
+  L2 部署与完整生产安全验收仍在进行。把 Phase 0–5 的独立组件接入
+  Gateway、CLI、Run Orchestrator 和真实 Playwright Browser Runtime，形成可启用、可取消、
+  可恢复并可通过生产安全验收的端到端认证链路。详细计划见 §16。
 
-> 说明：所有阶段的安全逻辑均已实现并有单元/集成测试覆盖。L2 强隔离（独立 OS 用户/容器/远程
-> Worker）、真实 Playwright Browser Host 的落地、以及把 DLP Gateway 接入现有每一个出口，属于依赖
-> §18 决策项的部署与集成工作。
+> 说明：Phase 0–5 的组件级安全逻辑已实现并有单元测试覆盖，但尚未形成生产端到端链路。
+> L2 强隔离（独立 OS 用户/容器/远程 Worker）、真实 Playwright Browser Host，以及把 DLP
+> Gateway 接入每一个出口，统一纳入 Phase 6；相关部署选择仍依赖完整规范中的 §18 决策项。
+
+## 16. Phase 6 — Managed Authentication Runtime Integration
+
+### 16.1 目标与完成定义
+
+Phase 6 的目标不是新增另一套认证核心，而是把 Phase 0–5 已有的模型、Broker、Executor、
+Browser Host、Session Vault 和 DLP 组件装配进默认运行时。完成后：
+
+1. `TABVIS_AUTHENTICATION_ENABLED=1` 暴露的 `BrowserAuthenticate` 必须执行真实认证，不得再
+   固定返回 `internal_authentication_error`。
+2. Agent 仍然只能提交 `credential_profile_id`；`task_id`、`user_id`、`agent_id`、
+   `browser_session_id`、Origin 和 Capability 必须来自可信运行时。
+3. 开发模式可以使用 L0 便于调试；L1 使用独立 Broker 进程；生产模式必须使用 L2，并在无法满足
+   隔离、审计或安全 Secret Provider 要求时失败关闭。
+4. 认证成功、失败、超时、取消、进程崩溃和 Run 结束都必须有确定的清理路径。
+5. 所有可能离开受信任域的数据必须经过统一 DLP Gateway。
+
+Phase 6 未通过 §16.10 的验收门槛前，托管认证保持默认关闭，不得宣称生产可用。
+
+### 16.2 Gateway / CLI 的 Broker 生命周期与配置装配
+
+Gateway 与 CLI 必须复用同一个 composition root，负责构建并管理托管认证依赖：
+
+- 根据 `TABVIS_CREDENTIAL_BROKER_MODE` 选择 L0、L1 或 L2；不允许生产配置静默降级到较低级别。
+- 解析 `TABVIS_CREDENTIAL_BROKER_ENDPOINT`，校验 Unix socket 路径、父目录权限、所有者和平台
+  长度限制；未显式配置时使用短且权限受控的运行时目录。
+- 在 `--serve` 启动时启动或连接 Broker，执行 startup hardening 和健康检查；关闭时停止接收新
+  请求、等待或取消在途认证、删除 socket，并回收过期 Capability 和租约。
+- one-shot CLI 只为当前进程/Run 建立短生命周期 Broker；无论正常退出还是异常退出都执行清理。
+- 装配 Profile Store、Secret Provider、Approval Service、Audit Sink、Capability Store、
+  Browser Host client、Session Vault 和 DLP Gateway，不允许各入口自行创建不一致的单例。
+- 配置缺失、Secret Provider 不安全、审计不可用或 Broker 不健康时，工具应返回稳定错误码并且
+  不解析任何秘密。
+
+### 16.3 Orchestrator 注入可信运行上下文
+
+Run Orchestrator 是 Agent 请求与 Broker 内部请求之间唯一可信的上下文桥梁：
+
+- Agent 工具输入继续由 `AgentAuthenticationRequest` 校验，字段只能是
+  `credential_profile_id`，额外字段必须拒绝。
+- Orchestrator 从当前 Durable Agent、Run、Browser Binding 和认证主体中读取
+  `task_id`、`user_id`、`agent_id` 和 `browser_session_id`，并生成唯一 `request_id`。
+- 不得信任模型消息、工具参数、URL 参数或客户端请求体中同名字段。
+- 创建内部 `AuthenticationRequest` 前必须检查 Run 仍处于可执行状态、Browser Binding 属于
+  当前 Agent、用户主体未变化且请求尚未取消。
+- 取消状态必须持续传播到 Broker/Executor；不能只在发起请求时做一次快照。
+- 可信上下文缺失、冲突或过期时失败关闭，并返回稳定错误码，不把内部标识或异常细节返回 Agent。
+
+### 16.4 `BrowserAuthenticateTool → BrokerClient → Broker` 调用链
+
+`BrowserAuthenticateTool.call()` 必须改为调用由运行时注入的认证服务，而不是直接读取
+Secret Store 或 BrowserService：
+
+1. 工具校验 `credential_profile_id` 并向 Orchestrator 提交 Agent-visible 请求。
+2. Orchestrator 使用 §16.3 的可信字段调用 `enrich_request()`。
+3. 根据运行模式选择 `InProcessBrokerClient` 或 `SocketBrokerClient`，设置总超时并绑定取消信号。
+4. Broker 重新读取 Profile 所有权和实时浏览器上下文，执行 Policy、Approval、Capability 和
+   Executor 流程。
+5. 返回值必须重新通过严格的 `AuthenticationResult` schema，只允许
+   `success`、`authenticated_origin`、`requires_human_interaction` 和 `error_code`。
+6. IPC 断开、超时、Broker 重启或响应格式错误时，Capability、租约和敏感字段必须被清理，工具
+   只返回稳定错误码。
+
+Broker 的并发控制必须在一个原子临界区中完成“检查并占有”，同一 Browser Session 也不得同时
+执行两个认证。`max_uses` 的检查与成功计数更新必须具备同等级的原子性或持久化事务保证。
+
+### 16.5 真实 Playwright `PageController`
+
+Browser Host 内实现 Playwright-backed `PageController`，并保持受限接口：
+
+- Browser Host 独占 `Browser`、`BrowserContext`、`Page`、CDP endpoint 和 profile path；这些对象
+  或地址不得返回 Agent、Broker 或 Executor。
+- `current_context()` 从实时 Playwright frame tree 计算 top-level/frame/ancestor Origins、
+  `page_id` 和单调递增的 `navigation_generation`，不能接受调用方声明的 Origin。
+- `find_field()` 只返回 Browser Host 生成的短生命周期 opaque handle；handle 必须绑定
+  page/frame/navigation generation，并在导航或租约结束时失效。
+- `type_bytes()` 是秘密进入浏览器的唯一接口。每次输入前重新验证 Capability、页面、完整 frame
+  链、HTTPS 和证书状态；实现不得把秘密写入普通日志、trace、异常参数或 Agent-visible tool input。
+- `clear_fields()` 必须覆盖 username/password/TOTP 字段；无法确认清理成功时销毁整个
+  BrowserContext，而不是把上下文归还普通浏览器工具。
+- 认证期间禁止 screenshot、DOM snapshot、evaluate、download 和普通 browser RPC；认证后的第一
+  次可见捕获应用 `post_auth_redaction_spec()`。
+
+### 16.6 认证租约心跳、取消与崩溃恢复
+
+- `begin_authentication()` 获取租约后必须自动启动心跳任务，心跳间隔不得超过 TTL 的三分之一；
+  调用方不应依赖手工调用 `lease.heartbeat()`。
+- 心跳续租、过期回收和释放必须使用跨进程原子机制，校验 `lease_id` 后再更新或删除，禁止旧持有者
+  覆盖新租约。
+- 用户取消、Run 取消、总超时、Broker/Executor 崩溃和 Browser Host 断连都必须触发同一清理
+  状态机：停止输入、失效 Capability、清理字段、终止心跳、释放租约，并在不确定时销毁 Context。
+- Browser Host 启动时回收过期租约；回收期间普通 Agent RPC 仍然失败关闭。
+- 人工确认、push MFA 等长流程必须在显式总超时内保持租约，不得因固定 120 秒 TTL 静默解锁。
+
+### 16.7 Session Vault 创建、恢复与清理
+
+- 只有在强认证成功信号成立、最终 Origin 合法且敏感字段已清理后，Browser Host 才能导出
+  `storage_state` 并交给 Session Vault 加密保存。
+- 创建会话时使用 Profile 的 TTL、可复用策略和 allowed Origins；持久化内容只能是加密 envelope，
+  不得回退到明文文件。
+- 恢复前重新检查同一用户、任务绑定、Profile 状态、过期/撤销状态和 requested Origins；恢复操作
+  必须发生在 Browser Host 内，原始 cookie/token/storage state 不得经过 Agent 或普通 Gateway API。
+- Run/Task 结束时删除不可跨任务复用的会话；Profile 禁用、删除、用户撤销或密钥轮换失败时执行
+  级联删除；启动和定时维护时清理过期记录。
+- 解密失败、key id 不匹配或记录损坏时失败关闭并删除不可恢复记录，不得返回部分状态。
+
+### 16.8 DLP 出口接入
+
+运行时只创建一个统一 `DLPGateway`，以下出口在序列化或写入前必须调用它：
+
+- 模型请求与工具结果；
+- Session Transcript、Run 事件和 Context Pack；
+- Browser Artifact、截图元数据、下载元数据和错误页面摘要；
+- 普通日志、审计、遥测和 crash report；
+- Gateway/legacy HTTP API 与 SSE 响应；
+- 临时文件、调试 trace 和人工交接材料。
+
+DLP 必须同时处理 header、URL、嵌套 mapping/list、Pydantic model 和其他实际使用的 payload
+形态。Canary 或禁止对象命中时必须阻止整个出口，并触发统一响应：失效 Capability、结束认证租约、
+把关联 Session 标记为不可复用、写入不含秘密的 `dlp.secret_blocked` 审计事件。DLP hook 自身失败
+不能把阻止结果改成放行。
+
+### 16.9 实施顺序
+
+建议按以下可独立验收的切片交付：
+
+1. **Composition**：Gateway/CLI 生命周期、配置校验、Broker health 与安全启动/停止。
+2. **Trusted call path**：Orchestrator 上下文注入和
+   `BrowserAuthenticateTool → BrokerClient → Broker`。
+3. **Browser isolation**：真实 `PageController`、跨进程租约、心跳、取消和 Context 销毁。
+4. **Session lifecycle**：Session Vault 保存、恢复、Run/Task 清理和撤销级联。
+5. **Egress enforcement**：DLP 接入全部出口并删除现存旁路。
+6. **Production gate**：L2 部署、跨平台测试、故障注入、安全评审和发布文档。
+
+每个切片必须默认关闭或保持失败关闭，不能为了让后续切片可开发而临时把秘密暴露给 Agent。
+
+### 16.10 测试与生产安全验收
+
+Phase 6 至少需要以下自动化测试：
+
+- 一条真实工具调用的端到端测试，证明启用后不再固定返回
+  `internal_authentication_error`，并且 Agent 只看到 `AuthenticationResult`。
+- Gateway daemon 与 one-shot CLI 两种 composition 的启动、健康、关闭和崩溃恢复测试。
+- 并发认证、同 session 重入、`max_uses`、Capability 重放和租约过期/回收竞态测试。
+- 导航、iframe 切换、HTTP 降级、证书错误、恶意 selector/handle 和页面替换的对抗测试。
+- 用户取消、Run 取消、Broker/Browser Host/Executor 崩溃、IPC 截断和超时的故障注入测试。
+- 长于默认租约 TTL 的人工 MFA 流程测试，证明心跳期间普通 Browser RPC 始终被拒绝。
+- Session Vault 的同用户/跨任务/Origin 约束、过期、撤销、密钥错误和无明文回退测试。
+- 对模型、Transcript、Artifact、日志、审计、遥测、API/SSE 和 crash report 的 DLP Canary
+  测试，并覆盖混合 header/body、嵌套对象和模型对象。
+- Linux/macOS 的 Unix socket、peer credential、权限和路径长度测试；生产支持 Windows 时补充
+  等价 IPC 与 ACL 测试。
+- 安装矩阵测试，证明基础安装或明确的 managed-auth extra 包含 Session Vault 所需加密依赖。
+
+生产发布必须同时满足：
+
+1. L2 隔离通过安全评审，Agent Runtime 无法读取 Secret Provider、Broker 内存、Browser profile、
+   CDP endpoint、原始 cookie 或 storage state。
+2. `TABVIS_AUTH_AUDIT_FAIL_CLOSED=1` 时，审计写入失败会阻止认证成功，而不是吞掉异常继续执行。
+3. 任何失败路径都不会在模型上下文、工具参数、日志、异常、Artifact、Transcript 或 API 中出现
+   测试秘密。
+4. 完整测试、静态检查和跨平台 IPC 测试通过，且没有依靠跳过安全测试获得绿色结果。
+5. 运维文档说明配置、启动、密钥轮换、撤销、审计、故障恢复和降级策略。
+
+### 16.11 当前编码进度
+
+已落地：
+
+- `authentication/runtime.py` 成为 CLI/Gateway 共用 composition root。开发模式装配 L0
+  `CredentialBroker`；`ipc`/`production` 使用经过路径、类型、所有者和 `0600` 权限校验的 Unix
+  socket。生产模式缺少显式 L2 验证或安全 Secret Backend 时启动失败关闭。
+- `ToolUseContext` 由 Orchestrator 注入 principal/run/session/browser binding；
+  `BrowserAuthenticateTool` 只构造 `AgentAuthenticationRequest`，经 Runtime、BrokerClient 和
+  Broker 执行，并重新校验严格的 `AuthenticationResult`。
+- Browser Host 已接入真实 `PlaywrightPageController`、BrowserService 动作互斥、跨进程租约锁、
+  自动心跳、取消/超时 Capability 失效、字段清理、必要时 Context 销毁和首次认证后截图遮罩。
+- Broker 的并发占有改为原子临界区；Session Vault 已接入成功创建、强 Cookie 信号恢复、任务结束
+  清理、Profile 禁用/删除级联撤销和启动过期清理。
+- 模型工具结果、Transcript、Context Pack、Run preview、Browser Artifact、HTTP/SSE 和认证审计
+  已接入统一 DLP Gateway；Canary 命中会使在途认证 Context 标记为销毁、清空 Capability 并撤销
+  活跃 Profile 的 Vault session。
+- 自动化测试覆盖 Tool→Runtime→Broker→Browser/Vault、可信上下文缺失、取消、租约心跳、Broker
+  并发、审计失败关闭、DLP 混合对象和真实 Chromium PageController。
+
+尚未作为“Phase 6 完成”验收：
+
+- L2 Broker 的独立 OS 用户/容器/远程 Worker 启停与健康协议仍属于部署工作；当前 production gate
+  会在未显式确认 L2 时拒绝启动。
+- 仍需完成 Linux/macOS IPC 矩阵、Broker/Browser Host/Executor 崩溃故障注入、真实 MFA 长流程、
+  全部遥测/crash-report/临时 trace 出口审计，以及正式安全评审和运维 runbook。

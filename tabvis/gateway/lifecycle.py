@@ -10,6 +10,7 @@ Phase 3 control-plane slice needs: open the store, register handlers, report rea
 
 from __future__ import annotations
 
+import os
 from typing import Any, Literal
 
 from tabvis.gateway.events.store import EventStore, get_event_store
@@ -23,6 +24,7 @@ from tabvis.gateway.runtime.interaction_service import InteractionService, get_i
 from tabvis.gateway.runtime.orchestrator import RunLauncher, RunOrchestrator
 from tabvis.gateway.runtime.run_store import RunStore, get_run_store
 from tabvis.gateway.store import db
+from tabvis.utils.env_utils import is_env_truthy
 
 GatewayStatus = Literal[
     "starting", "migrating", "loading", "ready", "degraded", "draining", "stopped", "failed"
@@ -55,6 +57,10 @@ class GatewayApplication:
         self.status: GatewayStatus = "starting"
         # Optional IM channel runtime, attached by the server when TABVIS_CHANNELS is set (design §4).
         self.channels: Any = None
+        # Managed-authentication composition is process-scoped and shared by Gateway Runs. It is
+        # created during startup (not from model input) so invalid production wiring fails before
+        # the service advertises readiness.
+        self.authentication: Any = None
 
     # --- construction ---------------------------------------------------------------------------
 
@@ -92,6 +98,10 @@ class GatewayApplication:
         except Exception:  # noqa: BLE001
             pass
         self.status = "loading"
+        if is_env_truthy(os.environ.get("TABVIS_AUTHENTICATION_ENABLED")):
+            from tabvis.authentication.runtime import get_managed_authentication_runtime
+
+            self.authentication = get_managed_authentication_runtime()
         self.status = "ready" if self.orchestrator.has_launcher else "degraded"
 
     def drain(self) -> None:
@@ -127,6 +137,11 @@ class GatewayApplication:
                 "event_store": store_state,
                 "agent_runtime": agent_state,
                 "browser_runtime": "not_configured",
+                "authentication": (
+                    "ready"
+                    if self.authentication is not None and self.authentication.healthy
+                    else "not_configured"
+                ),
                 "channels": self.channels.health() if self.channels is not None else {},
             },
             "capacity": {"runs": self.max_runs, "available": max(0, self.max_runs - active)},

@@ -239,7 +239,7 @@ async def list_agents_compat(request: Request) -> Response:
         if status:
             views = [v for v in views if v["status"] == status]
         limit = _int_param(request, "limit")
-        if limit:
+        if limit is not None and limit > 0:  # a 0 or negative limit is meaningless — return all
             views = views[:limit]
         return JSONResponse({"agents": views, "count": len(views)})
     except GatewayError as e:

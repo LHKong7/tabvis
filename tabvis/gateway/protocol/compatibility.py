@@ -140,7 +140,7 @@ def project_agent_list(
     agents = [project_run_as_agent(r, by_id.get(r.agent_id)) for r in latest_runs]
     if status:
         agents = [a for a in agents if a["status"] == status]
-    if limit:
+    if limit is not None and limit > 0:  # a 0 or negative limit is meaningless — return all
         agents = agents[:limit]
     return {"agents": agents, "count": len(agents)}
 

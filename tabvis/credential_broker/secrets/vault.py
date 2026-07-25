@@ -25,7 +25,7 @@ class VaultProvider:
     async def resolve(self, secret_ref: str) -> SecretValue:
         try:
             plaintext = await self._fetch(secret_ref)
-        except Exception as exc:  # noqa: BLE001 - any transport error is "unavailable", not a leak
+        except Exception:  # noqa: BLE001 - any transport error is "unavailable", not a leak
             raise SecretProviderUnavailable("vault fetch failed") from None
         if plaintext is None:
             raise SecretProviderUnavailable("secret not found for ref")

@@ -226,10 +226,23 @@ async def record_browser_artifact(event: dict[str, Any], data: dict[str, Any]) -
         if is_browser_artifacts_dom_enabled():
             html = await _capture_dom()
             if html:
-                ref, nbytes = await asyncio.to_thread(_store_dom_sync, directory, html)
-                record["dom_ref"] = ref
-                record["dom_bytes"] = nbytes
+                from tabvis.dlp.gateway import get_dlp_gateway
 
+                dom_dlp = get_dlp_gateway().scrub("artifact", html)
+                if not dom_dlp.blocked:
+                    ref, nbytes = await asyncio.to_thread(
+                        _store_dom_sync, directory, str(dom_dlp.payload)
+                    )
+                    record["dom_ref"] = ref
+                    record["dom_bytes"] = nbytes
+
+        from tabvis.dlp.gateway import get_dlp_gateway
+
+        dlp = get_dlp_gateway().scrub("artifact", record)
+        if dlp.blocked or not isinstance(dlp.payload, dict):
+            log_for_debugging("[DLP] blocked browser artifact persistence")
+            return
+        record = dlp.payload
         await asyncio.to_thread(_append_event_sync, directory, record)
 
         # PERS-4: index the event in the SQLite metadata store. Best-effort — the JSONL log above
@@ -310,6 +323,13 @@ async def record_download_artifact(
         }
         if extra:
             record.update(extra)
+        from tabvis.dlp.gateway import get_dlp_gateway
+
+        dlp = get_dlp_gateway().scrub("artifact", record)
+        if dlp.blocked or not isinstance(dlp.payload, dict):
+            log_for_debugging("[DLP] blocked download artifact persistence")
+            return
+        record = dlp.payload
         await asyncio.to_thread(_append_event_sync, directory, record)
         try:
             from tabvis.bootstrap.state import get_session_id

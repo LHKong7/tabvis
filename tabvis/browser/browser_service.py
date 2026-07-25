@@ -243,6 +243,7 @@ class BrowserService:
         # have already been announced so each is reported once.
         self._downloads: list[dict[str, Any]] = []
         self._downloads_reported = 0
+        self._post_auth_redaction_pending = False
 
     # ------------------------------------------------------------------ lifecycle
 
@@ -638,6 +639,22 @@ class BrowserService:
         self._active_page = None
         self._snapshot_page = None
 
+    @contextlib.asynccontextmanager
+    async def authentication_control(self):
+        """Reserve the browser action lane for one managed-authentication transaction.
+
+        Ordinary actions already serialize on ``_action_lock``. Holding the same lock from before the
+        authentication lease is acquired until fields are cleared closes the policy-check/action race:
+        an Agent action can finish before authentication starts or wait until it ends, but cannot
+        interleave with secret injection.
+        """
+        async with self._action_lock:
+            yield
+
+    def arm_post_auth_redaction(self) -> None:
+        """Mask sensitive inputs in the first screenshot emitted after managed authentication."""
+        self._post_auth_redaction_pending = True
+
     def is_alive(self) -> bool:
         return self._context is not None and not self._closed
 
@@ -926,10 +943,18 @@ class BrowserService:
 
         if attach_visual:
             with contextlib.suppress(Exception):
+                mask = []
+                if self._post_auth_redaction_pending:
+                    selectors = (
+                        "input[type='password'], input[autocomplete='one-time-code'], "
+                        "input[autocomplete='username'], input[type='email']"
+                    )
+                    mask = [frame.locator(selectors) for frame in page.frames]
                 png = await asyncio.wait_for(
-                    page.screenshot(type="png"), timeout=self._timeout_s()
+                    page.screenshot(type="png", mask=mask), timeout=self._timeout_s()
                 )
                 data["screenshot_b64"] = base64.b64encode(png).decode("ascii")
+                self._post_auth_redaction_pending = False
         return data
 
     async def _build_snapshot(self, page: Page, *, boxes: bool = False) -> str:

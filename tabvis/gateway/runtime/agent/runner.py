@@ -21,7 +21,7 @@ default is the real :func:`tabvis.ui.cli.print.stream_agent`.
 from __future__ import annotations
 
 import asyncio
-from typing import Any, Awaitable, Callable
+from typing import Any, Callable
 
 from tabvis.gateway.events.store import EventStore, get_event_store
 from tabvis.gateway.protocol.errors import GatewayError
@@ -61,6 +61,24 @@ def _assistant_text(message: dict[str, Any]) -> str:
         parts = [b.get("text", "") for b in content if isinstance(b, dict) and b.get("type") == "text"]
         return "".join(parts)
     return ""
+
+
+def _safe_preview(surface: str, value: str | None) -> str:
+    """DLP-gate content before it enters the durable event log / API projection."""
+    from tabvis.dlp.gateway import get_dlp_gateway
+
+    decision = get_dlp_gateway().scrub(surface, value or "")
+    if decision.blocked:
+        return "[dlp_blocked]"
+    return str(decision.payload)[:_PREVIEW_CHARS]
+
+
+def _safe_full(value: str | None) -> str:
+    """DLP-gate a Run's full result for delivery — scrubbed like the preview, but NOT truncated."""
+    from tabvis.dlp.gateway import get_dlp_gateway
+
+    decision = get_dlp_gateway().scrub("api", value or "")
+    return "[dlp_blocked]" if decision.blocked else str(decision.payload)
 
 
 class AgentRunLauncher:
@@ -146,7 +164,9 @@ class AgentRunLauncher:
                         tool_calls += _count_tool_uses(message)
                         self._events.append(
                             AGGREGATE_RUN, run.run_id, EventType.ASSISTANT_MESSAGE_COMPLETED, scope=scope,
-                            data={"turn": turns, "text_preview": _assistant_text(message)[:_PREVIEW_CHARS]},
+                            data={"turn": turns, "text_preview": _safe_preview(
+                                "transcript", _assistant_text(message)
+                            )},
                         )
                         for _ in range(_count_tool_uses(message)):
                             self._events.append(
@@ -158,10 +178,18 @@ class AgentRunLauncher:
                         is_error = bool(message.get("is_error"))
 
                 terminal = runs.FAILED if is_error else runs.COMPLETED
+                # Persist the FULL (DLP-scrubbed but untruncated) result before the transition so a
+                # channel reply can deliver it in full; the event carries only the bounded preview
+                # (§7.9). Best-effort: a store hiccup must not fail the run — the preview still ships.
+                if result_text and not is_error:
+                    try:
+                        self._runs.record_result(run.run_id, _safe_full(result_text))
+                    except Exception as e:  # noqa: BLE001
+                        log_for_debugging(f"[GATEWAY] could not persist full result for {run.run_id}: {e}")
                 self._runs.transition(
                     run.run_id, terminal, expected=runs.RUNNING,
                     error_code="agent_error" if is_error else None,
-                    data={"result_preview": (result_text or "")[:_PREVIEW_CHARS]},
+                    data={"result_preview": _safe_preview("api", result_text)},
                     turns=turns, tool_calls=tool_calls,
                 )
             finally:
@@ -207,7 +235,11 @@ class AgentRunLauncher:
             )
             rendered = render_system_context(pack)
             if rendered:
-                context.extra["system_context"] = rendered
+                from tabvis.dlp.gateway import get_dlp_gateway
+
+                decision = get_dlp_gateway().scrub("model_request", rendered)
+                if not decision.blocked:
+                    context.extra["system_context"] = str(decision.payload)
             # The pack is now authoritative for project instructions + memory too, so tell the loop to
             # suppress the base prompt's copies (full base-prompt migration under the gateway path).
             context.extra["owns_system_context"] = True
@@ -229,6 +261,14 @@ class AgentRunLauncher:
         # only new input is extra_system_context — the Context Runtime's situational block, appended to
         # the system prompt inside stream_agent.
         from tabvis.ui.cli.print import stream_agent
+        from tabvis.gateway.runtime.agents import get_agent_store
+
+        durable_agent = get_agent_store().get(run.agent_id)
+        principal_id = (
+            durable_agent.principal_id
+            if durable_agent is not None and durable_agent.principal_id
+            else "principal_local"
+        )
 
         async for m in stream_agent(
             context.prompt,
@@ -246,6 +286,7 @@ class AgentRunLauncher:
             # transcript/RunContext agree with the durable Run (Resume Plus §4.1, item 1).
             run_id=run.run_id,
             resume_mode=(context.resume_mode or ("plus" if context.resume else "fresh")),
+            principal_id=principal_id,
             # When a browser binding was acquired above, the runtime owns init/release (item 2).
             skip_browser_init=bool(context.extra.get("skip_browser_init")),
             # A conversation-only resume does not write Agent Memory (§5.1).

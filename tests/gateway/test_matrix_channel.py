@@ -75,6 +75,27 @@ def test_to_inbound_and_skips() -> None:
     edit = _event("$4", "!room:example.org", "e")
     edit["content"]["m.relates_to"] = {"rel_type": "m.replace"}
     assert ch._to_inbound(edit) is None
+    # an id-less event (bug #18) — can't dedupe, so dropped rather than collapsed onto one key
+    assert ch._to_inbound(_event("", "!room:example.org", "no id")) is None
+
+
+def test_injected_source_resolves_user_id_and_does_not_drop_all() -> None:
+    # Bug #11: when a source is injected and no user_id is configured, the loop must still resolve our
+    # MXID (via whoami) — otherwise the self-message fail-safe drops every inbound message.
+    async def scenario() -> None:
+        cfg = MatrixConfig(homeserver="https://hs.example.org", access_token="tok", user_id="",
+                           channel_account_id=ACCOUNT)
+        gw = ChannelGateway()
+        ch = MatrixChannel(cfg, client=_FakeClient(),  # _FakeClient.whoami() returns the bot MXID
+                           source=_source([_event("$e1", "!roomA:example.org", "hi from alice")]))
+        gw.register_plugin(ch)
+        gw.register_account(ChannelAccount(channel_account_id=ACCOUNT, plugin_id="matrix"))
+        await gw.start_plugin("matrix")
+        await ch._task
+        received = [e for e in get_event_store().read() if e.type == EventType.CONVERSATION_MESSAGE_RECEIVED]
+        assert len(received) == 1  # resolved user_id → alice's message ingested, not fail-safe-dropped
+
+    asyncio.run(scenario())
 
 
 def test_client_loop_creates_run() -> None:

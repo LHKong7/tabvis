@@ -100,6 +100,32 @@ def test_deliver_dm_and_group() -> None:
     asyncio.run(scenario())
 
 
+def test_group_id_starting_with_plus_routes_as_group() -> None:
+    # Bug #19: signal-cli group ids are base64 (alphabet includes '+'), so a group id can begin with
+    # '+'. Routing must key on an E.164 *shape*, not a bare leading '+', or such groups misroute as DMs.
+    async def scenario() -> None:
+        gw = ChannelGateway()
+        fake = _FakeConn()
+        plus_group = "+AbC123def/xyz="  # a base64 group id that begins with '+'
+        ch = _channel(fake, source=_source([_receive("hi group", source="+15551112222", group=plus_group)]))
+        gw.register_plugin(ch)
+        gw.register_account(ChannelAccount(channel_account_id=ACCOUNT, plugin_id="signal"))
+        await gw.start_plugin("signal")
+        await ch._task
+
+        binding = gw.bindings.get(ACCOUNT, plus_group)
+        assert binding is not None
+        receipt = await gw.deliver(
+            ACCOUNT,
+            OutboundMessage(delivery_id="dg", conversation_id=binding.conversation_id, run_id=None, text="reply"),
+        )
+        assert receipt.status == "succeeded"
+        # routed as a GROUP despite the leading '+', not misclassified as an E.164 recipient
+        assert fake.sent == [("send", {"groupId": plus_group, "message": "reply"})]
+
+    asyncio.run(scenario())
+
+
 def test_lifecycle() -> None:
     async def scenario() -> None:
         gw = ChannelGateway()

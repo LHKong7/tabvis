@@ -22,6 +22,8 @@ import os
 import threading
 import time
 import uuid
+from contextlib import contextmanager
+from typing import Iterator
 
 from tabvis.utils.env_utils import get_tabvis_config_home_dir
 
@@ -70,22 +72,24 @@ class AuthLease:
         self._ttl = ttl
         self._released = False
 
-    def heartbeat(self) -> None:
+    def heartbeat(self) -> bool:
+        """Extend this lease, returning whether it is still owned by this handle."""
         if self._released:
-            return
-        with _lock:
+            return False
+        with _session_lock(self._path):
             record = _read(self._path)
             if record is None or record.get("lease_id") != self.lease_id:
-                return  # our lease is gone (reclaimed) — nothing to extend
+                return False  # our lease is gone (reclaimed) — nothing to extend
             record["heartbeat_at"] = _now()
             record["expires_at"] = _now() + self._ttl
             _write_atomic(self._path, record)
+            return True
 
     def release(self) -> None:
         if self._released:
             return
         self._released = True
-        with _lock:
+        with _session_lock(self._path):
             record = _read(self._path)
             if record is not None and record.get("lease_id") == self.lease_id:
                 try:
@@ -98,6 +102,42 @@ class AuthLease:
 
     def __exit__(self, *_exc) -> None:
         self.release()
+
+    @property
+    def heartbeat_interval(self) -> float:
+        """Safe automatic-renewal interval used by the Browser Host."""
+        return max(0.1, self._ttl / 3.0)
+
+
+@contextmanager
+def _session_lock(path: str) -> Iterator[None]:
+    """Serialize lease read/modify/write across processes.
+
+    ``threading.RLock`` only protects callers in this interpreter.  The sibling lock file closes the
+    stale-reclaim/heartbeat race between the Browser Host and Broker processes.  Unix-domain Broker
+    deployments run on platforms with ``fcntl``; the import fallback retains the prior in-process
+    behavior on unsupported development platforms.
+    """
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    lock_path = f"{path}.lock"
+    with _lock:
+        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            try:
+                import fcntl
+
+                fcntl.flock(fd, fcntl.LOCK_EX)
+            except (ImportError, OSError):
+                pass
+            yield
+        finally:
+            try:
+                import fcntl
+
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            except (ImportError, OSError):
+                pass
+            os.close(fd)
 
 
 def _write_atomic(path: str, record: dict) -> None:
@@ -125,7 +165,7 @@ def acquire(browser_session_id: str, *, task_id: str, request_id: str, ttl: floa
         "heartbeat_at": _now(),
         "expires_at": _now() + ttl,
     }
-    with _lock:
+    with _session_lock(path):
         # Reclaim a stale lease first (§13.3 Broker-crash recovery).
         existing = _read(path)
         if existing is not None and not _expired(existing):
@@ -148,8 +188,9 @@ def acquire(browser_session_id: str, *, task_id: str, request_id: str, ttl: floa
 
 def is_authentication_locked(browser_session_id: str) -> bool:
     """Whether a valid authentication lease is currently held for this session (§4.2)."""
-    with _lock:
-        record = _read(_path(browser_session_id))
+    path = _path(browser_session_id)
+    with _session_lock(path):
+        record = _read(path)
         return record is not None and not _expired(record)
 
 
@@ -168,9 +209,11 @@ def any_authentication_locked() -> bool:
     for name in names:
         if not name.endswith(".lease"):
             continue
-        record = _read(os.path.join(directory, name))
-        if record is not None and not _expired(record, now=now):
-            return True
+        path = os.path.join(directory, name)
+        with _session_lock(path):
+            record = _read(path)
+            if record is not None and not _expired(record, now=now):
+                return True
     return False
 
 
@@ -183,11 +226,11 @@ def reclaim_expired() -> int:
         return 0
     now = _now()
     reclaimed = 0
-    with _lock:
-        for name in names:
-            if not name.endswith(".lease"):
-                continue
-            path = os.path.join(directory, name)
+    for name in names:
+        if not name.endswith(".lease"):
+            continue
+        path = os.path.join(directory, name)
+        with _session_lock(path):
             record = _read(path)
             if record is None or _expired(record, now=now):
                 try:

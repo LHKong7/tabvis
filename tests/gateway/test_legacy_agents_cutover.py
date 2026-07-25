@@ -83,6 +83,20 @@ def test_reuse_unknown_agent_id_is_404() -> None:
     assert resp.status_code == 404
 
 
+def test_registered_zero_run_agent_can_start_its_first_run() -> None:
+    # Bug #1: existence is a property of the durable Agent, not of a prior Run. A registered agent that
+    # has never run must be able to start its first run instead of 404'ing (the register→run flow).
+    from tabvis.gateway.runtime.agents import get_agent_store
+
+    app, _ = _app_with_fake_launcher(_msgs())
+    get_agent_store().register("ag_zero", principal_id="ag_zero", model="m")
+    client = TestClient(app)
+    resp = client.post("/agent", json={"prompt": "first run", "agent_id": "ag_zero"})
+    assert resp.status_code == 200 and resp.headers["x-agent-id"] == "ag_zero"
+    # it actually ran (a fresh run, not a resume of nothing) → the projection reports completed.
+    assert client.get("/agents/ag_zero").json()["status"] == "completed"
+
+
 def test_capacity_returns_429(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("TABVIS_SERVER_MAX_AGENTS", "1")
     # seed one active (queued) run so the gateway is already at capacity.
@@ -120,6 +134,48 @@ def test_server_flag_routes_agents_to_the_gateway(monkeypatch: pytest.MonkeyPatc
     assert any(a["agent_id"] == "ag_gw" for a in body["agents"])   # served from gateway Run data
     detail = client.get("/v1/agents/ag_gw").json()
     assert detail["status"] == "completed" and detail["run_id"] == run.run_id
+
+
+def test_zero_run_agent_artifacts_do_not_leak_the_default_session(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Bug #7: a zero-run agent has no session, so its artifacts endpoint must return empty — never fall
+    # back to the process's current session and disclose another agent's browsing trail.
+    monkeypatch.delenv("TABVIS_GATEWAY_AGENTS", raising=False)
+    from tabvis.bootstrap.state import get_session_id
+    from tabvis.browser import artifacts
+    from tabvis.browser.server import create_app
+    from tabvis.gateway.runtime.agents import get_agent_store
+
+    sid = str(get_session_id())  # the process's current/default session
+    artifacts._append_event_sync(
+        artifacts.get_artifacts_dir(sid),
+        {"type": "navigation", "url": "https://secret.example/dashboard"},
+    )
+    get_agent_store().register("ag_noart", principal_id="ag_noart")
+    client = TestClient(create_app(auth_required=False))
+    body = client.get("/agents/ag_noart/artifacts").json()
+    assert body["count"] == 0 and body["artifacts"] == []  # not the seeded default-session trail
+    # and a DOM fetch on the zero-run agent is a 404, not a peek into the default session's blobs.
+    assert client.get("/agents/ag_noart/artifacts?dom=dom/whatever.html").status_code == 404
+
+
+def test_quit_never_run_agent_reports_queued(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Bugs #16/#17: quit of a never-run agent must not falsely claim "cancelled" — it reports the same
+    # zero-run status GET /agents/{id} projects ("queued"), so the two endpoints agree.
+    monkeypatch.delenv("TABVIS_GATEWAY_AGENTS", raising=False)
+    from tabvis.browser import manager
+    from tabvis.browser.server import create_app
+    from tabvis.gateway.runtime.agents import get_agent_store
+
+    async def _quit(_agent_id: str) -> bool:
+        return False  # a never-run agent holds no browser
+
+    monkeypatch.setattr(manager, "quit_agent_browser", _quit)
+    get_agent_store().register("ag_neverran", principal_id="ag_neverran")
+    client = TestClient(create_app(auth_required=False))
+    quit_resp = client.post("/agents/ag_neverran/quit")
+    assert quit_resp.status_code == 200
+    assert quit_resp.json()["status"] == "queued"  # not a false "cancelled"
+    assert client.get("/agents/ag_neverran").json()["status"] == "queued"  # and GET agrees
 
 
 def test_registry_only_agent_is_invisible_after_retirement(monkeypatch: pytest.MonkeyPatch) -> None:

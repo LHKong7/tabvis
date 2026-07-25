@@ -18,6 +18,8 @@ tested with a fake :class:`~tabvis.browser.auth_browser.PageController`.
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 from contextlib import asynccontextmanager
 
 from tabvis.browser import auth_lease
@@ -63,9 +65,16 @@ async def begin_authentication(
         browser_session_id, task_id=task_id, request_id=request_id
     )
     session = _AuthSession(RestrictedAuthenticationBrowser(controller, context))
+    heartbeat = asyncio.create_task(
+        _heartbeat_lease(lease, session),
+        name=f"authentication-lease-heartbeat:{browser_session_id}",
+    )
     try:
         yield session
     finally:
+        heartbeat.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await heartbeat
         try:
             await controller.clear_fields()
         except Exception:  # noqa: BLE001 - could not confirm the fields were cleared
@@ -79,3 +88,23 @@ class _AuthSession:
     def __init__(self, browser: RestrictedAuthenticationBrowser) -> None:
         self.browser = browser
         self.must_destroy_context = False
+
+
+async def _heartbeat_lease(lease: auth_lease.AuthLease, session: _AuthSession) -> None:
+    """Keep a live authentication lease fresh until cancellation.
+
+    A lost lease is security-significant: the Browser Host can no longer prove exclusivity, so the
+    context is marked for destruction before it is returned to ordinary Agent control.
+    """
+    try:
+        while True:
+            await asyncio.sleep(lease.heartbeat_interval)
+            try:
+                owned = await asyncio.to_thread(lease.heartbeat)
+            except Exception:  # noqa: BLE001 - losing the heartbeat must fail closed
+                owned = False
+            if not owned:
+                session.must_destroy_context = True
+                return
+    except asyncio.CancelledError:
+        raise

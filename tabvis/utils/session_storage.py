@@ -1317,6 +1317,13 @@ async def record_transcript(
     Returns the last actually-recorded chain participant's UUID, or the prefix-tracked UUID.
     """
     cleaned_messages = clean_messages_for_logging(messages, all_messages)
+    from tabvis.dlp.gateway import get_dlp_gateway
+
+    dlp = get_dlp_gateway().scrub("transcript", cleaned_messages)
+    if dlp.blocked or not isinstance(dlp.payload, list):
+        log_for_debugging("[DLP] blocked transcript persistence")
+        return starting_parent_uuid_hint
+    cleaned_messages = dlp.payload
     session_id = get_session_id()
     message_set = await get_session_messages(session_id)
     new_messages: list[dict[str, Any]] = []
@@ -1345,8 +1352,15 @@ async def record_sidechain_transcript(
     starting_parent_uuid: str | None = None,
 ) -> None:
     """Record the sidechain transcript."""
+    from tabvis.dlp.gateway import get_dlp_gateway
+
+    cleaned = clean_messages_for_logging(messages)
+    dlp = get_dlp_gateway().scrub("transcript", cleaned)
+    if dlp.blocked or not isinstance(dlp.payload, list):
+        log_for_debugging("[DLP] blocked sidechain transcript persistence")
+        return
     await get_project().insert_message_chain(
-        clean_messages_for_logging(messages), True, agent_id, starting_parent_uuid
+        dlp.payload, True, agent_id, starting_parent_uuid
     )
 
 

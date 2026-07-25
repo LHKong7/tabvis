@@ -3,22 +3,29 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import asyncio
+from typing import Any
 
 import pytest
+from pydantic import BaseModel
 
+from tabvis.agent.tool_services.tool_execution import run_tool_use
 from tabvis.authentication.models import CredentialCapability, ResolvedCredentials
 from tabvis.authentication.secrets import secret_from_str
 from tabvis.dlp import canary
-from tabvis.dlp.gateway import DLPGateway
+from tabvis.dlp.gateway import DLPGateway, set_dlp_gateway
 from tabvis.dlp.text import mask_identifiers, redact_headers, redact_mapping
 from tabvis.dlp.url import clean_url
+from tabvis.tool import Tool, ToolResult, ToolUseContext, ToolUseContextOptions
 
 
 @pytest.fixture(autouse=True)
 def _clean():
     canary.clear()
+    set_dlp_gateway(None)
     yield
     canary.clear()
+    set_dlp_gateway(None)
 
 
 # --------------------------------------------------------------------------- cleaners
@@ -114,6 +121,19 @@ def test_gateway_redacts_headers_and_cookies() -> None:
     assert decision.payload["Authorization"] == "[redacted]"
 
 
+def test_gateway_redacts_mixed_header_and_sensitive_mapping() -> None:
+    gw = DLPGateway()
+    decision = gw.scrub(
+        "api",
+        {"Cookie": "sid=abc", "password": "hunter2", "nested": {"api_key": "key"}},
+    )
+    assert decision.payload == {
+        "Cookie": "[redacted]",
+        "password": "[redacted]",
+        "nested": {"api_key": "[redacted]"},
+    }
+
+
 def test_block_hook_failure_does_not_unblock() -> None:
     canary.register(b"AnotherCanary9", tag="x")
 
@@ -123,3 +143,51 @@ def test_block_hook_failure_does_not_unblock() -> None:
     gw = DLPGateway(on_secret_blocked=boom)
     decision = gw.scrub("crash_report", "leak AnotherCanary9 here")
     assert decision.blocked  # a broken hook still results in a block, never a passthrough
+
+
+def test_tool_result_is_blocked_before_mapper_and_model_request() -> None:
+    class Input(BaseModel):
+        pass
+
+    class LeakingTool(Tool):
+        name = "Leaking"
+        input_schema = Input
+        max_result_size_chars = 100
+        mapper_called = False
+
+        async def call(self, *args, **kwargs):
+            return ToolResult(data={"text": "contains CanarySecretValue1"})
+
+        async def description(self, input, options):
+            return self.name
+
+        async def prompt(self, options):
+            return self.name
+
+        def map_tool_result_to_tool_result_block_param(self, content: Any, tool_use_id: str):
+            self.mapper_called = True
+            raise AssertionError("DLP must run before mapper serialization")
+
+    tool = LeakingTool()
+    canary.register(b"CanarySecretValue1", tag="password:p1")
+    context = ToolUseContext(options=ToolUseContextOptions(tools=[tool]))
+
+    async def allow(*_args):
+        return {"behavior": "allow"}
+
+    async def scenario():
+        return [
+            update
+            async for update in run_tool_use(
+                {"id": "tu1", "name": tool.name, "input": {}},
+                {"uuid": "assistant-1"},
+                allow,
+                context,
+            )
+        ]
+
+    updates = asyncio.run(scenario())
+    block = updates[-1]["message"]["message"]["content"][0]
+    assert block["is_error"] is True
+    assert "DLP blocked" in block["content"]
+    assert not tool.mapper_called

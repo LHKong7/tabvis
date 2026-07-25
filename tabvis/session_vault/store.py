@@ -136,7 +136,40 @@ class SessionVault:
                 session_id=session.id,
             )
         except SessionCryptoError:
+            with _lock:
+                self._delete(session.id)
             return None
+
+    def find_for_profile(
+        self,
+        *,
+        credential_profile_id: str,
+        user_id: str,
+        task_id: str,
+        requested_origins: list[str],
+    ) -> tuple[str, dict] | None:
+        """Open the newest eligible session for a profile without exposing it outside trusted code."""
+        with _lock:
+            candidates = sorted(
+                (
+                    session
+                    for session in self._all()
+                    if session.credential_profile_id == credential_profile_id
+                    and session.owner_user_id == user_id
+                ),
+                key=lambda session: _as_aware(session.created_at),
+                reverse=True,
+            )
+        for session in candidates:
+            state = self.open(
+                session.id,
+                user_id=user_id,
+                task_id=task_id,
+                requested_origins=requested_origins,
+            )
+            if state is not None:
+                return session.id, state
+        return None
 
     # ------------------------------------------------------------------ lifecycle
 

@@ -9,19 +9,19 @@ human-required / stable error code). Two hard contracts (design §14, §16.4):
   to add one a validation error;
 * this module MUST NOT import ``secret_store`` or ``BrowserService``. The trusted context (task / user /
   session / origin) is injected by the Orchestrator, and the actual authentication is performed by the
-  Credential Broker in a separate trusted domain (Phase 2+). In Phase 0 there is no Broker, so the tool
-  is feature-gated off and returns a stable ``internal_authentication_error`` if invoked.
+  managed runtime through a narrow Broker client.
 """
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
 from tabvis.agent.tools.browser_common import playwright_available
 from tabvis.authentication.errors import AuthErrorCode
-from tabvis.authentication.models import AuthenticationResult
+from tabvis.authentication.models import AgentAuthenticationRequest, AuthenticationResult
 from tabvis.constants.tools import BROWSER_AUTHENTICATE_TOOL_NAME
 from tabvis.tool import Tool, ToolResult, ToolUseContext
 from tabvis.types.permissions import PermissionDecision
@@ -49,8 +49,7 @@ class BrowserAuthenticateInput(BaseModel):
 
 
 def _authentication_enabled() -> bool:
-    # Gated off by default (design §17 TABVIS_AUTHENTICATION_ENABLED). Phase 0 ships no Broker, so even
-    # when enabled the call returns a stable internal error rather than doing anything with secrets.
+    # Gated off by default (design §17 TABVIS_AUTHENTICATION_ENABLED).
     import os
 
     return is_env_truthy(os.environ.get("TABVIS_AUTHENTICATION_ENABLED"))
@@ -98,13 +97,38 @@ class BrowserAuthenticateTool(Tool):
         parent_message: Any,
         on_progress: Any = None,
     ) -> ToolResult[dict[str, Any]]:
-        # Phase 0: no Credential Broker is wired yet, so there is no code path that resolves a secret.
-        # Return the redacted result contract with a stable error code — never an exception message.
-        result = AuthenticationResult(
-            success=False,
-            error_code=AuthErrorCode.INTERNAL_AUTHENTICATION_ERROR.value,
-        )
+        service = context.authentication_service
+        if service is None:
+            result = _internal_failure()
+            return ToolResult(data=result.model_dump())
+        try:
+            request = AgentAuthenticationRequest(
+                credential_profile_id=args.credential_profile_id
+            )
+            result = await service.authenticate(request, context=context)
+            # Re-validate the trust-boundary response against the strict Agent-visible schema.
+            result = AuthenticationResult.model_validate(result)
+        except Exception:  # noqa: BLE001 - never expose Broker/browser/provider exception details
+            result = _internal_failure()
         return ToolResult(data=result.model_dump())
+
+    def map_tool_result_to_tool_result_block_param(
+        self, content: Any, tool_use_id: str
+    ) -> dict[str, Any]:
+        safe = AuthenticationResult.model_validate(content).model_dump()
+        return {
+            "type": "tool_result",
+            "tool_use_id": tool_use_id,
+            "content": json.dumps(safe, separators=(",", ":"), sort_keys=True),
+            "is_error": not safe["success"],
+        }
+
+
+def _internal_failure() -> AuthenticationResult:
+    return AuthenticationResult(
+        success=False,
+        error_code=AuthErrorCode.INTERNAL_AUTHENTICATION_ERROR.value,
+    )
 
 
 browser_authenticate_tool = BrowserAuthenticateTool()

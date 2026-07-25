@@ -30,7 +30,10 @@ from tabvis.gateway.protocol.events import EventType
 
 
 def _config(**kw) -> FeishuConfig:
-    base = dict(app_id="cli_test", app_secret="secret_test")
+    # A real Feishu channel is always configured with a verification token or encrypt key; default one
+    # in so the flow/normalize tests exercise a *properly configured* channel (matching _text_event's
+    # header token). A channel with neither now fails closed — see test_fails_closed_when_unconfigured.
+    base = dict(app_id="cli_test", app_secret="secret_test", verification_token="vtok")
     base.update(kw)
     return FeishuConfig(**base)
 
@@ -152,6 +155,14 @@ def test_handle_webhook_rejects_invalid_json() -> None:
     assert result.rejected
 
 
+def test_handle_webhook_fails_closed_when_unconfigured() -> None:
+    # Bug #8: with neither a verification token nor an encrypt key there is nothing to authenticate the
+    # sender, so the channel must reject rather than fall through and accept a spoofable event.
+    ch = FeishuChannel(FeishuConfig(app_id="cli_test", app_secret="secret_test"), client=_FakeClient())
+    result = ch.handle_webhook({}, _body(_text_event("e1", "oc_1", "spoofed")))
+    assert result.rejected and result.raw is None
+
+
 def test_handle_webhook_requires_valid_signature_when_encrypt_key_set() -> None:
     key = "enc-key"
     ch = _channel(encrypt_key=key)
@@ -223,8 +234,8 @@ def test_normalize_ignores_bot_and_non_message_events() -> None:
         bot_event = _text_event("e3", "oc_1", "loop?")
         bot_event["event"]["sender"]["sender_type"] = "app"
         assert await ch.normalize(ch.handle_webhook({}, _body(bot_event)).raw) == []
-        # a non-message event type
-        other = {"header": {"event_type": "im.chat.member.bot.added_v1"}, "event": {}}
+        # a non-message event type (still a validly-signed event, so it carries the verification token)
+        other = {"header": {"event_type": "im.chat.member.bot.added_v1", "token": "vtok"}, "event": {}}
         assert await ch.normalize(ch.handle_webhook({}, _body(other)).raw) == []
 
     asyncio.run(scenario())

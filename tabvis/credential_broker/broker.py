@@ -47,6 +47,10 @@ BrowserProvider = Callable[[str], "object"]  # browser_session_id -> Authenticat
 # (request, origin) -> approved?  Prompts the user through a trusted UI (design §9.5, §18.7).
 ApprovalCallback = Callable[[AuthenticationRequest, str], Awaitable[bool]]
 AuditSink = Callable[[dict], None]
+SessionRestorer = Callable[
+    [AuthenticationRequest, CredentialProfile, "object"],
+    Awaitable[AuthenticationResult | None],
+]
 
 
 async def _auto_deny(_request: AuthenticationRequest, _origin: str) -> bool:
@@ -65,6 +69,7 @@ class CredentialBroker:
         approval_callback: ApprovalCallback | None = None,
         capability_store: CapabilityStore | None = None,
         audit_sink: AuditSink | None = None,
+        session_restorer: SessionRestorer | None = None,
         capability_ttl_seconds: int = DEFAULT_CAPABILITY_TTL_SECONDS,
     ) -> None:
         self._provider = provider
@@ -74,6 +79,7 @@ class CredentialBroker:
         self._approval_callback = approval_callback or _auto_deny
         self._capabilities = capability_store or CapabilityStore()
         self._audit_sink = audit_sink
+        self._session_restorer = session_restorer
         self._capability_ttl = capability_ttl_seconds
         self._executor = CredentialExecutor(
             provider=provider, capability_store=self._capabilities
@@ -83,9 +89,22 @@ class CredentialBroker:
         # A single active lease at a time across the Broker (design §8.4 "没有另一个认证租约").
         self._active_session: str | None = None
 
+    def invalidate_all_capabilities(self) -> None:
+        """Emergency invalidation used by cancellation/DLP response paths."""
+        self._capabilities.clear()
+
     async def authenticate(self, request: AuthenticationRequest) -> AuthenticationResult:
         adapter_name = "unknown"
         origin: str | None = None
+        # Claim the Broker-wide slot before any awaited lookup, browser inspection, approval, or
+        # provider health check.  The old check-then-set left an await-sized race in which two
+        # requests could both pass the exclusivity check and inject into different sessions.
+        with self._lock:
+            busy = self._active_session is not None
+            if not busy:
+                self._active_session = request.browser_session_id
+        if busy:
+            return self._deny(request, adapter_name, origin, AuthErrorCode.BROWSER_LOCKED)
         try:
             profile = self._profile_lookup(request.credential_profile_id, request.user_id)
             if profile is None:
@@ -102,23 +121,18 @@ class CredentialBroker:
             context: BrowserAuthenticationContext = await browser.inspect_context()
             origin = context.top_level_origin
 
-            # -- lease exclusivity (§13.1): only one authentication at a time ---------------------
-            with self._lock:
-                another_lease = (
-                    self._active_session is not None
-                    and self._active_session != request.browser_session_id
-                )
-            if another_lease:
-                return self._deny(request, adapter_name, origin, AuthErrorCode.BROWSER_LOCKED)
-
             # -- policy (§8.4) -------------------------------------------------------------------
             code = check_authorization(
                 profile=profile,
                 context=context,
                 requesting_user_id=request.user_id,
                 uses_so_far=self._uses.get(profile.id, 0),
-                another_lease_held=False,
-                secret_provider_healthy=await self._provider.health(),
+                another_lease_held=False,  # this request owns the Broker-wide slot
+                # A Vault restoration does not resolve a credential. If no reusable session exists,
+                # the Executor re-checks provider health before a fresh resolution below.
+                secret_provider_healthy=(
+                    True if self._session_restorer is not None else await self._provider.health()
+                ),
                 audit_available=self._audit_available(),
             )
             if code is not None:
@@ -145,39 +159,63 @@ class CredentialBroker:
             else:
                 approved_by = None
 
+            # -- encrypted authenticated-session reuse (§10.3) ----------------------------------
+            # The restorer is trusted runtime code. It may return success only after Browser Host
+            # restoration and a profile-configured strong signal; None means continue with a fresh
+            # credential capability. Policy and approval above apply equally to restored sessions.
+            if self._session_restorer is not None:
+                restored = await self._session_restorer(request, profile, browser)
+                if restored is not None:
+                    if restored.success:
+                        self._uses[profile.id] = self._uses.get(profile.id, 0) + 1
+                    audit_ok = self._emit_audit(
+                        request,
+                        adapter_name,
+                        restored.authenticated_origin or origin,
+                        restored,
+                        approved_by,
+                    )
+                    if restored.success and not audit_ok and self._audit_fail_closed():
+                        return AuthenticationResult(
+                            success=False,
+                            error_code=AuthErrorCode.INTERNAL_AUTHENTICATION_ERROR.value,
+                        )
+                    return restored
+
             # -- capability + execution (§5.6, §7.1) ---------------------------------------------
-            with self._lock:
-                self._active_session = request.browser_session_id
-            try:
-                capability = self._capabilities.issue(
-                    credential_profile_id=profile.id,
-                    context=context,
-                    task_id=request.task_id,
-                    user_id=request.user_id,
-                    ttl_seconds=self._capability_ttl,
-                )
-                adapter = get_adapter(adapter_name)
-                result = await self._executor.execute(
-                    capability_id=capability.id,
-                    profile=profile,
-                    adapter=adapter,
-                    browser=browser,
-                    request=request,
-                )
-            finally:
-                with self._lock:
-                    self._active_session = None
+            capability = self._capabilities.issue(
+                credential_profile_id=profile.id,
+                context=context,
+                task_id=request.task_id,
+                user_id=request.user_id,
+                ttl_seconds=self._capability_ttl,
+            )
+            adapter = get_adapter(adapter_name)
+            result = await self._executor.execute(
+                capability_id=capability.id,
+                profile=profile,
+                adapter=adapter,
+                browser=browser,
+                request=request,
+            )
 
             if result.success:
                 self._uses[profile.id] = self._uses.get(profile.id, 0) + 1
-            self._emit_audit(
+            audit_ok = self._emit_audit(
                 request, adapter_name, result.authenticated_origin or origin, result, approved_by
             )
+            if result.success and not audit_ok and self._audit_fail_closed():
+                return AuthenticationResult(
+                    success=False,
+                    error_code=AuthErrorCode.INTERNAL_AUTHENTICATION_ERROR.value,
+                )
             return result
         except Exception:  # noqa: BLE001 - the Broker never leaks an exception outward (§12.1)
-            with self._lock:
-                self._active_session = None
             return self._deny(request, adapter_name, origin, AuthErrorCode.INTERNAL_AUTHENTICATION_ERROR)
+        finally:
+            with self._lock:
+                if self._active_session == request.browser_session_id:
+                    self._active_session = None
 
     # ------------------------------------------------------------------------------------------
 
@@ -191,6 +229,14 @@ class CredentialBroker:
             return True
         # No sink: only block when the deployment demands audit fail-closed (§17).
         return not is_env_truthy(os.environ.get("TABVIS_AUTH_AUDIT_FAIL_CLOSED"))
+
+    @staticmethod
+    def _audit_fail_closed() -> bool:
+        import os
+
+        from tabvis.utils.env_utils import is_env_truthy
+
+        return is_env_truthy(os.environ.get("TABVIS_AUTH_AUDIT_FAIL_CLOSED"))
 
     def _deny(
         self,
@@ -210,9 +256,9 @@ class CredentialBroker:
         origin: str | None,
         result: AuthenticationResult,
         approved_by: str | None,
-    ) -> None:
+    ) -> bool:
         if self._audit_sink is None:
-            return
+            return False
         event = build_credential_used_event(
             request_id=request.request_id,
             credential_profile_id=request.credential_profile_id,
@@ -226,8 +272,9 @@ class CredentialBroker:
         )
         try:
             self._audit_sink(event.model_dump())
+            return True
         except Exception:  # noqa: BLE001 - audit failure must not leak or crash the flow
-            pass
+            return False
 
 
 def new_request_id() -> str:

@@ -18,6 +18,7 @@ Wiring sketch::
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any, AsyncIterable, Mapping
 
 from tabvis.channels.core.contract import (
@@ -30,8 +31,11 @@ from tabvis.channels.core.contract import (
 )
 from tabvis.channels.plugins._platform.loop import ClientLoopChannel
 from tabvis.channels.plugins.telegram.client import TelegramClient, TelegramConfig
+from tabvis.utils.debug import log_for_debugging
 
 PLUGIN_ID = "telegram"
+
+_MAX_POLL_BACKOFF = 30.0  # cap the reconnect backoff after repeated getUpdates failures
 
 
 class TelegramChannel(ClientLoopChannel):
@@ -72,10 +76,24 @@ class TelegramChannel(ClientLoopChannel):
                 await self._handle(update)
             return
         # Live long-poll: learn our own id (to drop echoed messages), then poll from the ack cursor.
-        await self._ensure_bot_id()
+        try:
+            await self._ensure_bot_id()
+        except Exception as exc:  # noqa: BLE001 - a getMe blip must not stop us from ever polling
+            log_for_debugging(f"[telegram] getMe failed at startup: {exc}")
         offset: int | None = None
+        backoff = 1.0
         while True:
-            for update in await self._client.get_updates(offset=offset, timeout=self._config.poll_timeout):
+            try:
+                updates = await self._client.get_updates(offset=offset, timeout=self._config.poll_timeout)
+                backoff = 1.0  # a good poll resets the backoff
+            except asyncio.CancelledError:
+                raise  # cooperative shutdown — never swallow the cancel
+            except Exception as exc:  # noqa: BLE001 - a transient poll error must not kill the loop
+                log_for_debugging(f"[telegram] getUpdates failed, retrying in {backoff:.0f}s: {exc}")
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, _MAX_POLL_BACKOFF)
+                continue
+            for update in updates:
                 update_id = update.get("update_id")
                 if update_id is not None:
                     offset = max(offset or 0, int(update_id) + 1)  # advancing the offset acks the update
@@ -108,6 +126,9 @@ class TelegramChannel(ClientLoopChannel):
         user_id = sender.get("id")
         if user_id is None:  # channel posts have no `from`; attribute to the broadcasting chat
             user_id = (message.get("sender_chat") or {}).get("id")
+        # Enforce the optional allowlist: when set, only messages from listed user ids are accepted.
+        if self._config.allowed_users and (user_id is None or str(user_id) not in self._config.allowed_users):
+            return None
         return InboundMessage(
             # update_id is the true global dedupe key (message_id is only per-chat unique).
             external_event_id=str(update.get("update_id") or message.get("message_id")),

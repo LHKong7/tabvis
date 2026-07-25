@@ -47,6 +47,9 @@ class ChannelManifest:
     version: str
     capabilities: frozenset[str] = field(default_factory=frozenset)
     signed_webhooks: bool = False
+    # The largest single outbound message the channel accepts; a longer reply is split into this many
+    # chars per message. Default is safe for Telegram/WhatsApp (~4096); tighter platforms override it.
+    max_message_chars: int = 3900
 
 
 @dataclass

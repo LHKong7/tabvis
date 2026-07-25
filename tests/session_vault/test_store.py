@@ -110,3 +110,17 @@ def test_purge_expired() -> None:
     live = _create(vault, ttl_seconds=3600)
     assert vault.purge_expired() == 1
     assert vault.open(live.id, user_id="u1", task_id="t1") == _STATE
+
+
+def test_find_for_profile_returns_newest_eligible_session() -> None:
+    vault = _vault()
+    first = _create(vault, reusable_across_tasks=True)
+    second = _create(vault, reusable_across_tasks=True)
+    found = vault.find_for_profile(
+        credential_profile_id="p1",
+        user_id="u1",
+        task_id="t2",
+        requested_origins=["https://accounts.example.com"],
+    )
+    assert found == (second.id, _STATE)
+    assert found[0] != first.id

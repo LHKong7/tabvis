@@ -159,24 +159,32 @@ class GoogleCertsCache:
     """
 
     def __init__(
-        self, certs_url: str = GOOGLE_CERTS_URL, *, http_client: httpx.Client | None = None, ttl: float = 300.0
+        self, certs_url: str = GOOGLE_CERTS_URL, *, http_client: httpx.Client | None = None,
+        ttl: float = 300.0, min_refetch_interval: float = 20.0,
     ) -> None:
         self._url = certs_url
         self._client = http_client
         self._owns_client = http_client is None
         self._ttl = ttl
+        self._min_refetch_interval = min_refetch_interval
         self._keys: dict[str, Any] = {}
         self._expiry = 0.0
+        self._last_refresh = 0.0
 
     def get_key(self, kid: str | None) -> Any:
         now = time.monotonic()
-        # Refresh when the cache is empty, expired, or missing the kid the token was signed with
-        # (a key rotation shows up as a miss, which google-auth also treats as "refetch and retry").
-        if not self._keys or now >= self._expiry or (kid and kid not in self._keys):
+        stale = not self._keys or now >= self._expiry
+        missing = bool(kid) and kid not in self._keys
+        # A stale/empty cache always refreshes (bounded by the TTL). A miss on an unknown kid — which an
+        # unauthenticated caller controls via the JWT header, *before* the signature is verified —
+        # refreshes only past a cooldown, so junk kids can't force a blocking JWKS fetch on every
+        # request (pre-signature DoS / fetch amplification against Google's endpoint).
+        if stale or (missing and now - self._last_refresh >= self._min_refetch_interval):
             self._refresh()
         return self._keys.get(kid) if kid else None
 
     def _refresh(self) -> None:
+        self._last_refresh = time.monotonic()  # record the attempt even if it fails, so the cooldown holds
         client = self._client if self._client is not None else httpx.Client(timeout=10.0)
         try:
             data = client.get(self._url).json()

@@ -84,9 +84,13 @@ async def run_agent_gw(request: Request) -> Response:
     # Reuse an existing agent (continuation) or mint a fresh one.
     resume = False
     if body_agent:
-        if gateway.runs.latest_run_for_agent(body_agent) is None:
+        # Existence is a property of the durable Agent, not of a prior Run: a registered zero-run
+        # agent must be runnable on its first POST /agent (else register→run 404s). Resume only when
+        # the agent has actually run before.
+        if gateway.agents.get(body_agent) is None:
             return JSONResponse({"error": f"unknown agent_id {body_agent!r}; omit it to create a new agent"}, status_code=404)
-        agent_id, resume = body_agent, True
+        agent_id = body_agent
+        resume = gateway.runs.latest_run_for_agent(body_agent) is not None
     else:
         agent_id = ids.new_agent_id()
 
@@ -124,6 +128,13 @@ async def _legacy_agent_stream(gateway: GatewayApplication, run_id: str):
 
     queue: asyncio.Queue = asyncio.Queue()
 
+    def render(frame: dict[str, Any]) -> dict[str, str]:
+        from tabvis.dlp.gateway import get_dlp_gateway
+
+        decision = get_dlp_gateway().scrub("api", frame["data"])
+        safe = {"error": "dlp_blocked"} if decision.blocked else decision.payload
+        return {"event": frame["event"], "data": json.dumps(safe, default=str)}
+
     def _listen(envelope):
         if envelope.aggregate_id == run_id:
             queue.put_nowait(envelope)
@@ -134,7 +145,7 @@ async def _legacy_agent_stream(gateway: GatewayApplication, run_id: str):
         for envelope in gateway.events.read(aggregate_id=run_id):
             last = envelope.cursor
             for frame in legacy_frames_for(envelope):
-                yield {"event": frame["event"], "data": json.dumps(frame["data"], default=str)}
+                yield render(frame)
             if envelope.type in _TERMINAL_EVENTS:
                 return
         while True:
@@ -147,7 +158,7 @@ async def _legacy_agent_stream(gateway: GatewayApplication, run_id: str):
                 continue
             last = envelope.cursor
             for frame in legacy_frames_for(envelope):
-                yield {"event": frame["event"], "data": json.dumps(frame["data"], default=str)}
+                yield render(frame)
             if envelope.type in _TERMINAL_EVENTS:
                 return
     finally:
