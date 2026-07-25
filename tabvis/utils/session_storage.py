@@ -1860,6 +1860,11 @@ def check_resume_consistency(chain: list[dict[str, Any]]) -> None:
         if expected is None:
             return
         actual = i
+        if actual != expected:
+            log_for_debugging(
+                f"Resume consistency drift: expected {expected} messages before turn-duration "
+                f"record, found {actual}"
+            )
         return
 
 

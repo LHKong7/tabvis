@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -67,7 +68,7 @@ def test_clear_profile_writes_audit() -> None:
     dc.clear_profile(path, agent_id="agX", reason="account switch", wait=True)
     log = dc._audit_log_path()
     assert os.path.exists(log)
-    assert "profile_cleared" in open(log, encoding="utf-8").read()
+    assert "profile_cleared" in Path(log).read_text(encoding="utf-8")
 
 
 # --------------------------------------------------------------------------- origin clear

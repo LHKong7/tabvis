@@ -3,9 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
+import shutil
 import sys
+import tempfile
+from contextlib import contextmanager
 from datetime import datetime, timezone
+from pathlib import Path
 
 import pytest
 
@@ -46,22 +51,33 @@ def _request() -> AuthenticationRequest:
     )
 
 
+@contextmanager
+def _short_socket_path(name: str):
+    """Yield a macOS-safe Unix-socket path independent of pytest's long temp root."""
+    directory = Path(tempfile.mkdtemp(prefix="tvi-", dir="/tmp"))
+    try:
+        yield str(directory / name)
+    finally:
+        with contextlib.suppress(OSError):
+            shutil.rmtree(directory)
+
+
 def test_socket_round_trip(tmp_path, browser_cls, make_profile) -> None:
     async def scenario() -> None:
-        sock_path = str(tmp_path / "broker.sock")
-        broker = _make_broker(browser_cls, make_profile)
-        server = BrokerServer(broker, socket_path=sock_path)
-        await server.start()
-        # socket file is owner-only
-        assert oct(os.stat(sock_path).st_mode & 0o777) == oct(0o600)
-        try:
-            client = SocketBrokerClient(sock_path)
-            result = await client.authenticate(_request())
-            assert result.success
-            assert result.authenticated_origin == "https://accounts.example.com"
-        finally:
-            await server.stop()
-        assert not os.path.exists(sock_path)
+        with _short_socket_path("broker.sock") as sock_path:
+            broker = _make_broker(browser_cls, make_profile)
+            server = BrokerServer(broker, socket_path=sock_path)
+            await server.start()
+            # socket file is owner-only
+            assert oct(os.stat(sock_path).st_mode & 0o777) == oct(0o600)
+            try:
+                client = SocketBrokerClient(sock_path)
+                result = await client.authenticate(_request())
+                assert result.success
+                assert result.authenticated_origin == "https://accounts.example.com"
+            finally:
+                await server.stop()
+            assert not os.path.exists(sock_path)
 
     asyncio.run(scenario())
 
@@ -70,31 +86,40 @@ def test_extra_fields_rejected_over_ipc(tmp_path, browser_cls, make_profile) -> 
     async def scenario() -> None:
         from tabvis.credential_broker.protocol import decode, encode, read_frame, write_frame
 
-        sock_path = str(tmp_path / "broker2.sock")
-        server = BrokerServer(_make_broker(browser_cls, make_profile), socket_path=sock_path)
-        await server.start()
-        try:
-            reader, writer = await asyncio.open_unix_connection(sock_path)
-            # a request with a smuggled secret field must be rejected by the fixed schema
-            payload = {
-                "request_id": "r1",
-                "browser_session_id": "b1",
-                "credential_profile_id": "p1",
-                "task_id": "t1",
-                "user_id": "u1",
-                "agent_id": "a1",
-                "requested_at": datetime.now(timezone.utc).isoformat(),
-                "password": "smuggled",
-            }
-            await write_frame(writer, encode(payload))
-            resp = decode(await read_frame(reader))
-            writer.close()
-            assert resp["success"] is False
-            assert resp["error_code"] == AuthErrorCode.INTERNAL_AUTHENTICATION_ERROR.value
-        finally:
-            await server.stop()
+        with _short_socket_path("broker2.sock") as sock_path:
+            server = BrokerServer(_make_broker(browser_cls, make_profile), socket_path=sock_path)
+            await server.start()
+            try:
+                reader, writer = await asyncio.open_unix_connection(sock_path)
+                # a request with a smuggled secret field must be rejected by the fixed schema
+                payload = {
+                    "request_id": "r1",
+                    "browser_session_id": "b1",
+                    "credential_profile_id": "p1",
+                    "task_id": "t1",
+                    "user_id": "u1",
+                    "agent_id": "a1",
+                    "requested_at": datetime.now(timezone.utc).isoformat(),
+                    "password": "smuggled",
+                }
+                await write_frame(writer, encode(payload))
+                resp = decode(await read_frame(reader))
+                writer.close()
+                assert resp["success"] is False
+                assert resp["error_code"] == AuthErrorCode.INTERNAL_AUTHENTICATION_ERROR.value
+            finally:
+                await server.stop()
 
     asyncio.run(scenario())
+
+
+def test_server_rejects_overlong_socket_path(browser_cls, make_profile) -> None:
+    server = BrokerServer(
+        _make_broker(browser_cls, make_profile),
+        socket_path="/" + "x" * 101,
+    )
+    with pytest.raises(ValueError, match="portable 100-byte limit"):
+        asyncio.run(server.start())
 
 
 def test_enrich_request_adds_trusted_context() -> None:

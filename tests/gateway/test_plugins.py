@@ -7,7 +7,7 @@ import asyncio
 import pytest
 
 from tabvis.gateway.plugins import builtin, version as version_mod
-from tabvis.gateway.plugins.contract import DEGRADED, READY, REJECTED, PluginCandidate, PluginHealth
+from tabvis.gateway.plugins.contract import REJECTED, PluginCandidate
 from tabvis.gateway.plugins.dependency import topological_order
 from tabvis.gateway.plugins.manifest import KIND_TOOL_PROVIDER, PluginManifest, PluginRequirements
 from tabvis.gateway.plugins.permissions import PermissionPolicy

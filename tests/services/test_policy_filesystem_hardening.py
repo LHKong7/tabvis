@@ -7,7 +7,6 @@ secret reads; grant_directory opens a subtree. No real tool call is executed.
 
 from __future__ import annotations
 
-import os
 from types import SimpleNamespace
 from typing import Any
 

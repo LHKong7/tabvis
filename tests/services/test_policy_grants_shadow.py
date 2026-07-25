@@ -62,7 +62,7 @@ def test_global_grant_applies_to_any_agent() -> None:
 
 
 def test_purge_and_revoke() -> None:
-    g = grants.add_grant("network.request", "url:https://x/**", ttl_seconds=10, now=1000.0)
+    grants.add_grant("network.request", "url:https://x/**", ttl_seconds=10, now=1000.0)
     assert grants.purge_expired(now=1020.0) == 1
     g2 = grants.add_grant("network.request", "url:https://y/**", now=1000.0)
     assert grants.revoke(g2.id) is True

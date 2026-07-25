@@ -12,9 +12,40 @@ import sys
 
 from tabvis.bootstrap_macro import MACRO
 
+HELP_TEXT = """\
+Usage:
+  tabvis -p <prompt> [options]
+  tabvis --serve [--host <host>] [--port <port>] [--dev]
+  tabvis --dump-system-prompt [--model <model>]
+  tabvis --version
+
+Options:
+  -p, --print <prompt>              Run one headless agent task.
+  --model <model>                   Override the configured model.
+  --output-format <format>          text, json, or stream-json.
+  --max-turns <count>               Limit model turns (unbounded by default).
+  --browser-engine, --browser <id>  Select the browser engine.
+  --bare                            Use only Bash, Read, and Edit tools.
+  --resume-plus <session-id>        Resume a saved session with context.
+  --conversation-only              Resume conversation without agent memory.
+  --no-memory                       Resume without reading or writing memory.
+  --allow-new-browser               Allow a replacement browser when resuming.
+  --serve                           Run the local HTTP/SSE service.
+  --host <host>                     Service bind host.
+  --port <port>                     Service bind port.
+  --dev                             Serve the Vite console in development mode.
+  --dump-system-prompt              Print the rendered system prompt.
+  -v, -V, --version                 Print the Tabvis version.
+  -h, --help                        Show this help.
+"""
+
 
 async def main() -> None:
     args = sys.argv[1:]
+
+    if len(args) == 1 and args[0] in ("--help", "-h"):
+        print(HELP_TEXT, end="")
+        return
 
     # Fast-path for --version/-v: zero module loading needed.
     if len(args) == 1 and args[0] in ("--version", "-v", "-V"):
@@ -28,7 +59,7 @@ async def main() -> None:
 
     # Fast-path for --serve: run the HTTP/SSE agent server instead of a one-shot turn.
     #   tabvis --serve [--host H] [--port N] [--dev]
-    #   --dev serves the console live from web/ via Vite (HMR); default serves the built bundle.
+    #   --dev serves the console live from web/ via Vite (HMR); default is the headless API only.
     if args and args[0] == "--serve":
         from tabvis.utils.config import enable_configs
 
@@ -47,7 +78,7 @@ async def main() -> None:
         from tabvis.utils.env_utils import is_env_truthy
 
         port_raw = _flag("--port")
-        # --dev (or TABVIS_WEB_DEV=1): serve the console live from web/ via Vite (HMR), not the build.
+        # --dev (or TABVIS_WEB_DEV=1): serve the console live from web/ via Vite (HMR).
         dev = "--dev" in args or is_env_truthy(os.environ.get("TABVIS_WEB_DEV"))
         await serve_async(host=_flag("--host"), port=int(port_raw) if port_raw else None, dev=dev)
         return

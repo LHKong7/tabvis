@@ -22,7 +22,13 @@ def main() -> None:
     ensure_bootstrap_macro()
     from tabvis.ui.entry import cli
 
-    asyncio.run(cli.main())
+    try:
+        asyncio.run(cli.main())
+    except KeyboardInterrupt:
+        # Ctrl-C is a normal way to stop the long-running --serve mode. asyncio.run() translates
+        # cancellation from SIGINT back into KeyboardInterrupt after cleanup; do not print a
+        # traceback for an intentional shutdown.
+        return
 
 
 if __name__ == "__main__":

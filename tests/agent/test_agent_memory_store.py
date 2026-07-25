@@ -8,6 +8,7 @@ logical forget (not regenerated), physical erase, and the MEMORY.md bounds.
 from __future__ import annotations
 
 import os
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -218,10 +219,10 @@ def test_logical_forget_keeps_history_physical_erase_removes_it() -> None:
     # logical forget: hidden from reads, but the revision still physically contains it.
     s.forget("topic", tid)
     assert s.get_effective_snapshot().topics == []
-    assert "sensitive summary" in open(content_path, encoding="utf-8").read()
+    assert "sensitive summary" in Path(content_path).read_text(encoding="utf-8")
     # physical erase: gone from the revision content and its projections too.
     s.erase("topic", tid)
-    assert "sensitive summary" not in open(content_path, encoding="utf-8").read()
+    assert "sensitive summary" not in Path(content_path).read_text(encoding="utf-8")
     assert not os.path.exists(topics_dir) or not os.listdir(topics_dir)
 
 
@@ -233,7 +234,7 @@ def test_memory_index_respects_bounds() -> None:
     topics = [BrowsingTopic.create(f"topic-{i}", f"Topic {i}", "x" * 200) for i in range(500)]
     s.commit(MemorySnapshot(topics=topics))
 
-    text = open(s._p("MEMORY.md"), encoding="utf-8").read()
+    text = Path(s._p("MEMORY.md")).read_text(encoding="utf-8")
     assert len(text.splitlines()) <= MEMORY_MD_MAX_LINES
     assert len(text.encode("utf-8")) <= MEMORY_MD_MAX_BYTES
 

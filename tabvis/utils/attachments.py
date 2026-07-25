@@ -334,12 +334,10 @@ def _is_agent_swarms_enabled() -> bool:
 
 async def _maybe(label: str, f: Callable[[], Any]) -> list[Attachment]:
     """The TS ``maybe`` wrapper: run ``f``, swallow errors (→ ``[]``), 5%-sample telemetry."""
-    start = _now_ms()
     try:
         result = await f()
         if result is None:
             result = []
-        duration = _now_ms() - start
         if random.random() < 0.05:
             from tabvis.utils.slow_operations import json_stringify
 
@@ -350,18 +348,11 @@ async def _maybe(label: str, f: Callable[[], Any]) -> list[Attachment]:
                     size += len(s or "")
         return result
     except Exception as e:  # noqa: BLE001 (faithful: maybe swallows everything → [])
-        duration = _now_ms() - start
         if random.random() < 0.05:
             pass
         _log_error(e)
         _log_ant_error(f"Attachment error in {label}", e)
         return []
-
-
-def _now_ms() -> int:
-    return int(datetime.now(UTC).timestamp() * 1000)
-
-
 # --------------------------------------------------------------------------------------------
 # Queued commands / pending agent messages / image blocks.
 # --------------------------------------------------------------------------------------------
@@ -1345,10 +1336,7 @@ async def generate_file_attachment(
                 try:
                     from tabvis.utils.fs_operations import get_fs_implementation
 
-                    stats = await _maybe_await(get_fs_implementation().stat(filename))
-                    size = getattr(stats, "size", None) or (
-                        stats.get("size") if isinstance(stats, dict) else None
-                    )
+                    await _maybe_await(get_fs_implementation().stat(filename))
                     return None
                 except Exception:
                     pass
@@ -1839,6 +1827,13 @@ def _msg_content(message: dict[str, Any]) -> Any:
     if isinstance(msg, dict):
         return msg.get("content")
     return getattr(msg, "content", None) if msg is not None else None
+
+
+def _has_tool_result_content(content: Any) -> bool:
+    """Whether a message content array contains a tool-result block."""
+    return isinstance(content, list) and any(
+        isinstance(block, dict) and block.get("type") == "tool_result" for block in content
+    )
 
 
 def _attachment(message: dict[str, Any]) -> dict[str, Any]:

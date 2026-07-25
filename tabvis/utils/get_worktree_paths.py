@@ -22,7 +22,6 @@ paths — no wire-key dicts.
 from __future__ import annotations
 
 import os
-import time
 import unicodedata
 
 from tabvis.utils.exec_file_no_throw import exec_file_no_throw_with_cwd
@@ -48,15 +47,11 @@ async def get_worktree_paths(cwd: str) -> list[str]:
     Current worktree first, then the others alphabetically. ``[]`` if git is unavailable, not in a
     repo, or there is only one worktree.
     """
-    start_time = time.time() * 1000
-
     result = await exec_file_no_throw_with_cwd(
         _git_exe(),
         ["worktree", "list", "--porcelain"],
         {"cwd": cwd, "preserve_output_on_error": False},
     )
-
-    duration_ms = int(time.time() * 1000 - start_time)
 
     if result["code"] != 0:
         return []

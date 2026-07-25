@@ -8,6 +8,7 @@ session digests, and candidate validation.
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -118,7 +119,7 @@ def test_no_raw_dom_in_committed_memory() -> None:
     store = _store()
     _run(C.consolidate_run(store, _checkpoint(store), _evidence(), extractor=_extractor()))
     rev = store.get_current_revision()
-    content = open(store._p("revisions", rev, "content.json"), encoding="utf-8").read()
+    content = Path(store._p("revisions", rev, "content.json")).read_text(encoding="utf-8")
     assert "dom/deadbeef" not in content and "<html" not in content
 
 

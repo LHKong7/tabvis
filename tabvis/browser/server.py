@@ -985,10 +985,12 @@ async def serve_async(host: str | None = None, port: int | None = None, dev: boo
     except Exception:  # noqa: BLE001
         pass
 
-    print(f"tabvis agent console -> http://{host}:{port}/", flush=True)
+    print(f"tabvis agent API -> http://{host}:{port}/", flush=True)
     print(f"  POST http://{host}:{port}/agent   (SSE)   GET /agents  (manage)", flush=True)
     if dev:
         print("  --dev: console served live from web/ via Vite (HMR); edits reload in the browser", flush=True)
+    else:
+        print("  headless mode: run with --dev for the live web console", flush=True)
 
     config = uvicorn.Config(
         create_app(auth_required=auth_required, dev=dev), host=host, port=port, log_level="warning"
@@ -998,7 +1000,10 @@ async def serve_async(host: str | None = None, port: int | None = None, dev: boo
 
 def serve(host: str | None = None, port: int | None = None, dev: bool = False) -> None:
     """Blocking entry for contexts with no running loop (``python -m tabvis.browser.server``)."""
-    asyncio.run(serve_async(host, port, dev=dev))
+    try:
+        asyncio.run(serve_async(host, port, dev=dev))
+    except KeyboardInterrupt:
+        return
 
 
 if __name__ == "__main__":  # `python -m tabvis.browser.server`

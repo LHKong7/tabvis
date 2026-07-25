@@ -8,7 +8,6 @@ no wall-clock sleeps. ``config_home`` (autouse) roots on-disk state in a tmp dir
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 from typing import Any
 

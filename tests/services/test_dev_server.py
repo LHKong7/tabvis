@@ -6,7 +6,7 @@ import os
 
 from starlette.routing import Route
 
-from tabvis.browser import dev_server
+from tabvis.browser import dev_server, server
 from tabvis.browser.server import create_app
 
 
@@ -63,3 +63,13 @@ def test_dev_app_adds_vite_catchall() -> None:
     assert root.endpoint is dev_server.proxy_to_vite
     # API routes still present and NOT proxied
     assert "/health" in paths and "/agent" in paths
+
+
+def test_blocking_server_treats_keyboard_interrupt_as_clean_shutdown(monkeypatch) -> None:
+    def interrupted(coroutine):
+        coroutine.close()
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(server.asyncio, "run", interrupted)
+
+    server.serve()

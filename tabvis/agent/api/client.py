@@ -14,7 +14,6 @@ Not supported in this build: proxy/mTLS fetch options, Foundry/Azure, an
 from __future__ import annotations
 
 import os
-import uuid
 from collections.abc import Callable
 from typing import Any
 
@@ -22,6 +21,7 @@ from anthropic import AsyncAnthropic
 
 from tabvis.bootstrap.state import (
     get_is_non_interactive_session as _bootstrap_get_is_non_interactive_session,
+    get_session_id as _bootstrap_get_session_id,
 )
 from tabvis.bootstrap_macro import MACRO
 from tabvis.utils.debug import log_for_debugging
@@ -78,13 +78,9 @@ def apply_provider_sdk_env_adapter() -> None:
             os.environ.pop(sdk_name, None)
 
 
-# --- bootstrap/state stubs --------------------------------------------------------------------
-
-_SESSION_ID: str = str(uuid.uuid4())
-
-
 def get_session_id() -> str:
-    return _SESSION_ID
+    """Return the active bootstrap session, including switches for fresh and resumed runs."""
+    return str(_bootstrap_get_session_id())
 
 
 def get_is_non_interactive_session() -> bool:

@@ -36,6 +36,7 @@ from tabvis.authentication.models import AgentAuthenticationRequest, Authenticat
 from tabvis.authentication.profile_store import get_for_user
 from tabvis.browser.host import begin_authentication
 from tabvis.credential_broker.broker import CredentialBroker, new_request_id
+from tabvis.credential_broker.protocol import MAX_UNIX_SOCKET_PATH_BYTES
 from tabvis.credential_broker.secrets.keychain import NativeKeychainProvider
 from tabvis.dlp.gateway import get_dlp_gateway
 from tabvis.utils.debug import log_for_debugging
@@ -495,8 +496,7 @@ def _validate_broker_endpoint(endpoint: str) -> None:
         raise ManagedAuthenticationConfigurationError(
             "TABVIS_CREDENTIAL_BROKER_ENDPOINT must be an absolute Unix socket path"
         )
-    # sockaddr_un is commonly 104 bytes on macOS and 108 on Linux. Keep a portable margin.
-    if len(os.fsencode(endpoint)) > 100:
+    if len(os.fsencode(endpoint)) > MAX_UNIX_SOCKET_PATH_BYTES:
         raise ManagedAuthenticationConfigurationError(
             "TABVIS_CREDENTIAL_BROKER_ENDPOINT exceeds the portable Unix socket path limit"
         )

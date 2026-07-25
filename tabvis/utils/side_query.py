@@ -16,7 +16,6 @@ import os
 from typing import Any, TypedDict
 
 from tabvis.bootstrap.state import (
-    get_last_api_completion_timestamp,
     get_session_id,
     set_last_api_completion_timestamp,
 )
@@ -197,8 +196,6 @@ async def side_query(opts: SideQueryOptions) -> Any:
         }
 
     normalized_model = normalize_model_string_for_api(model)
-    start = _now_ms()
-
     params: dict[str, Any] = {
         "model": normalized_model,
         "max_tokens": max_tokens,
@@ -223,10 +220,7 @@ async def side_query(opts: SideQueryOptions) -> Any:
 
     response = await _create_message(client, params, signal)
 
-    request_id = getattr(response, "_request_id", None) or None
     now = _now_ms()
-    last_completion = get_last_api_completion_timestamp()
-    usage = response.usage
     set_last_api_completion_timestamp(now)
 
     return response

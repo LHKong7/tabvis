@@ -285,7 +285,6 @@ async def _load_markdown_files_for_subdir(
     subdir: TabvisConfigDirectory,
     cwd: str,
 ) -> list[MarkdownFile]:
-    search_start_time = time.time() * 1000.0
     user_dir = os.path.join(get_tabvis_config_home_dir(), subdir)
     managed_dir = os.path.join(get_managed_file_path(), ".tabvis", subdir)
     project_dirs = get_project_dirs_up_to_home(subdir, cwd)

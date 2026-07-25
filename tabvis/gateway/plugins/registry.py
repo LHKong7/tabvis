@@ -24,7 +24,6 @@ from tabvis.gateway.plugins.contract import (
     LOADED,
     READY,
     REJECTED,
-    STARTED,
     STOPPED,
     STOPPING,
     VALIDATED,
