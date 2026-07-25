@@ -3,7 +3,7 @@
   "private": true,
   "version": "0.0.0",
   "type": "module",
-  "description": "Tabvis agent console — React front-end for the tabvis HTTP/SSE API. Run live with `tabvis --serve --dev`, or `npm run build` to web/dist and host it yourself.",
+  "description": "Tabvis agent console — bundled React front-end for the tabvis HTTP/SSE API.",
   "scripts": {
     "dev": "vite",
     "build": "tsc --noEmit && vite build",

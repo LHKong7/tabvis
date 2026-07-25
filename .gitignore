@@ -31,10 +31,9 @@ htmlcov/
 .idea/
 .vscode/
 
-# Node / web console. Source in web/; tabvis ships NO built-in UI (headless API). The console is
-# run live with `tabvis --serve --dev`, or built to web/dist and hosted externally — never committed.
+# Node / web console. Source lives in web/; the production bundle is committed under
+# tabvis/browser/static so it is included in Python packages.
 node_modules/
 web/dist/
 *.tsbuildinfo
-tabvis/browser/static/          # legacy built-console location; no longer produced or served
 # NOTE: web/package-lock.json IS committed (locks JS deps, like uv.lock).

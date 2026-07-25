@@ -329,10 +329,9 @@ def create_app(auth_required: bool = False, dev: bool = False) -> Any:
     reject unauthenticated requests and enforce per-agent isolation. The default (False) preserves the
     open loopback/dev posture — an unauthenticated caller is the local admin.
 
-    ``dev`` (``--serve --dev``) starts the Vite dev server from ``web/`` and reverse-proxies the
-    console to it (live HMR from source). Without ``--dev`` tabvis serves NO built-in UI — it is a
-    headless JSON/SSE API and ``/`` returns a pointer to the two ways to get a console. API routes
-    are unaffected; under ``--dev`` only ``/`` and unmatched frontend asset paths proxy to Vite.
+    The bundled React console is served at ``/`` by default. ``dev`` (``--serve --dev``) replaces it
+    with the Vite dev server from ``web/`` and reverse-proxies live source/HMR traffic. API routes
+    always take precedence over the console's final SPA catch-all.
     """
     from sse_starlette.sse import EventSourceResponse
     from starlette.applications import Starlette
@@ -364,26 +363,6 @@ def create_app(auth_required: bool = False, dev: bool = False) -> Any:
         if decision.get("behavior") != "allow":
             return JSONResponse({"error": decision.get("message", "forbidden")}, status_code=403)
         return None
-
-    async def console(_request: Request) -> Any:
-        """GET / — tabvis serves NO built-in web UI; this is a JSON/SSE API. Point the user at the
-        two supported ways to get a console. (Under ``--dev`` this handler is replaced by a live-Vite
-        reverse proxy; see create_app.)"""
-        from starlette.responses import JSONResponse as _JSONResponse
-
-        return _JSONResponse(
-            {
-                "service": "tabvis",
-                "ui": "none — this is a headless JSON/SSE API",
-                "get_a_console": [
-                    "run `tabvis --serve --dev` for the live React console (Vite HMR from web/)",
-                    "or build web/ (`cd web && npm run build`) and host web/dist behind your own "
-                    "server, pointing it at this API",
-                ],
-                "api": ["GET /health", "GET/POST /config", "POST /agent (SSE)", "GET /agents"],
-            },
-            status_code=404,
-        )
 
     async def health(_request: Request) -> JSONResponse:
         # Counts come from the gateway's durable Run/Agent stores (design §7 Phase 6 convergence).
@@ -882,14 +861,16 @@ def create_app(auth_required: bool = False, dev: bool = False) -> Any:
         ("/browsers/close", close_browser_route, ["POST"]),
         ("/browser/session", browser_session, ["GET"]),
     ]
-    # The console at `/`: served from the built bundle, or (--dev) reverse-proxied to Vite.
+    # The console at `/`: served from the bundled production build, or reverse-proxied to Vite.
     if dev:
         from tabvis.browser.dev_server import proxy_to_vite
 
-        console_route = Route("/", proxy_to_vite, methods=["GET", "HEAD"])
+        console_endpoint = proxy_to_vite
     else:
-        console_route = Route("/", console, methods=["GET"])
-    routes = [console_route]  # the console UI (unversioned)
+        from tabvis.browser.web_console import serve_built_console
+
+        console_endpoint = serve_built_console
+    routes = [Route("/", console_endpoint, methods=["GET", "HEAD"])]  # unversioned console UI
     for path, handler, methods in api_routes:
         routes.append(Route(path, handler, methods=methods))
         routes.append(Route("/v1" + path, handler, methods=methods))
@@ -929,9 +910,9 @@ def create_app(auth_required: bool = False, dev: bool = False) -> Any:
         # /agents is now gateway-backed; the standalone /v1 command surface is the additional plane.
         routes.extend(gateway_routes(health_path="/v1/gateway/health", include_compat=False))
 
-    if dev:
-        # Catch-all LAST so API routes win; forwards Vite's module graph (/src/*, /@vite/*, …) to it.
-        routes.append(Route("/{path:path}", proxy_to_vite, methods=["GET", "HEAD"]))
+    # Catch-all LAST so API routes win. In dev it forwards Vite's module graph; in production it
+    # serves built assets and falls back to index.html for React Router locations.
+    routes.append(Route("/{path:path}", console_endpoint, methods=["GET", "HEAD"]))
 
     app = Starlette(routes=routes, lifespan=lifespan)
     # P0-2: transport hardening (security headers, body cap, default-deny CORS) — pure ASGI, so the
@@ -959,7 +940,8 @@ async def serve_async(host: str | None = None, port: int | None = None, dev: boo
     already runs inside ``asyncio.run(cli.main())`` (bootstrap_entry). So drive uvicorn's Server
     directly and await it on the loop we are already on.
 
-    ``dev`` reverse-proxies the console to a live Vite dev server started from ``web/``.
+    The bundled console is served by default. ``dev`` replaces it with a live Vite server from
+    ``web/`` for HMR.
     """
     import uvicorn
 
@@ -985,12 +967,12 @@ async def serve_async(host: str | None = None, port: int | None = None, dev: boo
     except Exception:  # noqa: BLE001
         pass
 
-    print(f"tabvis agent API -> http://{host}:{port}/", flush=True)
+    print(f"tabvis web console -> http://{host}:{port}/", flush=True)
     print(f"  POST http://{host}:{port}/agent   (SSE)   GET /agents  (manage)", flush=True)
     if dev:
         print("  --dev: console served live from web/ via Vite (HMR); edits reload in the browser", flush=True)
     else:
-        print("  headless mode: run with --dev for the live web console", flush=True)
+        print("  console served from the bundled production build", flush=True)
 
     config = uvicorn.Config(
         create_app(auth_required=auth_required, dev=dev), host=host, port=port, log_level="warning"

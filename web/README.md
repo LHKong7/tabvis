@@ -1,8 +1,16 @@
 # Tabvis agent console (React front-end)
 
-A **Vite + React + TypeScript** console for the tabvis HTTP/SSE API. tabvis itself is **headless —
-it ships no built-in UI**. You get a console one of two ways: run it live in dev, or build it and
-host the static bundle yourself (pointing it at the tabvis API).
+A **Vite + React + TypeScript** console for the tabvis HTTP/SSE API. Its production build is bundled
+inside the Python package and served automatically by `tabvis` / `tabvis --serve`. Vite remains
+available for live frontend development.
+
+## Run the production console
+
+```bash
+uv run tabvis                 # `uv run tabvis --serve` is equivalent
+```
+
+Open `http://127.0.0.1:8765/`. The console, HTTP API, and SSE streams share one origin.
 
 ## Develop
 
@@ -34,19 +42,16 @@ tabvis server you run separately (`uv run tabvis --serve` on `:8765`). Point the
 `TABVIS_SERVER=http://host:port npm run dev`. `TABVIS_WEB_DEV_PORT` sets only the HMR client port
 (default `5173`); to move Vite's actual listen port pass `npm run dev -- --port <n>`.
 
-## Build & host it yourself
+## Build the bundled console
 
 ```bash
 cd web
-npm run build        # tsc --noEmit, then a standard bundle in web/dist/
+npm run build        # tsc --noEmit, then bundle into tabvis/browser/static/
 ```
 
-`web/dist/` is a plain static bundle — serve it from any static host / CDN / your own reverse proxy,
-and make sure its API calls (`/health`, `/config`, `/agents`, `/agent` SSE, `/browsers`, …) reach a
-running tabvis server. Simplest: host `web/dist` and the tabvis API under the **same origin** (a
-reverse proxy that sends `/health`, `/config`, `/agent*`, `/browsers*`, `/workspaces*`, `/executions*`
-to tabvis and everything else to the static bundle) so no CORS is needed. `web/dist/` is **not**
-committed and **not** bundled into the Python package — tabvis serves no UI.
+`npm run build` writes the production bundle to `tabvis/browser/static/`. That directory is
+committed and included in Python packages, so the server can serve the console without Node/npm at
+runtime.
 
 ## Layout
 
@@ -57,7 +62,7 @@ The console is a small `react-router-dom` app: `main.tsx` mounts the router, `Ap
 ```
 web/
   index.html            Vite / bundle entry (#root + /src/main.tsx)
-  vite.config.ts        build (-> web/dist) + dev API proxy + HMR clientPort
+  vite.config.ts        build (-> tabvis/browser/static) + dev API proxy + HMR clientPort
   tsconfig.json         TS config (strict, noEmit)
   src/
     main.tsx            React entry — renders <App/> inside <BrowserRouter>
@@ -79,5 +84,5 @@ web/
       NewRun, AgentList, Stream, Detail, Settings, Driver, Setup, Health, Banner, Code
 ```
 
-Scripts (`package.json`): `dev` (Vite + HMR), `build` (`tsc --noEmit` then bundle to `web/dist/`),
-`typecheck` (`tsc --noEmit`), `preview` (`vite preview`).
+Scripts (`package.json`): `dev` (Vite + HMR), `build` (`tsc --noEmit` then bundle to
+`tabvis/browser/static/`), `typecheck` (`tsc --noEmit`), `preview` (`vite preview`).

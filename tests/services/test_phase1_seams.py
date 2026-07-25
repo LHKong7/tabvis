@@ -194,11 +194,14 @@ def test_rt1_v1_aliases_and_workspace_route() -> None:
     assert "/workspaces/{workspace_id}/snapshot" in paths
     assert "/v1/workspaces/{workspace_id}/snapshot" in paths
 
-    # Every legacy API path has a /v1 twin (skip the console and the /ui static mount).
+    # Every legacy API path has a /v1 twin (skip the console and its SPA fallback).
     legacy = {
         p
         for p in paths
-        if p and p != "/" and not p.startswith("/v1") and not p.startswith("/ui")
+        if p
+        and p not in {"/", "/{path:path}"}
+        and not p.startswith("/v1")
+        and not p.startswith("/ui")
     }
     for p in legacy:
         assert "/v1" + p in paths, f"missing /v1 alias for {p}"

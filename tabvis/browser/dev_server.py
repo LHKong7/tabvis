@@ -4,9 +4,8 @@
 Python server reverse-proxies every non-API request to it — so the React app is served live from
 source, on the SAME origin as the API. Edit ``web/src/*`` and the browser hot-reloads; no build step.
 
-Without ``--dev`` tabvis serves NO built-in UI (it is a headless JSON/SSE API); a console then comes
-only from an external host serving a build of ``web/`` (``npm run build`` -> ``web/dist``). This
-module and its Vite subprocess exist ONLY when ``--dev`` is set.
+Without ``--dev`` Tabvis serves the production bundle embedded in the Python package. This module
+and its Vite subprocess exist only when ``--dev`` is set.
 
 The HMR websocket connects straight to :5173 (``vite.config.ts`` sets ``server.hmr.clientPort``), so
 the Python side only ever proxies plain HTTP.

@@ -17,8 +17,8 @@
 
 ## What is Tabvis?
 
-Tabvis is a headless agent runtime built around one idea: an agent should be able to work across
-your local project and the live web in the same reasoning loop.
+Tabvis is a browser-native agent runtime built around one idea: an agent should be able to work
+across your local project and the live web in the same reasoning loop.
 
 Instead of fetching simplified page text, Tabvis drives a real Playwright browser. It sees an
 accessibility snapshot of the current page, acts on stable element references, and observes the
@@ -132,26 +132,27 @@ uv run tabvis -p "..." --output-format json
 uv run tabvis -p "..." --max-turns 20
 ```
 
-Tabvis is intentionally headless: without `-p/--print`, it prints usage guidance rather than
-starting an interactive terminal UI.
+One-shot runs are non-interactive and print their result to the terminal. Running `tabvis` without
+arguments starts the local Web console instead.
 
 ### Local agent service
 
-Run the HTTP/SSE server:
+Start the Web console and HTTP/SSE server (both commands are equivalent):
 
 ```bash
+uv run tabvis
 uv run tabvis --serve
-# JSON/SSE API on http://127.0.0.1:8765
+# Web console on http://127.0.0.1:8765/
 ```
 
-Tabvis is headless and serves **no built-in UI** by default — `GET /` returns a JSON pointer, and
-`/health` is the liveness probe. To use the bundled web console, either attach the live dev console:
+The production React bundle is included in the Python package and served from `/`; its API and SSE
+requests use the same origin. For frontend development, replace the production bundle with Vite:
 
 ```bash
 uv run tabvis --serve --dev     # starts Vite and reverse-proxies the console at http://127.0.0.1:8765/
 ```
 
-or build `web/` and host the static bundle yourself, pointed at the API (see [`web/README.md`](web/README.md)).
+See [`web/README.md`](web/README.md) for frontend development and build details.
 
 Launch an agent programmatically over SSE:
 
