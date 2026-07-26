@@ -26,7 +26,11 @@ export function summarize(ev: string, d: any): Summary {
           .join('\n') || null
       ) // null => hide empty turns
     case 'tool_use':
-      return `${d.name}(${JSON.stringify(d.input ?? {}).slice(0, 110)})`
+      {
+        const encoded = JSON.stringify(d.input ?? {})
+        const shown = encoded.length > 600 ? `${encoded.slice(0, 600)}… [truncated]` : encoded
+        return `${d.name}(${shown})`
+      }
     case 'tool_result':
       return (d.is_error ? '✗ ' : '') + String(d.content ?? '').split('\n').slice(0, 4).join('  ')
     case 'result':

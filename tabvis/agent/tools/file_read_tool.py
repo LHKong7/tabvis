@@ -305,7 +305,7 @@ async def _read_image_data(resolved_file_path: str) -> dict[str, Any]:
     return {"type": "image_unavailable", "file": {"filePath": resolved_file_path}}
 
 
-async def _read_pdf_data(resolved_file_path: str, pages: str | None) -> dict[str, Any]:  # noqa: ARG001
+async def _read_pdf_data(resolved_file_path: str, pages: str | None) -> dict[str, Any]:
     """Read a PDF for the active model.
 
     - Anthropic vision model → the PDF as a native ``document`` block (best fidelity; no poppler).
@@ -318,14 +318,51 @@ async def _read_pdf_data(resolved_file_path: str, pages: str | None) -> dict[str
 
     from tabvis.agent.api.providers import resolve_provider_name
     from tabvis.utils.model.model import get_main_loop_model, get_model_supports_vision
-    from tabvis.utils.pdf import extract_pdf_pages, read_pdf
+    from tabvis.utils.pdf import (
+        extract_pdf_pages,
+        extract_pdf_text,
+        get_pdf_page_count,
+        read_pdf,
+    )
 
     model = get_main_loop_model()
     provider = resolve_provider_name(model)
     vision = get_model_supports_vision(model, provider)
+    options = parse_pdf_page_range(pages) if pages else None
+
+    page_count = await get_pdf_page_count(resolved_file_path)
+    if pages is None and page_count is not None and page_count > PDF_AT_MENTION_INLINE_THRESHOLD:
+        return {
+            "type": "pdf_unavailable",
+            "file": {
+                "filePath": resolved_file_path,
+                "reason": (
+                    f"the PDF has {page_count} pages. Read it in ranges of at most "
+                    f"{PDF_MAX_PAGES_PER_READ} pages using the pages parameter, for example "
+                    'pages: "1-10". Do not repeat the same unpaged Read request'
+                ),
+            },
+        }
+
+    # Prefer selectable text. It works across model providers and avoids installing a Python PDF
+    # package just to inspect a document. Image/native fallbacks remain for scanned PDFs.
+    text_result = await extract_pdf_text(resolved_file_path, options)
+    if text_result.get("success"):
+        text = str(text_result["data"]["file"].get("text") or "")
+        if text.strip():
+            return {
+                "type": "pdf_text",
+                "file": {
+                    "filePath": resolved_file_path,
+                    "pages": pages,
+                    "pageCount": page_count,
+                    "text": text[:120_000]
+                    + (" …[PDF text truncated]" if len(text) > 120_000 else ""),
+                },
+            }
 
     # Anthropic vision + native PDF support → send the validated PDF as a document block (no poppler).
-    if vision and provider == "anthropic" and is_pdf_supported():
+    if pages is None and vision and provider == "anthropic" and is_pdf_supported():
         res = await read_pdf(resolved_file_path)
         if res.get("success"):
             return {"type": "pdf_document", "file": res["data"]["file"]}
@@ -335,7 +372,7 @@ async def _read_pdf_data(resolved_file_path: str, pages: str | None) -> dict[str
         # else (e.g. transient) fall through to rasterization
 
     # Rasterize the pages to JPEGs (needs poppler pdftoppm).
-    res = await extract_pdf_pages(resolved_file_path, None)
+    res = await extract_pdf_pages(resolved_file_path, options)
     if res.get("success"):
         out = res["data"]["file"]
         page_paths = sorted(_glob.glob(os.path.join(out["outputDir"], "*.jpg")))
@@ -750,6 +787,18 @@ class FileReadTool(Tool):
         dot = file_path.rfind(".")
         ext = file_path[dot + 1 :].lower() if dot != -1 else ""
         full_file_path = expand_path(file_path)
+        if not is_pdf_extension(ext):
+            def _has_pdf_magic() -> bool:
+                with open(full_file_path, "rb") as fh:
+                    return fh.read(5).startswith(b"%PDF-")
+
+            try:
+                if await asyncio.to_thread(_has_pdf_magic):
+                    # Dynamic endpoints used to be saved as ``get_pdf.cfm``. Content sniffing keeps
+                    # those existing workspace files on the native PDF path too.
+                    ext = "pdf"
+            except OSError:
+                pass  # the normal read path below produces the established missing-file error
 
         # Dedup: same exact range, file unchanged on disk → return a stub.
         existing_state = _state_get(read_file_state, full_file_path)
@@ -923,6 +972,18 @@ class FileReadTool(Tool):
                 )
             return {"tool_use_id": tool_use_id, "type": "tool_result", "content": blocks}
 
+        if data_type == "pdf_text":
+            file = data["file"]
+            page_label = f" pages {file['pages']}" if file.get("pages") else ""
+            return {
+                "tool_use_id": tool_use_id,
+                "type": "tool_result",
+                "content": (
+                    f"[PDF text extracted from {file['filePath']}{page_label}]\n\n"
+                    f"{(file.get('text') or '').strip()}"
+                ),
+            }
+
         if data_type == "pdf_ocr":
             file = data["file"]
             body = (file.get("text") or "").strip()
@@ -939,11 +1000,7 @@ class FileReadTool(Tool):
             return {
                 "tool_use_id": tool_use_id,
                 "type": "tool_result",
-                "content": (
-                    f"Cannot read PDF {file['filePath']}: {file.get('reason', '')}. Use an Anthropic "
-                    f"vision model, or install poppler (`brew install poppler` / `apt install "
-                    f"poppler-utils`) to render pages for image/OCR reading."
-                ),
+                "content": f"Cannot read PDF {file['filePath']}: {file.get('reason', '')}.",
             }
 
         if data_type == "pdf":

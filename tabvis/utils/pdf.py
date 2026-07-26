@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
 import uuid as uuid_module
 from typing import Generic, Literal, TypedDict, TypeVar
 
@@ -143,21 +144,129 @@ async def get_pdf_page_count(file_path: str) -> int | None:
 
     Returns ``None`` if ``pdfinfo`` is not available or the page count can't be determined.
     """
-    result = await exec_file_no_throw(
-        "pdfinfo",
-        [file_path],
-        {"timeout": 10_000, "use_cwd": False},
+    result = (
+        await exec_file_no_throw(
+            "pdfinfo",
+            [file_path],
+            {"timeout": 10_000, "use_cwd": False},
+        )
+        if shutil.which("pdfinfo")
+        else {"code": 1, "stdout": "", "stderr": ""}
     )
-    if result.get("code") != 0:
-        return None
-    match = re.search(r"^Pages:\s+(\d+)", result.get("stdout", ""), flags=re.MULTILINE)
-    if not match:
-        return None
+    if result.get("code") == 0:
+        match = re.search(r"^Pages:\s+(\d+)", result.get("stdout", ""), flags=re.MULTILINE)
+        if match:
+            try:
+                return int(match.group(1))
+            except ValueError:
+                pass
+
+    # Pure-Python fallback is a declared runtime dependency, so an Agent never needs to mutate its
+    # environment with ``pip install`` merely because the host has no Poppler binaries.
     try:
-        count = int(match.group(1))
-    except ValueError:
+        import asyncio
+
+        from pypdf import PdfReader
+
+        return await asyncio.to_thread(lambda: len(PdfReader(file_path).pages))
+    except Exception:  # noqa: BLE001 - page count is an optional optimization
         return None
-    return count
+
+
+async def extract_pdf_text(
+    file_path: str,
+    options: "ExtractPagesOptions | None" = None,
+) -> PDFResult:
+    """Extract selectable text with Poppler's ``pdftotext``.
+
+    This is the cheapest provider-independent PDF path: no Python package installation, no image
+    tokens, and the same 1-indexed inclusive page range as :func:`extract_pdf_pages`.
+    """
+    args = ["-layout"]
+    opts = options or {}
+    if opts.get("firstPage"):
+        args.extend(["-f", str(int(opts["firstPage"]))])
+    last_page = opts.get("lastPage")
+    if last_page and last_page != float("inf"):
+        args.extend(["-l", str(int(last_page))])
+    args.extend([file_path, "-"])
+    result = (
+        await exec_file_no_throw(
+            "pdftotext",
+            args,
+            {"timeout": 120_000, "use_cwd": False},
+        )
+        if shutil.which("pdftotext")
+        else {"code": 1, "stdout": "", "stderr": ""}
+    )
+    if result.get("code") == 0:
+        return {
+            "success": True,
+            "data": {
+                "type": "text",
+                "file": {
+                    "filePath": file_path,
+                    "text": result.get("stdout", ""),
+                },
+            },
+        }
+
+    try:
+        import asyncio
+
+        from pypdf import PdfReader
+
+        def _extract() -> str:
+            reader = PdfReader(file_path)
+            if reader.is_encrypted and not reader.decrypt(""):
+                raise PermissionError("PDF is password-protected")
+            first = max(1, int(opts.get("firstPage") or 1))
+            last_raw = opts.get("lastPage")
+            last = (
+                len(reader.pages)
+                if not last_raw or last_raw == float("inf")
+                else min(len(reader.pages), int(last_raw))
+            )
+            return "\n\f\n".join(
+                reader.pages[index].extract_text() or ""
+                for index in range(first - 1, last)
+            )
+
+        text = await asyncio.to_thread(_extract)
+        return {
+            "success": True,
+            "data": {
+                "type": "text",
+                "file": {"filePath": file_path, "text": text},
+            },
+        }
+    except ImportError:
+        return {
+            "success": False,
+            "error": {
+                "reason": "unavailable",
+                "message": (
+                    "PDF text extraction is unavailable. Restore the declared runtime dependencies "
+                    "with `uv sync` before starting Tabvis."
+                ),
+            },
+        }
+    except PermissionError:
+        return {
+            "success": False,
+            "error": {
+                "reason": "password_protected",
+                "message": "PDF is password-protected. Provide an unprotected version.",
+            },
+        }
+    except Exception as error:  # noqa: BLE001 - structured tool error, never escape
+        return {
+            "success": False,
+            "error": {
+                "reason": "unknown",
+                "message": f"PDF text extraction failed: {get_error_message(error)}",
+            },
+        }
 
 
 class ExtractPagesFile(TypedDict):

@@ -20,8 +20,13 @@ publication dates, tables, and links with stable absolute href fields.
 Use this instead of guessing a URL or requesting the full HTML:
  - For current/latest/recent information, extract the official listing page and compare plausible
    candidates by publication date and reporting period before choosing one.
+ - Treat an explicit source restriction as part of the task: do not silently use another domain to
+   fill a missing field. State that the requested source does not publish it, or clearly label any
+   separately authorized fallback source.
  - Set query to a distinctive term or year to return focused matches and candidate links.
  - Set scope to a CSS selector when only a page region matters (for example `main` or `article`).
+   If it does not match, the result says ``scope_matched=false`` and suggests visible candidate
+   containers instead of silently pretending the requested selector worked.
  - Links identify ordinary pages versus PDFs/downloads. Navigating directly to a PDF with
    BrowserNavigate captures it into the download workspace and the next snapshot tells you which
    path to Read; this is the non-interactive fallback when explicit BrowserDownload needs approval.

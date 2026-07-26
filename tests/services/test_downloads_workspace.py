@@ -26,6 +26,24 @@ def test_filename_from_url() -> None:
     assert downloads.filename_from_url(None) == "download"
 
 
+def test_filename_from_response_prefers_disposition_and_normalizes_pdf() -> None:
+    assert downloads.filename_from_response(
+        "https://x.test/get_pdf.cfm?id=1",
+        {
+            "content-type": "application/pdf",
+            "content-disposition": 'attachment; filename="AI RMF 1.0.pdf"',
+        },
+    ) == "AI RMF 1.0.pdf"
+    assert downloads.filename_from_response(
+        "https://x.test/get_pdf.cfm?id=1",
+        {"content-type": "application/pdf"},
+    ) == "get_pdf.cfm.pdf"
+    assert downloads.filename_from_response(
+        "https://x.test/download",
+        {"content-disposition": "attachment; filename*=UTF-8''caf%C3%A9.pdf"},
+    ) == "caf_.pdf"
+
+
 def test_safe_name_strips_paths_and_unsafe(monkeypatch) -> None:
     # a hostile suggested filename can't escape the dir
     assert downloads._safe_name("../../etc/passwd") == "passwd"

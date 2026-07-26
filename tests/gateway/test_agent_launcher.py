@@ -75,6 +75,99 @@ def test_launch_drives_run_to_completed_with_counters() -> None:
     asyncio.run(scenario())
 
 
+def test_running_run_persists_live_counters_before_terminal() -> None:
+    async def scenario() -> None:
+        rs = RunStore()
+        observed = asyncio.Event()
+        release = asyncio.Event()
+
+        async def stream(run, context):
+            yield _assistant("working", tool_uses=2)
+            observed.set()
+            await release.wait()
+            yield _result("done")
+
+        launcher = AgentRunLauncher(run_store=rs, stream_fn=stream)
+        orch = RunOrchestrator(rs, launcher=launcher)
+        run = await orch.create_and_start(
+            agent_id="ag_live", session_id="ses_live", command_id="cmd_live", prompt="x"
+        )
+        await observed.wait()
+        await asyncio.sleep(0)
+        current = rs.get_run(run.run_id)
+        assert current.status == runs.RUNNING
+        assert current.turns == 1 and current.tool_calls == 2
+        release.set()
+        await launcher.join(run.run_id)
+
+    asyncio.run(scenario())
+
+
+def test_web_permission_gate_pauses_for_ask_user_question_and_resumes() -> None:
+    async def scenario() -> None:
+        from tabvis.agent.tools.ask_user_question_tool import (
+            AskUserQuestionInput,
+            ask_user_question_tool,
+        )
+        from tabvis.gateway.runtime.interaction_service import InteractionService
+        from tabvis.tool import ToolUseContext
+
+        rs = RunStore()
+        run = rs.create_run(
+            agent_id="ag_question",
+            session_id="ses_question",
+            command_id="cmd_question",
+        )
+        rs.transition(run.run_id, runs.PREPARING)
+        rs.transition(run.run_id, runs.RUNNING)
+        launcher = AgentRunLauncher(run_store=rs)
+        gate = launcher._interactive_can_use_tool(run)
+        tool_input = AskUserQuestionInput.model_validate(
+            {
+                "questions": [
+                    {
+                        "question": "Which environment?",
+                        "header": "Environment",
+                        "options": [
+                            {"label": "Production", "description": "Use production"},
+                            {"label": "Staging", "description": "Use staging"},
+                        ],
+                    }
+                ]
+            }
+        )
+
+        task = asyncio.create_task(
+            gate(
+                ask_user_question_tool,
+                tool_input,
+                ToolUseContext(),
+                {"type": "assistant"},
+                "tool_1",
+            )
+        )
+        service = InteractionService(run_store=rs)
+        for _ in range(20):
+            pending = service.list_pending()
+            if pending:
+                break
+            await asyncio.sleep(0)
+        assert pending and rs.get_run(run.run_id).status == runs.WAITING_FOR_INPUT
+        service.respond(
+            pending[0].interaction_id,
+            {"Which environment?": "Staging"},
+            response_command_id="cmd_answer",
+        )
+        decision = await task
+        assert decision["behavior"] == "allow"
+        assert decision["updatedInput"]["answers"] == {
+            "Which environment?": "Staging"
+        }
+        assert rs.get_run(run.run_id).status == runs.RUNNING
+
+    asyncio.run(scenario())
+
+
 def test_launch_records_a_failed_run_on_error_result() -> None:
     async def scenario() -> None:
         rs = RunStore()

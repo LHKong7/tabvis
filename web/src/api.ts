@@ -5,6 +5,7 @@ import type {
   ConfigResponse,
   DriversResponse,
   Health,
+  InteractionRecord,
   Workspace,
 } from './types'
 
@@ -18,6 +19,20 @@ interface Result {
 
 const asResult = async (r: Response): Promise<Result> => ({ ok: r.ok, body: await r.json() })
 
+export function apiErrorMessage(body: any, fallback: string): string {
+  const error = body?.error
+  if (typeof error === 'string' && error.trim()) return error
+  if (error && typeof error === 'object') {
+    const message = typeof error.message === 'string' ? error.message : ''
+    const code = typeof error.code === 'string' ? error.code : ''
+    const trace = typeof error.trace_id === 'string' ? ` · trace ${error.trace_id}` : ''
+    if (message) return `${code ? `${code}: ` : ''}${message}${trace}`
+    if (code) return `${code}${trace}`
+  }
+  if (typeof body?.message === 'string' && body.message.trim()) return body.message
+  return fallback
+}
+
 export const api = {
   health: (): Promise<Health> => fetch('/health').then((r) => r.json()),
   list: (): Promise<{ agents: AgentSummary[] }> => fetch('/agents').then((r) => r.json()),
@@ -25,6 +40,20 @@ export const api = {
     fetch(`/agents/${id}`).then((r) => (r.ok ? r.json() : null)),
   browser: (id: string): Promise<BrowserView | null> =>
     fetch(`/agents/${id}/browser`).then((r) => (r.ok ? r.json() : null)),
+  interactions: (id: string): Promise<{ interactions: InteractionRecord[] }> =>
+    fetch(`/agents/${id}/interactions`).then((r) =>
+      r.ok ? r.json() : { interactions: [] },
+    ),
+  respondInteraction: (
+    agentId: string,
+    interactionId: string,
+    answers: Record<string, unknown>,
+  ): Promise<Result> =>
+    fetch(`/agents/${agentId}/interactions/${interactionId}/responses`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ answers }),
+    }).then(asResult),
   cancel: (id: string): Promise<Result> => fetch(`/agents/${id}/cancel`, { method: 'POST' }).then(asResult),
   quit: (id: string): Promise<Result> => fetch(`/agents/${id}/quit`, { method: 'POST' }).then(asResult),
   config: (): Promise<ConfigResponse> => fetch('/config').then((r) => r.json()),
@@ -68,7 +97,7 @@ export async function runAgent(
   })
   if (!res.ok) {
     const e = await res.json().catch(() => ({}))
-    const err = new RunError(e.error || `HTTP ${res.status}`)
+    const err = new RunError(apiErrorMessage(e, `HTTP ${res.status}`))
     err.status = res.status
     err.held_by = e.held_by
     throw err
@@ -128,7 +157,7 @@ export async function installDriverStream(
   })
   if (!res.ok) {
     const e = await res.json().catch(() => ({}))
-    throw new Error(e.error || `HTTP ${res.status}`)
+    throw new Error(apiErrorMessage(e, `HTTP ${res.status}`))
   }
   const reader = res.body!.getReader()
   const dec = new TextDecoder()

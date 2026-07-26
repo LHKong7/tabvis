@@ -30,7 +30,16 @@ export function Detail({ agent, browser, onCancel, onQuit, onContinue, cancellin
         <h2>Agent · {agent.agent_id}</h2>
         <div className="body">
           <div className="detail-head">
-            <span className={`status s-${agent.status}`}>{agent.status}</span>
+            <span
+              className={`status s-${agent.status}`}
+              title={
+                agent.status === 'completed'
+                  ? 'The run ended without a runtime error; review the result to verify the user goal.'
+                  : undefined
+              }
+            >
+              {agent.status}
+            </span>
             <span className="spacer"></span>
             <button
               title="Send a new prompt to this agent — continues its session, browser & profile"
@@ -50,6 +59,12 @@ export function Detail({ agent, browser, onCancel, onQuit, onContinue, cancellin
               Quit
             </button>
           </div>
+          {agent.status === 'completed' && (
+            <p className="hint">
+              Completed means the run ended successfully; it does not independently verify that the
+              requested outcome was achieved.
+            </p>
+          )}
           <dl>
             <dt>agent_id</dt>
             <dd>{agent.agent_id}</dd>

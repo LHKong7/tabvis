@@ -113,6 +113,19 @@ def _safe_full(value: str | None) -> str:
     return "[dlp_blocked]" if decision.blocked else str(decision.payload)
 
 
+def _wire_input(value: Any) -> dict[str, Any]:
+    """Serialize a validated tool input back to its public wire keys."""
+    if isinstance(value, dict):
+        return dict(value)
+    dump = getattr(value, "model_dump", None)
+    if callable(dump):
+        return dump(by_alias=True, exclude_none=True)
+    try:
+        return dict(value)
+    except (TypeError, ValueError):
+        return {}
+
+
 class AgentRunLauncher:
     def __init__(
         self,
@@ -206,6 +219,9 @@ class AgentRunLauncher:
                                 AGGREGATE_RUN, run.run_id, EventType.TOOL_COMPLETED, scope=scope,
                                 data={"turn": turns, **summary},
                             )
+                        self._runs.record_progress(
+                            run.run_id, turns=turns, tool_calls=tool_calls
+                        )
                     elif mtype == "result":
                         result_text = message.get("result")
                         is_error = bool(message.get("is_error"))
@@ -324,8 +340,105 @@ class AgentRunLauncher:
             skip_browser_init=bool(context.extra.get("skip_browser_init")),
             # A conversation-only resume does not write Agent Memory (§5.1).
             write_memory=(context.resume_mode != "conversation_only"),
+            # Unlike the one-shot CLI, the Web runtime has a durable interaction transport. Policy
+            # asks and AskUserQuestion therefore pause the same Run until the console responds.
+            can_use_tool=self._interactive_can_use_tool(run),
         ):
             yield m
+
+    def _interactive_can_use_tool(self, run: RunRecord):
+        async def decide(
+            tool: Any,
+            input: Any,
+            tool_context: Any,
+            assistant_message: dict[str, Any],  # noqa: ARG001
+            tool_use_id: str,  # noqa: ARG001
+            force_decision: Any | None = None,  # noqa: ARG001
+        ) -> dict[str, Any]:
+            from tabvis.agent.tools.ask_user_question_tool import (
+                ASK_USER_QUESTION_TOOL_NAME,
+            )
+            from tabvis.gateway.runtime import interactions
+            from tabvis.gateway.runtime.interaction_service import get_interaction_service
+            from tabvis.tool import get_empty_tool_permission_context
+            from tabvis.utils.permissions.permissions import get_deny_rule_for_tool
+
+            app_state = (
+                tool_context.get_app_state()
+                if getattr(tool_context, "get_app_state", None)
+                else None
+            )
+            permission_context = (
+                (app_state or {}).get("toolPermissionContext")
+                or get_empty_tool_permission_context()
+            )
+            if get_deny_rule_for_tool(permission_context, tool):
+                return {
+                    "behavior": "deny",
+                    "message": f"{tool.name} is denied by a permission rule.",
+                    "decisionReason": {"type": "rule"},
+                }
+
+            decision = await tool.check_permissions(input, tool_context)
+            behavior = decision.get("behavior")
+            if behavior == "passthrough":
+                return {
+                    "behavior": "allow",
+                    "updatedInput": decision.get("updatedInput", input),
+                }
+            if behavior != "ask":
+                return decision
+
+            kind = (
+                interactions.KIND_QUESTION
+                if tool.name == ASK_USER_QUESTION_TOOL_NAME
+                else interactions.KIND_APPROVAL
+            )
+            wire = _wire_input(decision.get("updatedInput", input))
+            request_payload: dict[str, Any] = {
+                "tool": tool.name,
+                "message": decision.get("message") or "User input required",
+            }
+            if kind == interactions.KIND_QUESTION:
+                request_payload["questions"] = wire.get("questions") or []
+            else:
+                request_payload["input"] = wire
+                if decision.get("decisionReason") is not None:
+                    request_payload["decisionReason"] = decision["decisionReason"]
+
+            from tabvis.dlp.gateway import get_dlp_gateway
+
+            scrubbed = get_dlp_gateway().scrub("api", request_payload)
+            if scrubbed.blocked or not isinstance(scrubbed.payload, dict):
+                return {
+                    "behavior": "deny",
+                    "message": "DLP blocked the interaction request.",
+                    "decisionReason": {"type": "dlp"},
+                }
+
+            service = get_interaction_service()
+            interaction = service.request(run.run_id, kind, scrubbed.payload)
+            answer = await service.wait(interaction.interaction_id)
+            if kind == interactions.KIND_QUESTION:
+                wire["answers"] = answer.get("answers", answer)
+                return {
+                    "behavior": "allow",
+                    "updatedInput": wire,
+                    "userModified": True,
+                }
+            if bool(answer.get("allow")):
+                return {
+                    "behavior": "allow",
+                    "updatedInput": wire,
+                    "userModified": True,
+                }
+            return {
+                "behavior": "deny",
+                "message": "The user denied this action.",
+                "decisionReason": {"type": "user"},
+            }
+
+        return decide
 
     def _fail_best_effort(self, run_id: str, error: str, turns: int, tool_calls: int) -> None:
         try:

@@ -121,6 +121,7 @@ class _NavigationResponse:
 
 class _DirectPdfResponse:
     ok = True
+    headers = {"content-type": "application/pdf"}
 
     async def body(self) -> bytes:
         return b"%PDF-1.7\nreal report bytes"
@@ -151,3 +152,15 @@ def test_pdf_navigation_refetches_when_chromium_returns_viewer_html() -> None:
     service, saved = asyncio.run(scenario())
     assert saved.startswith(b"%PDF-")
     assert service._downloads[0]["kind"] == "pdf"
+
+
+def test_dynamic_pdf_navigation_gets_a_pdf_suffix() -> None:
+    async def scenario() -> str:
+        service = BrowserService()
+        await service._capture_pdf_navigation(
+            _DirectPdfResponse(),
+            "https://example.test/get_pdf.cfm?pub_id=936225",
+        )
+        return service._downloads[0]["filename"]
+
+    assert asyncio.run(scenario()) == "get_pdf.cfm.pdf"

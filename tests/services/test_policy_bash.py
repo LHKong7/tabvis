@@ -42,6 +42,26 @@ def test_standard_allows_shell(monkeypatch: pytest.MonkeyPatch) -> None:
     assert evaluate_command("ls -la", _ctx())["behavior"] == "allow"
 
 
+@pytest.mark.parametrize(
+    "command",
+    [
+        "pip install pypdf",
+        "python -m pip install pypdf",
+        "uv pip install pypdf",
+        "npm install",
+        "brew install poppler",
+    ],
+)
+def test_standard_requires_approval_for_package_install(command: str) -> None:
+    decision = evaluate_command(command, _ctx())
+    assert decision["behavior"] == "ask"
+    assert decision["decisionReason"]["action"] == "environment.install"
+
+
+def test_non_install_runtime_command_is_still_allowed() -> None:
+    assert evaluate_command("uv run pytest -q", _ctx())["behavior"] == "allow"
+
+
 def test_locked_denies_shell_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("TABVIS_PERMISSION_MODE", "locked")
     d = evaluate_command("ls -la", _ctx())

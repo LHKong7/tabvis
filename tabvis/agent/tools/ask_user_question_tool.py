@@ -7,11 +7,10 @@ fed back in via the permission decision's ``updatedInput`` (so by the time :meth
 ``answers`` field is populated). The tool body itself never blocks — it just echoes back
 ``{questions, answers, annotations?}``.
 
-Headless / non-interactive behavior: the headless permission gate resolves an ``ask`` decision to
-**deny** (``docs/SPINE_CONTRACTS.md`` decision 3), so the tool's ``call`` is never reached with
-collected answers and the model receives the declined/denied result from the permission layer —
-it does NOT block waiting for a prompt. The non-interactive path of ``call`` (no ``answers``
-supplied) returns ``answers={}``.
+Runtime behavior: the one-shot CLI permission gate resolves an ``ask`` decision to **deny**
+(``docs/SPINE_CONTRACTS.md`` decision 3). The Web/Gateway runtime instead persists a pending
+Interaction, pauses the Run, and resumes it after the console submits the structured answer. The
+tool body itself remains transport-independent and never owns the wait.
 
 Casing: Python identifiers are snake_case; the validated input / output dicts and the tool_result
 block keep their wire keys (``questions``/``options``/``multiSelect``/``answers``/``annotations``;
@@ -344,9 +343,8 @@ class AskUserQuestionTool(Tool):
         return ValidationResult(result=True)
 
     async def check_permissions(self, input: Any, context: ToolUseContext):
-        # Always 'ask' — the question UI IS the permission prompt. In headless / non-interactive
-        # mode the gate resolves 'ask' to deny (docs/SPINE_CONTRACTS.md decision 3), so the model
-        # receives a declined result rather than blocking on a prompt.
+        # Always 'ask' — the consumer decides how to collect the answer. The one-shot CLI denies;
+        # the Web/Gateway runtime persists an Interaction and resumes this call with updatedInput.
         return {
             "behavior": "ask",
             "message": "Answer questions?",

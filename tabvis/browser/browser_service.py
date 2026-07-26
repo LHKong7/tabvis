@@ -130,13 +130,31 @@ _PAGE_EXTRACT_JS = r"""
       style.opacity !== '0' && (rect.width > 0 || rect.height > 0);
   };
   let root;
+  let scopeMatched = true;
   try {
-    root = document.querySelector(args.scope || 'main, article, [role="main"]') ||
+    root = args.scope ? document.querySelector(args.scope) : null;
+    if (args.scope && !root) scopeMatched = false;
+    root = root || document.querySelector('main, article, [role="main"]') ||
       document.body || document.documentElement;
   } catch (error) {
     return {error: `Invalid CSS scope: ${String(error && error.message || error)}`};
   }
   if (!root) return {error: 'The page has no readable document root.'};
+
+  const selectorHint = (el) => {
+    const tag = (el.tagName || 'div').toLocaleLowerCase();
+    if (el.id) return `${tag}#${CSS.escape(el.id)}`;
+    const role = el.getAttribute('role');
+    if (role) return `${tag}[role="${role}"]`;
+    const cls = Array.from(el.classList || []).filter(Boolean).slice(0, 2);
+    return cls.length ? `${tag}.${cls.map((x) => CSS.escape(x)).join('.')}` : tag;
+  };
+  const candidateScopes = scopeMatched ? [] :
+    Array.from(document.querySelectorAll('main, article, section, [role="main"], [role="region"]'))
+      .filter(visible)
+      .map((el) => ({selector: selectorHint(el), text: clean(el.innerText || el.textContent, 160)}))
+      .filter((item) => item.text)
+      .slice(0, 8);
 
   const maxItems = Math.max(1, Math.min(Number(args.max_items) || 100, 200));
   const query = clean(args.query || '', 200).toLocaleLowerCase();
@@ -210,6 +228,9 @@ _PAGE_EXTRACT_JS = r"""
   }
   return {
     scope: args.scope || 'main/article/body',
+    scope_matched: scopeMatched,
+    scope_fallback: scopeMatched ? null : 'main, article, [role="main"], body',
+    candidate_scopes: candidateScopes,
     query: args.query || null,
     text: query ? matches.join('\n...\n') : text,
     matches,
@@ -908,7 +929,8 @@ class BrowserService:
         if response is None:
             return
         try:
-            ctype = (response.headers or {}).get("content-type", "") if hasattr(response, "headers") else ""
+            headers = dict(response.headers or {}) if hasattr(response, "headers") else {}
+            ctype = headers.get("content-type", "")
             is_pdf = "application/pdf" in ctype.lower() or urlparse(url).path.lower().endswith(".pdf")
             if not is_pdf:
                 return
@@ -921,14 +943,21 @@ class BrowserService:
                 direct = await self._context.request.get(url)
                 if direct.ok:
                     body = await direct.body()
+                    headers = dict(getattr(direct, "headers", {}) or headers)
             if not body.startswith(b"%PDF-"):
                 log_for_debugging(
                     f"[BROWSER] pdf capture rejected non-PDF response for {url}"
                 )
                 return
-            from tabvis.browser.downloads import filename_from_url, get_workspace_dir, unique_path
+            from tabvis.browser.downloads import filename_from_response, get_workspace_dir, unique_path
 
-            dest = unique_path(get_workspace_dir(), filename_from_url(url, "page.pdf"))
+            # Trust the bytes as the final MIME signal even when a dynamic endpoint omitted its
+            # Content-Type. This also ensures script-looking URLs such as get_pdf.cfm become *.pdf.
+            headers["content-type"] = "application/pdf"
+            dest = unique_path(
+                get_workspace_dir(),
+                filename_from_response(url, headers, "page.pdf"),
+            )
             with open(dest, "wb") as fh:
                 fh.write(body)
             self._record_download(dest, url, "pdf", action="pdf_navigation", policy_effect="allow")
@@ -950,7 +979,7 @@ class BrowserService:
         This is the *explicit* BrowserDownload path — the tool already cleared ``browser.download``
         via ``check_permissions`` before we get here, so the file is agent-visible; it is recorded as
         an ``explicit_download`` artifact."""
-        from tabvis.browser.downloads import filename_from_url, get_workspace_dir, unique_path
+        from tabvis.browser.downloads import filename_from_response, get_workspace_dir, unique_path
 
         async with self._action_lock:
             if self._context is None:
@@ -960,7 +989,13 @@ class BrowserService:
             if not resp.ok:
                 raise BrowserError(f"Download failed: HTTP {resp.status} for {url}")
             body = await resp.body()
-            dest = unique_path(get_workspace_dir(), filename or filename_from_url(url))
+            response_headers = dict(getattr(resp, "headers", {}) or {})
+            derived = filename or filename_from_response(url, response_headers)
+            # A server can omit/mislabel Content-Type; magic bytes are authoritative for naming.
+            if body.startswith(b"%PDF-") and not filename:
+                response_headers["content-type"] = "application/pdf"
+                derived = filename_from_response(url, response_headers)
+            dest = unique_path(get_workspace_dir(), derived)
             with open(dest, "wb") as fh:
                 fh.write(body)
             entry = self._record_download(

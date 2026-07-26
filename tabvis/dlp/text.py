@@ -36,7 +36,14 @@ _EMAIL = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
 # reached the model.  A later digit cannot become a partial match because the preceding character
 # is itself a digit.  Natural-language phone numbers (including the formatted form covered by the
 # policy) still match.
-_PHONE = re.compile(r"(?<![\w/=?#&.\-])(\+?\d[\d\-\s]{7,}\d)(?![\w/?#&.\-])")
+_PHONE = re.compile(
+    r"(?<![\w/=?#&.\-])"
+    # ISO calendar dates are public facts, not identifiers. Keep this guard adjacent to the phone
+    # pattern so a date at the start of a sentence is not redacted merely because it has ten digits.
+    r"(?!\d{4}-\d{2}-\d{2}(?!\d))"
+    r"(\+?\d[\d\-\s]{7,}\d)"
+    r"(?![\w/?#&.\-])"
+)
 
 REDACTED = "[redacted]"
 

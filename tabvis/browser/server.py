@@ -825,6 +825,8 @@ def create_app(auth_required: bool = False, dev: bool = False) -> Any:
     list_agents = _gw_agent["list_agents"]
     get_agent = _gw_agent["get_agent"]
     cancel_agent = _gw_agent["cancel_agent"]
+    list_agent_interactions = _gw_agent["list_agent_interactions"]
+    respond_agent_interaction = _gw_agent["respond_agent_interaction"]
 
     # RT-1: one declarative table of API routes, each mounted at BOTH its legacy path and a ``/v1``
     # alias (same handler, byte-identical response), so the versioned Runtime API surface can grow
@@ -840,6 +842,12 @@ def create_app(auth_required: bool = False, dev: bool = False) -> Any:
         ("/agents", list_agents, ["GET"]),
         ("/agents/{agent_id}", get_agent, ["GET"]),
         ("/agents/{agent_id}/cancel", cancel_agent, ["POST"]),
+        ("/agents/{agent_id}/interactions", list_agent_interactions, ["GET"]),
+        (
+            "/agents/{agent_id}/interactions/{interaction_id}/responses",
+            respond_agent_interaction,
+            ["POST"],
+        ),
         ("/agents/{agent_id}/quit", quit_agent, ["POST"]),
         ("/agents/{agent_id}/browser", agent_browser, ["GET"]),
         ("/agents/{agent_id}/artifacts", agent_artifacts, ["GET"]),

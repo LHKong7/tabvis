@@ -1,7 +1,7 @@
 import { createContext, useCallback, useContext, useEffect, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { api, runAgent, RunError } from './api'
+import { api, apiErrorMessage, runAgent, RunError } from './api'
 import { summarize } from './format'
 import type { AgentSummary, Frame, Health } from './types'
 
@@ -76,14 +76,23 @@ export function AppProvider({ children }: { children: ReactNode }) {
       setBusy(true)
       setFrames([])
       const continuing = !!body.agent_id
+      let openedSession = false
       runAgent(body, ({ event, data }) => {
         if (event === '_id' || event === 'agent') {
           const id = data.agent_id
-          if (id && streamRef.current !== id) {
-            streamRef.current = id
-            setStreamFor(id)
-            if (!continuing) setRunOn(id) // chat continuation
-            navigate(`/sessions/${id}`)
+          if (id) {
+            if (streamRef.current !== id) {
+              streamRef.current = id
+              setStreamFor(id)
+            }
+            // A second Run may continue the same Agent ID. De-duplicate the two opening frames
+            // within this request, not against the previous request's Agent ID, or the second
+            // Continue stays forever on /run despite having started successfully.
+            if (!openedSession) {
+              openedSession = true
+              if (!continuing) setRunOn(id) // chat continuation
+              navigate(`/sessions/${id}`)
+            }
           }
         }
         push(event, data)
@@ -109,7 +118,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
     async (id: string) => {
       setCancel(true)
       const { ok, body } = await api.cancel(id)
-      if (!ok) push('error', { message: body.error })
+      if (!ok) push('error', { message: apiErrorMessage(body, 'Cancel failed') })
       setCancel(false)
     },
     [push],
@@ -119,7 +128,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
     async (id: string) => {
       setCancel(true)
       const { ok, body } = await api.quit(id)
-      if (!ok) push('error', { message: body.error })
+      if (!ok) push('error', { message: apiErrorMessage(body, 'Quit failed') })
       setCancel(false)
     },
     [push],

@@ -100,6 +100,24 @@ def test_registered_zero_run_agent_can_start_its_first_run() -> None:
     assert client.get("/agents/ag_zero").json()["status"] == "completed"
 
 
+def test_completed_agent_continue_reuses_the_previous_session() -> None:
+    app, gw = _app_with_fake_launcher(_msgs())
+    client = TestClient(app)
+    first = client.post("/agent", json={"prompt": "first"})
+    assert first.status_code == 200
+    agent_id = first.headers["x-agent-id"]
+    first_run = gw.runs.latest_run_for_agent(agent_id)
+
+    continued = client.post("/agent", json={"prompt": "continue", "agent_id": agent_id})
+    assert continued.status_code == 200
+    second_run = gw.runs.latest_run_for_agent(agent_id)
+
+    assert first_run is not None and second_run is not None
+    assert second_run.run_id != first_run.run_id
+    assert second_run.session_id == first_run.session_id
+    assert second_run.prompt == "continue"
+
+
 def test_capacity_returns_429(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("TABVIS_SERVER_MAX_AGENTS", "1")
     # seed one active (queued) run so the gateway is already at capacity.
@@ -116,6 +134,43 @@ def test_cancel_agent_through_the_gateway() -> None:
     RunStore().create_run(agent_id="ag_c", session_id="ses_c", command_id="cmd_c")
     resp = TestClient(app).post("/agents/ag_c/cancel")
     assert resp.status_code == 200 and resp.json()["status"] == "cancelled"
+
+
+def test_web_console_can_list_and_answer_an_agent_interaction() -> None:
+    app, gw = _app_with_fake_launcher(_msgs())
+    run = gw.runs.create_run(
+        agent_id="ag_question",
+        session_id="ses_question",
+        command_id="cmd_question",
+    )
+    gw.runs.transition(run.run_id, runs.PREPARING)
+    gw.runs.transition(run.run_id, runs.RUNNING)
+    interaction = gw.interactions.request(
+        run.run_id,
+        "question",
+        {
+            "tool": "AskUserQuestion",
+            "questions": [
+                {
+                    "question": "Which environment?",
+                    "options": [{"label": "Production"}, {"label": "Staging"}],
+                }
+            ],
+        },
+    )
+
+    client = TestClient(app)
+    pending = client.get("/agents/ag_question/interactions")
+    assert pending.status_code == 200
+    assert pending.json()["interactions"][0]["interaction_id"] == interaction.interaction_id
+
+    answered = client.post(
+        f"/agents/ag_question/interactions/{interaction.interaction_id}/responses",
+        json={"answers": {"Which environment?": "Staging"}},
+    )
+    assert answered.status_code == 200
+    assert answered.json()["interaction"]["status"] == "answered"
+    assert gw.runs.get_run(run.run_id).status == runs.RUNNING
 
 
 # --- real server, flag on: the read path is gateway-backed -------------------------------------

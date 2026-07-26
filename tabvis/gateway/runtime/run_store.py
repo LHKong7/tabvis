@@ -249,6 +249,22 @@ class RunStore:
         data = db.get_run(run_id)
         return RunRecord.from_dict(data) if data else None
 
+    def record_progress(self, run_id: str, *, turns: int, tool_calls: int) -> RunRecord:
+        """Persist monotonic live counters without changing the Run state.
+
+        Assistant/tool events remain the diagnostic source of truth; these denormalized counters
+        let list/detail clients show progress before the terminal transition.
+        """
+        with db.transaction() as conn:
+            current = db.get_run_in(conn, run_id)
+            if current is None:
+                raise GatewayError("RUN_NOT_FOUND", details={"run_id": run_id})
+            record = RunRecord.from_dict(current)
+            record.turns = max(record.turns, turns)
+            record.tool_calls = max(record.tool_calls, tool_calls)
+            db.update_run(conn, record.to_dict())
+        return record
+
     def record_result(self, run_id: str, result: str) -> None:
         """Persist a Run's full result text (out of the run row and events) for full-fidelity delivery."""
         db.put_run_result(run_id, result, created_at=_utc_now())

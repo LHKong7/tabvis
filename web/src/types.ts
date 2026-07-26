@@ -132,6 +132,33 @@ export interface DriversResponse {
   drivers: DriverInfo[]
 }
 
+export interface InteractionOption {
+  label: string
+  description?: string
+}
+
+export interface InteractionQuestion {
+  question: string
+  header?: string
+  options: InteractionOption[]
+  multiSelect?: boolean
+}
+
+export interface InteractionRecord {
+  interaction_id: string
+  run_id: string
+  agent_id?: string
+  kind: 'question' | 'approval'
+  status: string
+  request: {
+    tool?: string
+    message?: string
+    questions?: InteractionQuestion[]
+    input?: Record<string, unknown>
+  }
+  created_at?: string
+}
+
 // A rendered line in the live stream panel.
 export interface Frame {
   event: string

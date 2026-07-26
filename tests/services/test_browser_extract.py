@@ -22,6 +22,7 @@ class _Page:
 
     async def evaluate(self, script: str, args: dict) -> dict:
         assert "querySelectorAll('a[href]')" in script
+        assert "candidate_scopes" in script
         assert args["query"] == "2026"
         return {
             "scope": "main/article/body",

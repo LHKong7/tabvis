@@ -60,6 +60,14 @@ def test_mask_identifiers_preserves_numeric_web_identifiers() -> None:
     assert mask_identifiers(html) == html
 
 
+def test_mask_identifiers_preserves_iso_dates_and_numeric_query_values() -> None:
+    text = (
+        "Python 3.14.6 was released on 2026-06-10; "
+        "PDF: https://tsapps.nist.gov/publication/get_pdf.cfm?pub_id=936225"
+    )
+    assert mask_identifiers(text) == text
+
+
 def test_gateway_preserves_numeric_document_paths_in_nested_browser_data() -> None:
     url = "https://home.alibabagroup.com/en-US/document-1991237455038119936"
     decision = DLPGateway().scrub(

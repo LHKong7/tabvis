@@ -3,8 +3,9 @@ import { Link, useNavigate, useParams } from 'react-router-dom'
 import { useApp } from '../context'
 import { api } from '../api'
 import { Detail } from '../components/Detail'
+import { InteractionCard } from '../components/InteractionCard'
 import { Stream } from '../components/Stream'
-import type { AgentRecord, BrowserView } from '../types'
+import type { AgentRecord, BrowserView, InteractionRecord } from '../types'
 
 export function SessionDetailPage() {
   const { id } = useParams<{ id: string }>()
@@ -12,16 +13,22 @@ export function SessionDetailPage() {
   const navigate = useNavigate()
   const [agent, setAgent] = useState<AgentRecord | null>(null)
   const [browser, setBrowser] = useState<BrowserView | null>(null)
+  const [interactions, setInteractions] = useState<InteractionRecord[]>([])
 
   // Poll this session's record + browser while the page is open.
   useEffect(() => {
     if (!id) return
     let stop = false
     const tick = async () => {
-      const [a, b] = await Promise.all([api.get(id), api.browser(id)])
+      const [a, b, pending] = await Promise.all([
+        api.get(id),
+        api.browser(id),
+        api.interactions(id),
+      ])
       if (!stop) {
         setAgent(a)
         setBrowser(b)
+        setInteractions(pending.interactions || [])
       }
     }
     tick()
@@ -52,6 +59,18 @@ export function SessionDetailPage() {
       </header>
       <div className="split">
         <div className="split-main">
+          {interactions.map((interaction) => (
+            <InteractionCard
+              key={interaction.interaction_id}
+              agentId={id || ''}
+              interaction={interaction}
+              onAnswered={() =>
+                setInteractions((current) =>
+                  current.filter((item) => item.interaction_id !== interaction.interaction_id),
+                )
+              }
+            />
+          ))}
           <Stream frames={isLive ? frames : []} />
           {!isLive && (
             <p className="hint" style={{ marginTop: '8px' }}>
