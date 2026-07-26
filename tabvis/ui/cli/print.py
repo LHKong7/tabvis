@@ -376,20 +376,20 @@ async def stream_agent(
     # Terminal status for post-run consolidation; overwritten when the result frame arrives. Defaults
     # to "interrupted" so a cancel/crash before the result still records a truthful digest (§10.4).
     run_status = "interrupted"
-    # Register the session id in bootstrap state so the persistence layer agrees with the id we
-    # advertise to the SDK stream. record_transcript / get_transcript_path both derive the on-disk
-    # file name and the stamped "sessionId" from get_session_id() — NOT from this local variable —
-    # so without switch_session() the transcript would land under the bootstrap-default uuid and
-    # resume-by-id could not find it. On a Resume Plus the resolver supplies ``project_dir`` (the
-    # ORIGINAL session's project directory, possibly under a different cwd), so the transcript is read
-    # and written where it actually lives rather than re-derived from the current cwd.
+    # Keep the legacy process-global locator in sync for writers that have not migrated to
+    # RunContext yet. On Resume Plus, ``project_dir`` is the ORIGINAL session's project directory
+    # (possibly under a different cwd), so those fallback paths still resolve to the right place.
     switch_session(as_session_id(session_id), project_dir=project_dir)
 
-    # Bind the immutable per-Run locator (Resume Plus §4.1) for this task. Additive: writers that
-    # still read process-global session state are unaffected; this is the seam they migrate onto.
-    from tabvis.agent.run_context import RunContext, set_run_context
+    # Bind the immutable per-Run locator (Resume Plus §4.1) for this task. Transcript persistence
+    # reads it directly; other writers can migrate away from process-global state incrementally.
+    from tabvis.agent.run_context import (
+        RunContext,
+        reset_run_context,
+        set_run_context,
+    )
 
-    set_run_context(
+    run_context_token = set_run_context(
         RunContext(
             principal_id=principal_id,
             agent_id=agent_id,
@@ -635,7 +635,10 @@ async def stream_agent(
 
             await cleanup_all(mcp_clients)
 
-        unbind_agent(token)
+        try:
+            unbind_agent(token)
+        finally:
+            reset_run_context(run_context_token)
 
 
 async def _build_tools_with_mcp(permission_context: Any) -> tuple[Any, list[Any], dict[str, Any]]:
