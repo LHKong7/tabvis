@@ -784,6 +784,8 @@ def create_app(auth_required: bool = False, dev: bool = False) -> Any:
             if _dev_server is not None:
                 await _dev_server.start()  # fail loud if npm/web deps are missing
             _gw = getattr(_app.state, "gateway", None)
+            if _gw is not None:
+                await _gw.scheduler.start()
             if _gw is not None and getattr(_gw, "channels", None) is not None:
                 await _gw.channels.start()  # subscribe outbound delivery + start client-loop read loops
             yield
@@ -792,6 +794,11 @@ def create_app(auth_required: bool = False, dev: bool = False) -> Any:
             if gw is not None and getattr(gw, "channels", None) is not None:
                 try:
                     await gw.channels.stop()
+                except Exception:  # noqa: BLE001 - best-effort
+                    pass
+            if gw is not None:
+                try:
+                    await gw.scheduler.stop()
                 except Exception:  # noqa: BLE001 - best-effort
                     pass
             if _dev_server is not None:
@@ -895,7 +902,7 @@ def create_app(auth_required: bool = False, dev: bool = False) -> Any:
     # The gateway's durable Agent/Run stores back the /agents surface (design §7 Phase 6), so the
     # gateway is ALWAYS built. TABVIS_GATEWAY only gates the additional /v1 control-plane routes
     # (/v1/runs, /v1/events SSE, interactions, conversations).
-    from tabvis.gateway.access.http import gateway_routes
+    from tabvis.gateway.access.http import gateway_routes, scheduled_task_routes
     from tabvis.gateway.lifecycle import GatewayApplication
     from tabvis.gateway.runtime.agent import AgentRunLauncher
     from tabvis.gateway.runtime.context.sources import SourceCollector
@@ -919,6 +926,10 @@ def create_app(auth_required: bool = False, dev: bool = False) -> Any:
     if _gateway_enabled():
         # /agents is now gateway-backed; the standalone /v1 command surface is the additional plane.
         routes.extend(gateway_routes(health_path="/v1/gateway/health", include_compat=False))
+    else:
+        # Schedules power a first-class console page, so disabling the optional command/event surface
+        # does not make the page unusable.
+        routes.extend(scheduled_task_routes())
 
     # Catch-all LAST so API routes win. In dev it forwards Vite's module graph; in production it
     # serves built assets and falls back to index.html for React Router locations.

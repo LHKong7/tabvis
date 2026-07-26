@@ -9,11 +9,11 @@ from tabvis.gateway.runtime.run_store import get_run_store
 from tabvis.gateway.store import db
 
 
-def test_schema_is_v7_with_agents_and_run_results_tables() -> None:
-    assert db.SCHEMA_VERSION == 7
+def test_schema_is_v8_with_agents_run_results_and_scheduled_tasks_tables() -> None:
+    assert db.SCHEMA_VERSION == 8
     conn = db.connect()
     names = {r["name"] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-    assert "agents" in names and "runs" in names and "run_results" in names
+    assert {"agents", "runs", "run_results", "scheduled_tasks"} <= names
 
 
 def _agent_events(agent_id: str):

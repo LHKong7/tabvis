@@ -27,7 +27,7 @@ from typing import Any, Iterator
 
 from tabvis.browser.persistence.paths import get_browser_os_data_dir
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 GATEWAY_DB_FILENAME = "gateway.db"
 
 _lock = threading.RLock()
@@ -207,6 +207,22 @@ _DDL = (
         result     TEXT NOT NULL,
         created_at TEXT
     )""",
+    # v8: user-defined browser-agent schedules. The JSON blob is the lossless source of truth while
+    # the small column projection makes due-task polling and console listing cheap. Claim state stays
+    # in the blob: polling is single-process and claims are recovered on scheduler startup.
+    """CREATE TABLE IF NOT EXISTS scheduled_tasks (
+        scheduled_task_id TEXT PRIMARY KEY,
+        name              TEXT NOT NULL,
+        enabled           INTEGER NOT NULL,
+        schedule_type     TEXT NOT NULL,
+        next_run_at       TEXT,
+        resume_agent_id   TEXT,
+        last_run_id       TEXT,
+        created_at        TEXT,
+        updated_at        TEXT,
+        data              TEXT NOT NULL
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_scheduled_tasks_due ON scheduled_tasks(enabled, next_run_at)",
 )
 
 
@@ -396,6 +412,95 @@ def get_run_by_command(command_id: str) -> dict[str, Any] | None:
             "SELECT data FROM runs WHERE command_id = ? ORDER BY created_at ASC LIMIT 1", (command_id,)
         ).fetchone()
     return json.loads(row["data"]) if row else None
+
+
+# --------------------------------------------------------------------------- scheduled tasks
+
+
+def _scheduled_task_params(record: dict[str, Any]) -> tuple[Any, ...]:
+    return (
+        record["scheduled_task_id"],
+        record["name"],
+        1 if record.get("enabled") else 0,
+        record["schedule_type"],
+        record.get("next_run_at"),
+        record.get("resume_agent_id"),
+        record.get("last_run_id"),
+        record.get("created_at"),
+        record.get("updated_at"),
+        json.dumps(record, default=str),
+    )
+
+
+def insert_scheduled_task(conn: sqlite3.Connection, record: dict[str, Any]) -> None:
+    conn.execute(
+        "INSERT INTO scheduled_tasks "
+        "(scheduled_task_id, name, enabled, schedule_type, next_run_at, resume_agent_id, "
+        "last_run_id, created_at, updated_at, data) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        _scheduled_task_params(record),
+    )
+
+
+def update_scheduled_task_in(conn: sqlite3.Connection, record: dict[str, Any]) -> None:
+    params = _scheduled_task_params(record)
+    conn.execute(
+        "UPDATE scheduled_tasks SET name=?, enabled=?, schedule_type=?, next_run_at=?, "
+        "resume_agent_id=?, last_run_id=?, created_at=?, updated_at=?, data=? "
+        "WHERE scheduled_task_id=?",
+        (*params[1:], params[0]),
+    )
+
+
+def get_scheduled_task(scheduled_task_id: str) -> dict[str, Any] | None:
+    with _lock:
+        conn = connect()
+        row = conn.execute(
+            "SELECT data FROM scheduled_tasks WHERE scheduled_task_id = ?",
+            (scheduled_task_id,),
+        ).fetchone()
+    return json.loads(row["data"]) if row else None
+
+
+def get_scheduled_task_in(
+    conn: sqlite3.Connection, scheduled_task_id: str
+) -> dict[str, Any] | None:
+    row = conn.execute(
+        "SELECT data FROM scheduled_tasks WHERE scheduled_task_id = ?",
+        (scheduled_task_id,),
+    ).fetchone()
+    return json.loads(row["data"]) if row else None
+
+
+def list_scheduled_tasks() -> list[dict[str, Any]]:
+    with _lock:
+        conn = connect()
+        rows = conn.execute(
+            "SELECT data FROM scheduled_tasks ORDER BY created_at DESC, rowid DESC"
+        ).fetchall()
+    return [json.loads(row["data"]) for row in rows]
+
+
+def list_due_scheduled_tasks(now: str, *, limit: int = 16) -> list[dict[str, Any]]:
+    with _lock:
+        conn = connect()
+        rows = conn.execute(
+            "SELECT data FROM scheduled_tasks "
+            "WHERE enabled = 1 AND next_run_at IS NOT NULL AND next_run_at <= ? "
+            "ORDER BY next_run_at ASC LIMIT ?",
+            (now, max(1, limit)),
+        ).fetchall()
+    return [json.loads(row["data"]) for row in rows]
+
+
+def delete_scheduled_task(scheduled_task_id: str) -> bool:
+    with _lock:
+        conn = connect()
+        cursor = conn.execute(
+            "DELETE FROM scheduled_tasks WHERE scheduled_task_id = ?",
+            (scheduled_task_id,),
+        )
+        conn.commit()
+    return cursor.rowcount > 0
 
 
 # --------------------------------------------------------------------------- agents (durable aggregate)

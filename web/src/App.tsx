@@ -8,11 +8,13 @@ import { SessionDetailPage } from './pages/SessionDetailPage'
 import { DriversPage } from './pages/DriversPage'
 import { SettingsPage } from './pages/SettingsPage'
 import { SetupPage } from './pages/SetupPage'
+import { ScheduledTasksPage } from './pages/ScheduledTasksPage'
 
 const NAV = [
   { to: '/', label: 'Dashboard', icon: '◧', end: true },
   { to: '/run', label: 'New run', icon: '＋' },
   { to: '/sessions', label: 'Sessions', icon: '≣' },
+  { to: '/scheduled-tasks', label: 'Scheduled tasks', icon: '◷' },
   { to: '/drivers', label: 'Browser', icon: '◐' },
   { to: '/settings', label: 'Settings', icon: '⚙' },
   { to: '/setup', label: 'Setup', icon: '?' },
@@ -51,6 +53,7 @@ function Shell() {
           <Route path="/run" element={<RunPage />} />
           <Route path="/sessions" element={<SessionsPage />} />
           <Route path="/sessions/:id" element={<SessionDetailPage />} />
+          <Route path="/scheduled-tasks" element={<ScheduledTasksPage />} />
           <Route path="/drivers" element={<DriversPage />} />
           <Route path="/settings" element={<SettingsPage />} />
           <Route path="/setup" element={<SetupPage />} />

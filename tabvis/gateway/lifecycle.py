@@ -23,6 +23,10 @@ from tabvis.gateway.runtime.agents import AgentStore
 from tabvis.gateway.runtime.interaction_service import InteractionService, get_interaction_service
 from tabvis.gateway.runtime.orchestrator import RunLauncher, RunOrchestrator
 from tabvis.gateway.runtime.run_store import RunStore, get_run_store
+from tabvis.gateway.runtime.scheduled_tasks import (
+    ScheduledTaskScheduler,
+    ScheduledTaskStore,
+)
 from tabvis.gateway.store import db
 from tabvis.utils.env_utils import is_env_truthy
 
@@ -57,6 +61,16 @@ class GatewayApplication:
         self.status: GatewayStatus = "starting"
         # Optional IM channel runtime, attached by the server when TABVIS_CHANNELS is set (design §4).
         self.channels: Any = None
+        # Persistent prompt schedules are part of the same control plane. The async polling loop is
+        # started/stopped by the ASGI lifespan; construction itself remains synchronous and testable.
+        self.scheduled_tasks = ScheduledTaskStore()
+        self.scheduler = ScheduledTaskScheduler(
+            self.scheduled_tasks,
+            router,
+            run_store,
+            self.agents,
+            max_runs=max_runs,
+        )
         # Managed-authentication composition is process-scoped and shared by Gateway Runs. It is
         # created during startup (not from model input) so invalid production wiring fails before
         # the service advertises readiness.
@@ -143,6 +157,10 @@ class GatewayApplication:
                     else "not_configured"
                 ),
                 "channels": self.channels.health() if self.channels is not None else {},
+                "scheduler": {
+                    "status": "running" if self.scheduler.running else "stopped",
+                    "tasks": len(self.scheduled_tasks.list()),
+                },
             },
             "capacity": {"runs": self.max_runs, "available": max(0, self.max_runs - active)},
         }

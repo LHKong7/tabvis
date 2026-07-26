@@ -159,6 +159,31 @@ export interface InteractionRecord {
   created_at?: string
 }
 
+export type ScheduleType = 'once' | 'interval'
+
+export interface ScheduledTask {
+  scheduled_task_id: string
+  name: string
+  prompt: string
+  schedule_type: ScheduleType
+  enabled: boolean
+  run_at?: string | null
+  interval_seconds?: number | null
+  next_run_at?: string | null
+  resume_agent_id?: string | null
+  profile?: string | null
+  model?: string | null
+  max_turns?: number | null
+  last_run_id?: string | null
+  last_run_at?: string | null
+  last_status?: string | null
+  last_error?: string | null
+  last_agent_id?: string | null
+  last_session_id?: string | null
+  created_at: string
+  updated_at: string
+}
+
 // A rendered line in the live stream panel.
 export interface Frame {
   event: string

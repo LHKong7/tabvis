@@ -6,6 +6,7 @@ import type {
   DriversResponse,
   Health,
   InteractionRecord,
+  ScheduledTask,
   Workspace,
 } from './types'
 
@@ -78,6 +79,29 @@ export const api = {
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify(body),
     }).then(asResult),
+  scheduledTasks: (): Promise<{ scheduled_tasks: ScheduledTask[]; count: number }> =>
+    fetch('/v1/scheduled-tasks').then((r) =>
+      r.ok ? r.json() : Promise.reject(new Error(`HTTP ${r.status}`)),
+    ),
+  createScheduledTask: (body: Record<string, unknown>): Promise<Result> =>
+    fetch('/v1/scheduled-tasks', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    }).then(asResult),
+  updateScheduledTask: (
+    scheduledTaskId: string,
+    body: Record<string, unknown>,
+  ): Promise<Result> =>
+    fetch(`/v1/scheduled-tasks/${scheduledTaskId}`, {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    }).then(asResult),
+  deleteScheduledTask: (scheduledTaskId: string): Promise<Result> =>
+    fetch(`/v1/scheduled-tasks/${scheduledTaskId}`, { method: 'DELETE' }).then(asResult),
+  runScheduledTask: (scheduledTaskId: string): Promise<Result> =>
+    fetch(`/v1/scheduled-tasks/${scheduledTaskId}/run`, { method: 'POST' }).then(asResult),
 }
 
 export interface RunFrame {

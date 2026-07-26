@@ -8,6 +8,7 @@ the existing ``server_auth.SecurityMiddleware`` so the gateway's posture matches
 
 from __future__ import annotations
 
+import contextlib
 import secrets
 from typing import Any
 
@@ -157,6 +158,124 @@ async def subscribe_events(request: Request) -> Response:
         is_disconnected=request.is_disconnected,
     )
     return EventSourceResponse(generator)
+
+
+# --- scheduled browser-agent tasks -------------------------------------------------------------
+
+
+def _require_schedule_admin(principal: Principal) -> None:
+    if not principal.is_admin:
+        raise GatewayError(
+            "FORBIDDEN", message="scheduled tasks require an administrator principal"
+        )
+
+
+def _scheduled_task_view(gateway: GatewayApplication, record: Any) -> dict[str, Any]:
+    """Return current last-Run status without rewriting the schedule on every UI poll."""
+    view = record.to_dict()
+    if record.last_run_id:
+        run = gateway.runs.get_run(record.last_run_id)
+        if run is not None:
+            view["last_status"] = run.status
+            view["last_agent_id"] = run.agent_id
+            view["last_session_id"] = run.session_id
+            if run.error_code:
+                view["last_error"] = run.error_code
+    return view
+
+
+async def list_scheduled_tasks(request: Request) -> Response:
+    try:
+        principal = await _principal(request)
+        _require_schedule_admin(principal)
+        gateway: GatewayApplication = request.app.state.gateway
+        tasks = [
+            _scheduled_task_view(gateway, record)
+            for record in gateway.scheduled_tasks.list()
+        ]
+        return JSONResponse({"scheduled_tasks": tasks, "count": len(tasks)})
+    except GatewayError as err:
+        return _error_response(err)
+
+
+async def create_scheduled_task(request: Request) -> Response:
+    try:
+        principal = await _principal(request)
+        _require_schedule_admin(principal)
+        body = await _read_json(request)
+        gateway: GatewayApplication = request.app.state.gateway
+        record = gateway.scheduled_tasks.create(
+            body, principal_id=principal.principal_id
+        )
+        gateway.scheduler.wake()
+        return JSONResponse(
+            {"scheduled_task": _scheduled_task_view(gateway, record)}, status_code=201
+        )
+    except GatewayError as err:
+        return _error_response(err)
+
+
+async def read_scheduled_task(request: Request) -> Response:
+    try:
+        principal = await _principal(request)
+        _require_schedule_admin(principal)
+        gateway: GatewayApplication = request.app.state.gateway
+        scheduled_task_id = request.path_params["scheduled_task_id"]
+        record = gateway.scheduled_tasks.get(scheduled_task_id)
+        if record is None:
+            raise GatewayError(
+                "NOT_FOUND",
+                message="unknown scheduled task",
+                details={"scheduled_task_id": scheduled_task_id},
+            )
+        return JSONResponse({"scheduled_task": _scheduled_task_view(gateway, record)})
+    except GatewayError as err:
+        return _error_response(err)
+
+
+async def update_scheduled_task(request: Request) -> Response:
+    try:
+        principal = await _principal(request)
+        _require_schedule_admin(principal)
+        body = await _read_json(request)
+        gateway: GatewayApplication = request.app.state.gateway
+        record = gateway.scheduled_tasks.update(
+            request.path_params["scheduled_task_id"], body
+        )
+        gateway.scheduler.wake()
+        return JSONResponse({"scheduled_task": _scheduled_task_view(gateway, record)})
+    except GatewayError as err:
+        return _error_response(err)
+
+
+async def delete_scheduled_task(request: Request) -> Response:
+    try:
+        principal = await _principal(request)
+        _require_schedule_admin(principal)
+        gateway: GatewayApplication = request.app.state.gateway
+        scheduled_task_id = request.path_params["scheduled_task_id"]
+        gateway.scheduled_tasks.delete(scheduled_task_id)
+        return JSONResponse(
+            {"scheduled_task_id": scheduled_task_id, "deleted": True}
+        )
+    except GatewayError as err:
+        return _error_response(err)
+
+
+async def run_scheduled_task_now(request: Request) -> Response:
+    try:
+        principal = await _principal(request)
+        _require_schedule_admin(principal)
+        gateway: GatewayApplication = request.app.state.gateway
+        record = await gateway.scheduler.run_now(
+            request.path_params["scheduled_task_id"]
+        )
+        return JSONResponse(
+            {"scheduled_task": _scheduled_task_view(gateway, record)},
+            status_code=202,
+        )
+    except GatewayError as err:
+        return _error_response(err)
 
 
 # --- IM channel ingress (design §4.5 inbound flow) ---------------------------------------------
@@ -331,6 +450,34 @@ async def agent_events_compat(request: Request) -> Response:
     return EventSourceResponse(_frames())
 
 
+def scheduled_task_routes() -> list[Route]:
+    """Routes needed by the Web console even when the optional extra gateway surface is disabled."""
+    return [
+        Route("/v1/scheduled-tasks", list_scheduled_tasks, methods=["GET"]),
+        Route("/v1/scheduled-tasks", create_scheduled_task, methods=["POST"]),
+        Route(
+            "/v1/scheduled-tasks/{scheduled_task_id}",
+            read_scheduled_task,
+            methods=["GET"],
+        ),
+        Route(
+            "/v1/scheduled-tasks/{scheduled_task_id}",
+            update_scheduled_task,
+            methods=["PATCH"],
+        ),
+        Route(
+            "/v1/scheduled-tasks/{scheduled_task_id}",
+            delete_scheduled_task,
+            methods=["DELETE"],
+        ),
+        Route(
+            "/v1/scheduled-tasks/{scheduled_task_id}/run",
+            run_scheduled_task_now,
+            methods=["POST"],
+        ),
+    ]
+
+
 def gateway_routes(*, health_path: str = "/v1/health", include_compat: bool = True) -> list[Route]:
     """The gateway's §9.4 HTTP routes, as a splice-able list.
 
@@ -349,6 +496,7 @@ def gateway_routes(*, health_path: str = "/v1/health", include_compat: bool = Tr
         Route("/v1/channels/{plugin}/webhook", channel_webhook, methods=["POST"]),
         Route("/v1/channels/{plugin}/webhook", channel_webhook_verify, methods=["GET"]),
     ]
+    routes += scheduled_task_routes()
     if health_path:
         routes.insert(0, Route(health_path, health, methods=["GET"]))
     if include_compat:
@@ -367,7 +515,17 @@ def create_gateway_app(gateway: GatewayApplication | None = None, *, launcher: A
     """Build the standalone gateway ASGI app. Pass a prebuilt ``gateway`` or let one be composed."""
     app_gateway = gateway or GatewayApplication.build(launcher=launcher)
     app_gateway.startup()
-    app = Starlette(routes=gateway_routes())
+
+    @contextlib.asynccontextmanager
+    async def lifespan(_app: Starlette):
+        await app_gateway.scheduler.start()
+        try:
+            yield
+        finally:
+            await app_gateway.scheduler.stop()
+            app_gateway.drain()
+
+    app = Starlette(routes=gateway_routes(), lifespan=lifespan)
     app.add_middleware(SecurityMiddleware)
     app.state.gateway = app_gateway
     return app
