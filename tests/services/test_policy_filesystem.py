@@ -151,6 +151,29 @@ def test_explicit_fix_request_keeps_workspace_write_allowed(
     assert decision["behavior"] == "allow"
 
 
+@pytest.mark.parametrize(
+    "prompt",
+    [
+        "把报告写到 docs/report.md，不要修改其他文件。",
+        "Write the report to docs/report.md, but do not modify any other files.",
+    ],
+)
+def test_explicit_target_write_with_other_files_guardrail_is_allowed(
+    tmp_path, monkeypatch: pytest.MonkeyPatch, prompt: str
+) -> None:
+    _patch_roots(monkeypatch, str(tmp_path), str(tmp_path / ".cfg"))
+    context = _ctx_with_prompts(prompt)
+
+    decision = evaluate_path(
+        "filesystem.write",
+        "docs/report.md",
+        context,
+        {"file_path": "docs/report.md"},
+    )
+
+    assert decision["behavior"] == "allow"
+
+
 def test_explicit_do_not_modify_overrides_mutation_words(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

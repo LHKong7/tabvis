@@ -23,7 +23,7 @@ snapshot with new refs.
 Usage:
  - down=true scrolls toward later content; down=false scrolls toward earlier content.
  - pages is measured in viewport heights and may be fractional. Multi-page requests are delivered
-   one page at a time so lazy-loaded content can react between steps.
+   one page at a time as native mouse-wheel events so lazy-loaded content can react between steps.
  - Set ref to scroll a specific container. Omit ref to scroll the main page.
  - Read the returned snapshot before acting because scrolling rebuilds the current ref map."""
 

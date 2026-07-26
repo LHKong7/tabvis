@@ -69,3 +69,9 @@ def test_browser_research_requires_field_and_year_grounding() -> None:
     assert "explicit in the source, inferred, or not found" in text
     assert "free admission does not by itself prove" in text
     assert "recurring seasonal range with no year is not proof" in text
+    assert "an abstract page is discovery only" in text
+    assert "methods, data/experimental setup, results, limitations" in text
+    assert "pageCount, coverage status, and nextPages" in text
+    assert "native mouse/keyboard events" in text
+    assert "Research like a considerate human, not a crawler" in text
+    assert "After HTTP 403/429, a CAPTCHA" in text

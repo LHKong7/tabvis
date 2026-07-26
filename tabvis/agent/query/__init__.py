@@ -23,6 +23,7 @@ from tabvis.agent.query.deps import QueryDeps, production_deps
 from tabvis.agent.tool_services.tool_orchestration import run_tools
 from tabvis.tool import ToolUseContext
 from tabvis.types.can_use_tool import CanUseToolFn
+from tabvis.utils.messages import create_user_message
 from tabvis.utils.system_prompt_type import SystemPrompt
 
 __all__ = ["Terminal", "production_deps", "query"]
@@ -64,6 +65,27 @@ def _is_api_error_turn(assistant_messages: list[dict[str, Any]]) -> bool:
     return any(isinstance(m, dict) and m.get("isApiErrorMessage") for m in assistant_messages)
 
 
+def _restore_research_evidence_after_compaction(
+    messages: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Re-inject durable BrowserExtract checkpoints after a lossy model summary.
+
+    Compaction intentionally replaces the live message list. Exact source URLs, dates, and numbers
+    must not depend on the summary model remembering them, so append a low-privilege user context
+    block rebuilt from the append-only browser artifact log.
+    """
+    try:
+        from tabvis.bootstrap.state import get_session_id
+        from tabvis.browser.artifacts import render_research_evidence_context
+
+        evidence = render_research_evidence_context(str(get_session_id()))
+        if evidence:
+            return [*messages, create_user_message(content=evidence, is_meta=True)]
+    except Exception:  # noqa: BLE001 - evidence recovery must never break compaction
+        pass
+    return messages
+
+
 async def query(params: QueryParams) -> AsyncGenerator[Any, None]:
     """Run the agent loop, yielding stream events + messages, ending with a :class:`Terminal`."""
     messages = list(params.messages)
@@ -102,7 +124,9 @@ async def query(params: QueryParams) -> AsyncGenerator[Any, None]:
             if "consecutiveFailures" in ac_result:
                 auto_compact_tracking["consecutiveFailures"] = ac_result["consecutiveFailures"]
             if ac_result.get("wasCompacted") and ac_result.get("compactionResult"):
-                messages = build_post_compact_messages(ac_result["compactionResult"])
+                messages = _restore_research_evidence_after_compaction(
+                    build_post_compact_messages(ac_result["compactionResult"])
+                )
                 auto_compact_tracking["compacted"] = True
         except Exception:  # noqa: BLE001 — fail-open: compaction must never crash the headless run
             from tabvis.utils.debug import log_for_debugging

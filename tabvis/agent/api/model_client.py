@@ -56,17 +56,30 @@ from tabvis.utils.messages import (
 from tabvis.utils.model.model import get_model_supports_vision, normalize_model_string_for_api
 from tabvis.utils.system_prompt_type import SystemPrompt
 from tabvis.utils.thinking import DISABLED_THINKING, ThinkingConfig
+from tabvis.utils.tool_search import (
+    extract_discovered_tool_names,
+    is_tool_search_enabled,
+)
 
-DEFAULT_MAX_OUTPUT_TOKENS = 8192
+DEFAULT_MAX_OUTPUT_TOKENS = 32_000
 
 
-def get_max_output_tokens() -> int:
+def get_max_output_tokens(model: str | None = None) -> int:
+    """Resolve the per-request output budget.
+
+    An explicit environment override always wins.  Otherwise use the selected model's advertised
+    default instead of the old fixed 8k budget.  The fixed budget was too small for otherwise valid
+    long tool inputs (for example, writing a research report): the provider stopped midway through
+    the streamed JSON and the agent retried the same incomplete tool call forever.
+    """
     raw = os.environ.get("TABVIS_MAX_OUTPUT_TOKENS")
     if raw:
         try:
             return int(raw)
         except ValueError:
             pass
+    if model:
+        return get_model_max_output_tokens(model)["default"]
     return DEFAULT_MAX_OUTPUT_TOKENS
 
 
@@ -422,6 +435,50 @@ class _BufferedStream:
         return _gen()
 
 
+async def select_tools_for_model_request(
+    messages: list[dict[str, Any]],
+    tools: Tools,
+    options: Options,
+) -> list[Any]:
+    """Return the schemas that should be visible to the model on this request.
+
+    Execution still receives the complete registry. Only the API schema surface is reduced:
+    core tools and ToolSearch stay visible, while deferred tools become visible after a
+    ToolSearch result (or an earlier call) recorded their names. The selected set is reconstructed
+    from durable message history, so compaction/resume do not need process-local state.
+    """
+    if not tools:
+        return []
+
+    async def _empty_permission_context() -> Any:
+        from tabvis.tool import get_empty_tool_permission_context
+
+        return get_empty_tool_permission_context()
+
+    get_permission_context = (
+        options.get_tool_permission_context or _empty_permission_context
+    )
+    enabled = await is_tool_search_enabled(
+        options.model,
+        tools,
+        get_permission_context,
+        options.agents,
+        options.query_source,
+    )
+    if not enabled:
+        return list(tools)
+
+    from tabvis.agent.tools.tool_search_tool import is_deferred_tool
+
+    discovered = extract_discovered_tool_names(messages)
+    selected = [
+        tool
+        for tool in tools
+        if not is_deferred_tool(tool) or tool.name in discovered
+    ]
+    return selected
+
+
 async def query_model_with_streaming(
     *,
     messages: list[dict[str, Any]],
@@ -448,12 +505,17 @@ async def query_model_with_streaming(
         "model": options.model,
         "get_tool_permission_context": options.get_tool_permission_context,
     }
+    request_tools = await select_tools_for_model_request(messages, tools, options)
     tool_schemas = (
-        list(await asyncio.gather(*[tool_to_api_schema(t, tool_opts) for t in tools]))
-        if tools
+        list(
+            await asyncio.gather(
+                *[tool_to_api_schema(t, tool_opts) for t in request_tools]
+            )
+        )
+        if request_tools
         else []
     )
-    max_tokens = options.max_output_tokens_override or get_max_output_tokens()
+    max_tokens = options.max_output_tokens_override or get_max_output_tokens(options.model)
     # Defensive clamp: never request more than the model's advertised output ceiling. An over-cap
     # TABVIS_MAX_OUTPUT_TOKENS would otherwise be sent verbatim and rejected as a hard, non-retryable
     # 400 (a dead, output-less turn). For an unknown model tabvis's ceiling is 64000.

@@ -52,6 +52,33 @@ def test_records_navigation_interaction_and_page(monkeypatch: pytest.MonkeyPatch
     assert all(e.get("dom_ref") is None for e in events)  # DOM disabled
 
 
+def test_records_native_execution_and_pacing_proof(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TABVIS_BROWSER_ARTIFACTS_DOM", "0")
+    _record(
+        {
+            "type": "interaction",
+            "action": "click",
+            "interaction": {"ref": "e5"},
+        },
+        {
+            "url": "https://a.com",
+            "action_result": {
+                "executed_via": "cdp",
+                "pacing_wait_ms": 187,
+                "verified": True,
+                "coordinates": {"x": 10, "y": 20},
+            },
+        },
+    )
+    assert A.load_artifacts()[0]["execution"] == {
+        "executed_via": "cdp",
+        "pacing_wait_ms": 187,
+        "verified": True,
+    }
+
+
 def test_disabled_records_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("TABVIS_BROWSER_ARTIFACTS", "0")
     _record({"type": "navigation", "action": "goto", "url": "https://a.com"}, {"url": "https://a.com"})
@@ -67,7 +94,154 @@ def test_summary_counts_by_type(monkeypatch: pytest.MonkeyPatch) -> None:
     s = A.artifacts_summary()
     assert s["count"] == 3
     assert s["by_type"] == {"navigation": 2, "page": 1}
+    assert s["research_checkpoints"] == 0
     assert s["last_url"] == "https://a.com"
+
+
+# --------------------------------------------------------------------------- research checkpoints
+
+
+def test_extract_persists_structured_research_and_renders_latest_checkpoint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TABVIS_BROWSER_ARTIFACTS_DOM", "0")
+    base = {
+        "url": "https://example.test/security/report",
+        "title": "Security report",
+        "query": "2026",
+        "scope": "main",
+        "scope_matched": True,
+        "dates": ["2026-07-26"],
+        "headings": [{"level": 1, "text": "Results"}],
+        "links": [{"text": "Dataset", "href": "https://example.test/data"}],
+        "tables": [{"caption": "Metrics", "rows": [["Detection", "37.5%"]]}],
+    }
+    _record(
+        {"type": "page", "action": "extract"},
+        {**base, "text": "Initial result."},
+    )
+    _record(
+        {"type": "page", "action": "extract"},
+        {**base, "text": "Corrected result: patch rate 23.4%."},
+    )
+
+    events = A.load_artifacts()
+    assert events[-1]["research"]["dates"] == ["2026-07-26"]
+    assert events[-1]["research"]["tables"][0]["rows"][0] == ["Detection", "37.5%"]
+    assert A.artifacts_summary()["research_checkpoints"] == 2
+
+    context = A.render_research_evidence_context()
+    assert context is not None
+    assert context.count("URL: https://example.test/security/report") == 1
+    assert "Corrected result: patch rate 23.4%." in context
+    assert "Initial result." not in context
+    assert A.events_path() in context
+    assert "LOW-PRIVILEGE EXTERNAL DATA" in context
+
+
+def test_research_checkpoint_is_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("TABVIS_BROWSER_ARTIFACTS_DOM", "0")
+    _record(
+        {"type": "page", "action": "extract"},
+        {
+            "url": "https://example.test/large",
+            "title": "Large",
+            "text": "x" * 100_000,
+            "links": [
+                {"text": "link", "href": f"https://example.test/{index}"}
+                for index in range(200)
+            ],
+        },
+    )
+
+    research = A.load_research_evidence()[0]
+    assert len(research["text"]) <= A._MAX_RESEARCH_TEXT_CHARS
+    assert len(json.dumps(research)) <= A._MAX_RESEARCH_EVENT_CHARS
+
+
+def test_pdf_page_ranges_are_distinct_durable_research_checkpoints(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TABVIS_BROWSER_ARTIFACTS_DOM", "0")
+    path = os.path.join(A.get_artifacts_dir(), "paper.pdf")
+    asyncio.run(
+        A.record_pdf_research_artifact(
+            {
+                "url": "https://example.test/paper.pdf",
+                "file_path": path,
+                "pages": "1-20",
+                "page_count": 35,
+                "first_page": 1,
+                "last_page": 20,
+                "coverage_complete": False,
+                "cumulative_page_ranges": ["1-20"],
+                "next_pages": "21-35",
+                "text_truncated": False,
+                "text": "Methods and experimental setup.",
+            }
+        )
+    )
+    asyncio.run(
+        A.record_pdf_research_artifact(
+            {
+                "url": "https://example.test/paper.pdf",
+                "file_path": path,
+                "pages": "21-35",
+                "page_count": 35,
+                "first_page": 21,
+                "last_page": 35,
+                "coverage_complete": True,
+                "cumulative_page_ranges": ["1-35"],
+                "next_pages": None,
+                "text_truncated": False,
+                "text": "Results, limitations, and appendices.",
+            }
+        )
+    )
+
+    evidence = A.load_research_evidence()
+    assert [item["pages"] for item in evidence] == ["1-20", "21-35"]
+    context = A.render_research_evidence_context()
+    assert context is not None
+    assert "PDF pages: 1-20 of 35" in context
+    assert "PDF pages: 21-35 of 35" in context
+    assert "cumulative_ranges=['1-35']" in context
+    assert "coverage_complete=True" in context
+    assert "Methods and experimental setup." in context
+    assert "Results, limitations, and appendices." in context
+
+
+def test_pdf_research_checkpoint_resolves_original_download_url(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    monkeypatch.setenv("TABVIS_BROWSER_ARTIFACTS_DOM", "0")
+    path = tmp_path / "paper.pdf"
+    path.write_bytes(b"%PDF-1.7\nfixture")
+    asyncio.run(
+        A.record_download_artifact(
+            action="pdf_navigation",
+            url="https://example.test/paper.pdf",
+            path=str(path),
+            filename="paper.pdf",
+            policy_effect="allow",
+        )
+    )
+    asyncio.run(
+        A.record_pdf_research_artifact(
+            {
+                "file_path": str(path),
+                "pages": "1-5",
+                "page_count": 5,
+                "coverage_complete": True,
+                "text": "Full paper text.",
+            }
+        )
+    )
+
+    evidence = A.load_research_evidence()
+    assert evidence[-1]["url"] == "https://example.test/paper.pdf"
+    assert evidence[-1]["source_type"] == "pdf"
 
 
 # --------------------------------------------------------------------------- interaction redaction

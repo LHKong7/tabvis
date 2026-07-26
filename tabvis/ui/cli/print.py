@@ -487,23 +487,33 @@ async def stream_agent(
         # itself once `seed_messages` is set, so we include it. Prior envelopes keep their uuids, so
         # record_transcript dedups them and nothing is duplicated on disk.
         prior: list[Any] = []
+        research_context: str | None = None
         if resume and should_query:
             from tabvis.utils.session_storage import load_conversation_for_resume
 
             prior = await load_conversation_for_resume(session_id)
+            try:
+                from tabvis.browser.artifacts import render_research_evidence_context
+
+                research_context = render_research_evidence_context(session_id)
+            except Exception:  # noqa: BLE001 - resume evidence is best-effort
+                research_context = None
 
         # Resume Plus §11.4: inject Agent Memory as LOW-PRIVILEGE contextual data — a leading text
         # block in the CURRENT user turn, before the prompt, so the model sees it as reference data
         # below the user's current instruction. It goes into the conversation, NOT the system prompt
         # (that would promote it to an instruction). It is distinct from the raw transcript replay
         # above, so nothing is duplicated.
-        if should_query and (prior or context_preamble):
+        if should_query and (prior or context_preamble or research_context):
             new_turn = (
                 seed_messages if seed_messages is not None
                 else [create_user_message(content=prompt)]
             )
-            if context_preamble and new_turn:
-                _prepend_context_block(new_turn[-1], context_preamble)
+            low_privilege_context = "\n\n".join(
+                block for block in (context_preamble, research_context) if block
+            )
+            if low_privilege_context and new_turn:
+                _prepend_context_block(new_turn[-1], low_privilege_context)
             seed_messages = [*prior, *new_turn]
 
         # A caller (the gateway's Context Runtime) may own project-context assembly: it supplies a

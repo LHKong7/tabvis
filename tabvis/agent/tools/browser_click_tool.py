@@ -23,6 +23,8 @@ the resulting page.
 Usage:
  - ref must come from the MOST RECENT snapshot (e.g. 'e7'). If the page changed since, the tool
    returns a 'stale ref' error — call BrowserSnapshot to get fresh refs and try again.
+ - Clicks are delivered as mouseMoved + mousePressed + mouseReleased events. The tool never uses
+   DOM element.click(). If a target is hidden or covered, re-observe/scroll/dismiss the overlay.
  - For a canvas or visual-only page, omit ref and provide both coordinate_x and coordinate_y from
    the latest screenshot. Coordinates are CSS pixels within the current viewport.
  - Set double=true for a double-click.

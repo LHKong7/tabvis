@@ -1,11 +1,11 @@
 """Tool Search utilities for dynamically discovering deferred tools.
 
-When enabled, deferred tools (MCP and
-``shouldDefer`` tools) are sent with ``defer_loading: true`` and discovered via
-``ToolSearchTool`` rather than loaded upfront. This module decides whether tool
+When enabled, deferred tools (MCP and ``shouldDefer`` tools) are withheld from the
+initial model request and discovered via ``ToolSearchTool``. The next request sends
+only the schemas selected by the search result. This module decides whether tool
 search is on for a given request (``tst`` / ``tst-auto`` / ``standard``), extracts
-discovered tool names from ``tool_reference`` blocks, and computes deferred-tool
-pool deltas.
+discovered tool names from provider-neutral result metadata (plus legacy
+``tool_reference`` blocks), and computes deferred-tool pool deltas.
 
 CYCLE: part of the ``context-tokens`` cluster. ``countToolDefinitionTokens`` +
 ``TOOL_TOKEN_COUNT_OVERHEAD`` come from the cycle sibling
@@ -24,9 +24,6 @@ from tabvis.utils.array import count
 from tabvis.utils.context import get_context_window_for_model
 from tabvis.utils.debug import log_for_debugging
 from tabvis.utils.env_utils import is_env_defined_falsy, is_env_truthy
-from tabvis.utils.model.providers import (
-    get_api_provider,
-    is_first_party_provider_base_url)
 from tabvis.utils.slow_operations import json_stringify
 from tabvis.utils.zod_to_json_schema import zod_to_json_schema
 
@@ -265,9 +262,9 @@ def isToolSearchEnabledOptimistic() -> bool:  # noqa: N802 - exported camel for 
 def is_tool_search_enabled_optimistic() -> bool:
     """Optimistic check: could tool search potentially be enabled?
 
-    Returns ``False`` only when tool search is definitively disabled (standard mode
-    or a non-first-party base URL with default settings). For the definitive check
-    use :func:`is_tool_search_enabled`.
+    Returns ``False`` only when tool search is definitively disabled (standard mode).
+    For the definitive threshold/tool-availability check use
+    :func:`is_tool_search_enabled`.
     """
     global _logged_optimistic
     mode = get_tool_search_mode()
@@ -278,23 +275,6 @@ def is_tool_search_enabled_optimistic() -> bool:
                 f"[ToolSearch:optimistic] mode={mode}, "
                 f"ENABLE_TOOL_SEARCH={os.environ.get('ENABLE_TOOL_SEARCH')}, "
                 "result=false"
-            )
-        return False
-
-    # tool_reference is a beta content type that third-party API gateways
-    # typically don't support. Only gate when ENABLE_TOOL_SEARCH is unset/empty.
-    if (
-        not os.environ.get("ENABLE_TOOL_SEARCH")
-        and get_api_provider() == "firstParty"
-        and not is_first_party_provider_base_url()
-    ):
-        if not _logged_optimistic:
-            _logged_optimistic = True
-            log_for_debugging(
-                "[ToolSearch:optimistic] disabled: "
-                f"TABVIS_BASE_URL={os.environ.get('TABVIS_BASE_URL')} is not a "
-                "first-party Provider host. Set ENABLE_TOOL_SEARCH=true (or auto / "
-                "auto:N) if your proxy forwards tool_reference blocks."
             )
         return False
 
@@ -359,8 +339,9 @@ async def is_tool_search_enabled(
 ) -> bool:
     """Definitive per-request check for whether tool search is enabled.
 
-    Includes MCP mode, model compatibility (haiku lacks tool_reference),
-    ToolSearchTool availability, and the threshold check for ``tst-auto`` mode.
+    Includes ToolSearchTool availability and the threshold check for ``tst-auto`` mode.
+    Loading is implemented by server-side schema selection, so it is provider-neutral and
+    does not depend on model support for Anthropic ``tool_reference`` blocks.
     """
     mcp_tool_count = count(tools, lambda t: t.is_mcp)
 
@@ -381,16 +362,6 @@ async def is_tool_search_enabled(
         }
         if extra_props:
             props.update(extra_props)
-
-    # Check if model supports tool_reference.
-    if not model_supports_tool_reference(model):
-        log_for_debugging(
-            f"Tool search disabled for model '{model}': model does not support "
-            "tool_reference blocks. This feature is only available on TABVIS "
-            "Balanced 4+, TABVIS Max 4+, and newer models."
-        )
-        log_mode_decision(False, "standard", "model_unsupported")
-        return False
 
     # Check if ToolSearchTool is available (respects disallowedTools).
     if not is_tool_search_tool_available(tools):
@@ -459,9 +430,11 @@ def _is_tool_result_block_with_content(obj: Any) -> bool:
 
 
 def extract_discovered_tool_names(messages: list[Message]) -> set[str]:
-    """Tool names discovered via ``tool_reference`` blocks across message history.
+    """Tool names discovered across message history.
 
-    Compaction snapshots the discovered set onto
+    New transcripts use the provider-neutral ``toolUseResult`` metadata emitted by
+    ToolSearch. Legacy Anthropic ``tool_reference`` blocks remain readable. Compaction
+    snapshots the discovered set onto
     ``compactMetadata.preCompactDiscoveredTools`` on the boundary marker; this scan
     reads it back. (Inline type checks rather than ``is_compact_boundary_message``
     to avoid the messages.py ↔ tool_search.py cycle.)
@@ -479,9 +452,32 @@ def extract_discovered_tool_names(messages: list[Message]) -> set[str]:
                 carried_from_boundary += len(carried)
             continue
 
-        # Only user messages contain tool_result blocks.
+        if msg.get("type") == "assistant":
+            assistant_content = msg.get("message", {}).get("content")
+            if isinstance(assistant_content, list):
+                for block in assistant_content:
+                    if (
+                        isinstance(block, dict)
+                        and block.get("type") == "tool_use"
+                        and isinstance(block.get("name"), str)
+                    ):
+                        # A previously called deferred tool must remain visible on future turns,
+                        # including transcripts produced before provider-neutral ToolSearch.
+                        discovered_tools.add(block["name"])
+            continue
+
+        # Only user messages contain tool results.
         if msg.get("type") != "user":
             continue
+
+        tool_use_result = msg.get("toolUseResult")
+        if (
+            isinstance(tool_use_result, dict)
+            and tool_use_result.get("type") == "tool_search_result"
+        ):
+            for name in tool_use_result.get("matches") or []:
+                if isinstance(name, str):
+                    discovered_tools.add(name)
 
         content = msg.get("message", {}).get("content")
         if not isinstance(content, list):

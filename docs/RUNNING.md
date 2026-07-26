@@ -208,9 +208,10 @@ A `[1m]`/`[2m]` suffix requests an extended context window and is stripped befor
 Aliases resolve only via `TABVIS_MODEL`/`settings.model` — **not** via the `--model` CLI flag, which
 is sent verbatim.
 
-Other model knobs: `TABVIS_MAX_OUTPUT_TOKENS` (default `8192`), `TABVIS_MAX_RETRIES` (default `10`),
-`TABVIS_STREAM_IDLE_TIMEOUT` (seconds to wait for the next stream chunk, default `90`),
-`TABVIS_CUSTOM_HEADERS` (extra request headers, `Name: Value` per line).
+Other model knobs: `TABVIS_MAX_OUTPUT_TOKENS` (blank = the selected model's advertised default;
+normally `32000`), `TABVIS_MAX_RETRIES` (default `10`), `TABVIS_STREAM_IDLE_TIMEOUT` (seconds to
+wait for the next stream chunk, default `90`), `TABVIS_CUSTOM_HEADERS` (extra request headers,
+`Name: Value` per line).
 
 ### 5.3 Vision & OCR
 
@@ -280,11 +281,17 @@ Pacing is a **process-wide** limiter shared across concurrent agents; loopback h
 
 | Var | Default | Meaning |
 |---|---|---|
-| `TABVIS_BROWSER_MIN_REQUEST_INTERVAL_MS` | `1000` | Min gap between navigations/clicks to the same host (`0` disables per-host pacing) |
-| `TABVIS_BROWSER_MAX_REQUESTS_PER_MINUTE` | `0` (off) | Per-host burst ceiling over a 60s window |
-| `TABVIS_BROWSER_MIN_ACTION_INTERVAL_MS` | `0` (off) | Min gap between *any* two browser actions |
-| `TABVIS_BROWSER_REQUEST_JITTER_MS` | `0` | Random 0..N ms added per paced slot |
-| `TABVIS_BROWSER_MAX_PACING_WAIT_MS` | `60000` | Safety cap on a single pacing wait |
+| `TABVIS_BROWSER_MIN_REQUEST_INTERVAL_MS` | `1500` | Min gap between request-causing actions to the same host (`0` disables per-host pacing) |
+| `TABVIS_BROWSER_MAX_REQUESTS_PER_MINUTE` | `12` | Per-host hard rolling ceiling over a 60s window (`0` disables it) |
+| `TABVIS_BROWSER_MIN_ACTION_INTERVAL_MS` | `120` | Min gap between *any* two browser actions |
+| `TABVIS_BROWSER_REQUEST_JITTER_MS` | `250` | Random 0..N ms added per paced slot |
+| `TABVIS_BROWSER_MAX_PACING_WAIT_MS` | `60000` | Maximum allowed wait; actions needing longer fail closed without sending a request |
+
+These limits are reserved under one process-wide lock, so multiple agents share the same host
+budget. Already-reserved future slots are included in the rolling window; excess calls cannot pile
+up and burst together when the window turns over. Top-level 403/429/503 responses also establish a
+shared host cooldown (honoring numeric `Retry-After`). Browser interaction tools use native mouse
+and keyboard events by default and do not fall back to DOM `click()`/`focus()`/`scrollBy()`.
 
 ### 6.4 Artifacts (browsing trail)
 
@@ -307,7 +314,7 @@ timezone is cloak-only); inert otherwise.
 | Var | Default | Meaning |
 |---|---|---|
 | `TABVIS_BROWSER_PROXY` | — | Proxy URL (`http://`, `https://`, `socks5://`; inline creds are stripped from logs) |
-| `TABVIS_BROWSER_HUMANIZE` | `0` | Human-like mouse/keystroke timing (adds latency) |
+| `TABVIS_BROWSER_HUMANIZE` | `0` | Cloak-only advanced mouse curves/keystroke timing on top of the native-input baseline |
 | `TABVIS_BROWSER_HUMAN_PRESET` | `default` | `default` \| `careful` |
 | `TABVIS_BROWSER_GEOIP` | `0` | Derive timezone/locale from the proxy exit IP |
 | `TABVIS_BROWSER_TIMEZONE` / `TABVIS_BROWSER_LOCALE` | host | IANA timezone / locale overrides |
@@ -315,7 +322,10 @@ timezone is cloak-only); inert otherwise.
 
 Downloads land in a per-run workspace (`<session-dir>/workspace/`, or an absolute
 `TABVIS_WORKSPACE_DIR`); filenames are sanitized to a basename and de-collided so a hostile download
-name cannot escape the directory.
+name cannot escape the directory. Direct PDF navigation reports `captured_not_read`, the local path,
+and page count. For research, `Read(file_path=..., pages="1-20")` returns explicit page markers,
+cumulative page coverage, and `nextPages`; successful ranges are also stored in the artifact JSONL
+so compact/resume does not turn an abstract-only source into a falsely “read” paper.
 
 ---
 

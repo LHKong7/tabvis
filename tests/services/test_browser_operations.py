@@ -105,14 +105,65 @@ class _FallbackPage:
         self.scrolls.append(pixels)
 
 
-def test_page_scroll_reaches_javascript_fallback() -> None:
+def test_page_scroll_refuses_javascript_fallback() -> None:
     service = BrowserService()
     page = _FallbackPage()
+    with pytest.raises(BrowserError, match="no JavaScript scroll was sent"):
+        asyncio.run(
+            service._scroll_once(  # type: ignore[arg-type]
+                page, 500, point=(50, 40), locator=None
+            )
+        )
+    assert page.scrolls == []
+
+
+class _RecordingSession:
+    def __init__(self) -> None:
+        self.events: list[tuple[str, dict[str, object]]] = []
+
+    async def send(self, method: str, params: dict[str, object]) -> None:
+        self.events.append((method, params))
+
+    async def detach(self) -> None:
+        return None
+
+
+class _RecordingContext:
+    def __init__(self, session: _RecordingSession) -> None:
+        self.session = session
+
+    async def new_cdp_session(self, page: object) -> _RecordingSession:
+        return self.session
+
+
+class _RecordingPage:
+    def __init__(self, session: _RecordingSession) -> None:
+        self.context = _RecordingContext(session)
+
+
+def test_native_click_emits_mouse_path_press_and_release(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def no_sleep(_seconds: float) -> None:
+        return None
+
+    monkeypatch.setattr("tabvis.browser.browser_service.asyncio.sleep", no_sleep)
+    session = _RecordingSession()
+    service = BrowserService()
     mechanism = asyncio.run(
-        service._scroll_once(page, 500, point=(50, 40), locator=None)  # type: ignore[arg-type]
+        service._native_click(  # type: ignore[arg-type]
+            _RecordingPage(session), 240, 180, double=False
+        )
     )
-    assert mechanism == "javascript"
-    assert page.scrolls == [500]
+    event_types = [
+        params["type"]
+        for method, params in session.events
+        if method == "Input.dispatchMouseEvent"
+    ]
+    assert mechanism == "cdp"
+    assert event_types.count("mouseMoved") >= 4
+    assert event_types[-2:] == ["mousePressed", "mouseReleased"]
+    assert service._last_mouse_position == (240, 180)
 
 
 class _Tab:

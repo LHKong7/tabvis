@@ -23,6 +23,8 @@ return a fresh snapshot of the resulting page.
 Usage:
  - ref must come from the MOST RECENT snapshot (e.g. 'e8'). A 'stale ref' error means the page
    changed — call BrowserSnapshot for fresh refs.
+ - The tool reaches/focuses the field with native mouse events, then types native keyboard events;
+   it does not fill or focus the field through page JavaScript.
  - clear=true (default) replaces the field's contents; clear=false appends to what's there.
  - submit=true presses Enter after typing (use to submit a search box or login form)."""
 

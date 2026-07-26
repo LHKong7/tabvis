@@ -26,7 +26,14 @@ Usage:
  - action='goto' requires a fully-formed url (http/https). Other actions ignore url.
  - The returned snapshot already reflects the new page, so you usually do not need a separate
    BrowserSnapshot after navigating — read the refs and act.
+ - When the target is a PDF, Chromium's viewer snapshot is not the document body. Tabvis saves the
+   PDF to the download workspace and returns a captured_not_read reminder with its path/page count.
+   For research, immediately use Read with page ranges and continue through the methods, data,
+   results, limitations, and relevant appendices. An abstract page never counts as full-paper
+   evidence; if PDF extraction fails, label the source abstract-only.
  - Only use refs from the MOST RECENT snapshot; navigating invalidates older refs.
+ - Research at human pace: reuse the current page and structured extraction, do not fan out
+   same-domain navigations or repeatedly reload. Stop retrying after HTTP 403/429 or CAPTCHA.
  - If a navigation is blocked by the domain allowlist, tell the user which domain to add to
    their settings rather than retrying the same navigation."""
 

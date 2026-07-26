@@ -71,3 +71,22 @@ def test_browser_extract_mapper_keeps_href_as_structured_json() -> None:
         "tu_1",
     )
     assert url in block["content"]
+
+
+def test_browser_extract_mapper_tells_report_tasks_to_checkpoint_incrementally() -> None:
+    block = browser_extract_tool.map_tool_result_to_tool_result_block_param(
+        {
+            "url": "https://example.test/report",
+            "research_checkpoint": {
+                "durable": True,
+                "path": "/tmp/events.jsonl",
+                "instruction": (
+                    "If the user requested a local report, persist this source's URL, date, and "
+                    "verified facts to that report now before navigating to the next source."
+                ),
+            },
+        },
+        "tu_2",
+    )
+    assert "persist this source" in block["content"]
+    assert "/tmp/events.jsonl" in block["content"]

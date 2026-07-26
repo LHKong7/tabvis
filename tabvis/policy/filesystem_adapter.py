@@ -92,6 +92,13 @@ _READ_ONLY_PROHIBITION_RE = re.compile(
 _READ_ONLY_PROHIBITION_ZH_RE = re.compile(
     r"(?:不要|不得|禁止|无需).{0,8}(?:写|修改|创建|编辑|更改|保存|删除)"
 )
+_SCOPED_OTHER_FILES_PROHIBITION_RE = re.compile(
+    r"\b(?:do not|don't|must not)\s+"
+    r"(?:write|modify|edit|change|save|create|delete)\s+(?:any\s+)?other\s+files?\b|"
+    r"(?:不要|不得|禁止).{0,8}(?:写|修改|创建|编辑|更改|保存|删除)"
+    r"(?:任何)?(?:其他|其余|别的)(?:本地)?文件",
+    re.IGNORECASE,
+)
 _MUTATION_INTENT_RE = re.compile(
     r"\b(?:write|save|create|update|edit|modify|fix|implement|build|add|remove|delete|patch|"
     r"refactor)\b|(?:写入|写到|保存|创建|更新|编辑|修改|修复|实现|构建|新增|添加|移除|删除|"
@@ -138,7 +145,14 @@ def _request_intent(context: Any) -> str | None:
         text = _human_user_text(message)
         if not text.strip():
             continue
-        if _READ_ONLY_PROHIBITION_RE.search(text) or _READ_ONLY_PROHIBITION_ZH_RE.search(text):
+        # "Write the requested report, but do not modify other files" grants a deliberately scoped
+        # mutation.  Strip that guardrail before looking for a blanket write prohibition; otherwise
+        # the safety clause incorrectly turns the entire request read-only.
+        intent_text = _SCOPED_OTHER_FILES_PROHIBITION_RE.sub("", text)
+        if (
+            _READ_ONLY_PROHIBITION_RE.search(intent_text)
+            or _READ_ONLY_PROHIBITION_ZH_RE.search(intent_text)
+        ):
             return "read_only"
         if _MUTATION_INTENT_RE.search(text):
             return "mutation"

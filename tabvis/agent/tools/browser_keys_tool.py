@@ -22,7 +22,7 @@ fresh snapshot.
 
 Supported examples include Enter, Tab, Escape, PageUp, PageDown, ArrowUp, ArrowDown, Control+A,
 Meta+A, and Shift+Tab. Set ref to focus a particular element before sending the keys; otherwise the
-page's current focus is used."""
+page's current focus is used. A ref is focused with a native mouse click, not a DOM focus call."""
 
 
 class BrowserKeysInput(BaseModel):
