@@ -1,56 +1,58 @@
-# Tabvis Web 控制台真实用户场景测试报告
+# Tabvis Web Console Real-User Scenario Test Report
 
-- 测试日期：2026-07-25
-- 测试地址：`http://localhost:8765/`
-- 测试方式：通过浏览器实际点击、筛选、导航、刷新、复制和提交无变更设置
-- 桌面环境：默认浏览器视口
-- 移动环境：`390 × 844`
-- 测试数据：服务中已有 4 个历史会话（3 个 completed、1 个 cancelled）
+- Test date: 2026-07-25
+- Test URL: `http://localhost:8765/`
+- Test method: Actual browser clicks, filtering, navigation, refreshes, copy actions, and submitting settings without changes
+- Desktop environment: Default browser viewport
+- Mobile environment: `390 × 844`
+- Test data: Four existing historical sessions in the service (three completed and one cancelled)
 
-## 结论摘要
+## Executive Summary
 
-本轮共执行 10 个真实用户场景：
+This round covered ten real-user scenarios:
 
-- 5 个通过
-- 4 个部分通过
-- 1 个失败
+- 5 passed
+- 4 partially passed
+- 1 failed
 
-仪表盘、会话筛选、浏览器状态、设置读取/无变更保存、命令复制、SPA 深链刷新等基础能力正常。
-但核心的 **New run / Continue 流程会白屏**，导致当前数据状态下无法从 Web 控制台创建或继续任务，
-应作为最高优先级问题处理。
+Core capabilities such as the dashboard, session filtering, browser status, reading and saving
+unchanged settings, command copying, and SPA deep-link refreshes worked correctly. However, the
+essential **New run / Continue workflow renders a blank screen**, which means users cannot create or
+continue tasks from the Web console with the current data. This should be treated as the
+highest-priority issue.
 
-## 场景结果
+## Scenario Results
 
-| # | 用户场景 | 实际操作 | 结果 | 反馈 |
+| # | User scenario | Actions performed | Result | Feedback |
 |---|---|---|---|---|
-| 1 | 打开控制台查看系统概况 | 打开首页，等待健康轮询完成 | 通过 | 正确显示 running、capacity、sessions、open browsers 和当前浏览器引擎；从 `connecting…` 更新为实际状态约需一次轮询周期。 |
-| 2 | 查看并筛选历史会话 | 进入 Sessions，点击 `completed 3` | 通过 | 列表从 4 条正确过滤为 3 条，筛选状态清晰，状态计数正确。 |
-| 3 | 查看已完成会话详情 | 打开一条 completed 会话 | 部分通过 | 能显示状态、agent/session id、turn/tool 数和耗时；但当前历史记录没有显示 prompt/result，Live stream 也为空，用户无法回看任务和最终答案。 |
-| 4 | 创建新任务或继续历史会话 | 分别点击 New run，以及在详情页点击 Continue | **失败** | 两个入口都会导航到 `/run` 后白屏。控制台报错：`TypeError: Cannot read properties of undefined (reading 'slice')`。 |
-| 5 | 查看浏览器驱动和运行状态 | 进入 Browser 页面，检查活动引擎、驱动状态和打开的浏览器 | 通过 | 活动引擎、kernel、连接模式、安装状态和 Open browsers 均能正确展示。页面信息完整，但 21 个驱动与高级选项较长。 |
-| 6 | 查看设置并保存 | 进入 Settings，确认配置加载；不修改任何值点击 Save & apply | 通过 | 设置正确加载；无变更保存不会改写配置，并显示 `applied live — no restart needed`。页面非常长，缺少分组导航、搜索或折叠。 |
-| 7 | 按安装说明复制命令 | 进入 Setup，点击 Install 区域的 copy | 部分通过 | copy 正确变为 copied；启动命令已包含 `uv run tabvis` 和 `--serve` 两种方式。但安全说明仍称服务“没有认证”，与当前非 loopback 强制 Token 的实现不一致。 |
-| 8 | 直接打开并刷新深层会话链接 | 打开 `/sessions/<id>`，然后刷新页面 | 通过 | 刷新前后都能恢复同一会话详情，说明生产 SPA fallback 工作正常。 |
-| 9 | 访问不存在的前端路径 | 打开 `/not-a-real-page` | 部分通过 | 页面静默显示 Dashboard，但地址栏仍保留错误路径；没有 404、重定向或“页面不存在”提示，容易让用户误以为链接有效。 |
-| 10 | 在手机宽度下使用控制台 | 将视口设为 `390 × 844`，检查首页和导航 | 部分通过 | 页面没有横向溢出，内容宽度和顶部导航适配正常；但导航文字被 CSS 隐藏后，可访问名称只剩 `◧`、`＋`、`≣` 等符号，对读屏和语音控制不可理解。 |
+| 1 | Open the console and inspect the system overview | Opened the home page and waited for the health poll to complete | Pass | Correctly displayed running, capacity, sessions, open browsers, and the active browser engine. Updating from `connecting…` to the actual state takes approximately one polling cycle. |
+| 2 | View and filter historical sessions | Opened Sessions and clicked `completed 3` | Pass | Correctly filtered the list from four entries to three. The active filter and status counts were clear and accurate. |
+| 3 | Inspect a completed session | Opened a completed session | Partial pass | Displayed status, agent/session IDs, turn/tool counts, and duration. However, current historical records do not display the prompt or result, and Live stream is empty, so users cannot review the task or final answer. |
+| 4 | Create a new task or continue a historical session | Clicked New run and, separately, Continue on a session detail page | **Fail** | Both entry points navigated to `/run` and then rendered a blank screen. Console error: `TypeError: Cannot read properties of undefined (reading 'slice')`. |
+| 5 | Inspect browser drivers and runtime status | Opened Browser and reviewed the active engine, driver state, and open browsers | Pass | Correctly displayed the active engine, kernel, connection mode, installation state, and Open browsers. The information was complete, although the list of 21 drivers and advanced options was long. |
+| 6 | Review and save settings | Opened Settings, confirmed that configuration loaded, and clicked Save & apply without changing any values | Pass | Settings loaded correctly. Saving without changes did not rewrite configuration and displayed `applied live — no restart needed`. The page is very long and lacks group navigation, search, or collapsible sections. |
+| 7 | Copy a command from the installation instructions | Opened Setup and clicked copy in the Install section | Partial pass | The button correctly changed from copy to copied. Startup instructions included both `uv run tabvis` and `--serve`. However, the security note still states that the service has “no authentication,” which conflicts with the current implementation that requires a token when binding beyond loopback. |
+| 8 | Open and refresh a deep session link | Opened `/sessions/<id>` and refreshed the page | Pass | The same session detail page was restored before and after refresh, confirming that the production SPA fallback works correctly. |
+| 9 | Visit an unknown frontend route | Opened `/not-a-real-page` | Partial pass | The application silently displayed Dashboard while leaving the invalid path in the address bar. There was no 404, redirect, or “page not found” message, which could make users believe the link is valid. |
+| 10 | Use the console at mobile width | Set the viewport to `390 × 844` and inspected the home page and navigation | Partial pass | There was no horizontal overflow, and content width and top navigation adapted correctly. However, after CSS hides navigation text, accessible names are reduced to symbols such as `◧`, `＋`, and `≣`, which are unintelligible to screen readers and voice control. |
 
-## 主要问题与优先级
+## Main Issues and Priorities
 
-### P0：New run / Continue 白屏，核心流程不可用
+### P0: New run / Continue Renders a Blank Screen, Blocking the Core Workflow
 
-复现步骤：
+Reproduction steps:
 
-1. 服务中存在至少一条 `prompt` 缺失的历史 Agent 记录。
-2. 点击侧边栏 New run，或在历史会话详情中点击 Continue。
-3. 页面进入 `/run` 后变成空白。
+1. Ensure that the service contains at least one historical Agent record with a missing `prompt`.
+2. Click New run in the sidebar, or click Continue on a historical session detail page.
+3. The page navigates to `/run` and becomes blank.
 
-浏览器错误：
+Browser error:
 
 ```text
 TypeError: Cannot read properties of undefined (reading 'slice')
 ```
 
-直接原因位于 `web/src/components/NewRun.tsx`：
+The direct cause is in `web/src/components/NewRun.tsx`:
 
 ```tsx
 {agents.map((a) => (
@@ -60,101 +62,111 @@ TypeError: Cannot read properties of undefined (reading 'slice')
 ))}
 ```
 
-当前 `/agents` 返回的数据中至少有记录缺少 `prompt`，列表页也能看到对应的空白摘要。前端却把
-`prompt` 当作必填字符串处理。
+At least one record returned by `/agents` has no `prompt`; the list page also shows a blank summary
+for that record. The frontend nevertheless treats `prompt` as a required string.
 
-建议：
+Recommendations:
 
-1. 前端立即做容错：`(a.prompt || 'No prompt').slice(0, 40)`。
-2. API/兼容投影层保证 `prompt` 和 `result` 始终为字符串，而不是缺失或 `null`。
-3. 给 `/run` 增加 Error Boundary，单条脏数据不应使整个页面白屏。
-4. 增加“历史记录缺少 prompt/result”的回归测试。
+1. Add immediate frontend tolerance: `(a.prompt || 'No prompt').slice(0, 40)`.
+2. Ensure that the API/compatibility projection always returns `prompt` and `result` as strings,
+   rather than omitting them or returning `null`.
+3. Add an Error Boundary to `/run` so one malformed record cannot blank the entire page.
+4. Add regression tests for historical records with missing prompts or results.
 
-验收标准：
+Acceptance criteria:
 
-- 任意历史记录字段缺失时 `/run` 仍可打开。
-- New agent 可以提交。
-- Continue 可以选择目标 Agent 并提交。
-- 页面不出现未捕获异常或空白屏。
+- `/run` remains available when any field is missing from a historical record.
+- A new agent can be submitted.
+- A target Agent can be selected and submitted through Continue.
+- The page produces no uncaught exception or blank screen.
 
-### P1：已完成会话无法有效回看结果
+### P1: Completed Session Results Cannot Be Reviewed Effectively
 
-详情页只对当前内存中的 live run 显示 `frames`。刷新或打开历史会话时，Live stream 固定为空；
-若兼容记录中也没有 `result`，页面只剩元数据。对真实用户而言，“完成了但看不到答案”等于任务结果丢失。
+The detail page only displays `frames` for a run that is currently held in memory. Live stream is
+always empty after a refresh or when opening a historical session. If the compatibility record also
+lacks `result`, only metadata remains. From a real user's perspective, “completed but the answer is
+unavailable” is equivalent to losing the task result.
 
-相关实现：
+Relevant implementation:
 
-- `web/src/pages/SessionDetailPage.tsx`：历史会话传给 Stream 的是空数组。
-- `web/src/components/Detail.tsx`：只有 `agent.result` 存在时才显示 result。
+- `web/src/pages/SessionDetailPage.tsx`: passes an empty array to Stream for historical sessions.
+- `web/src/components/Detail.tsx`: displays a result only when `agent.result` exists.
 
-建议服务端提供持久化事件/最终结果读取接口，详情页加载历史事件或至少始终展示最终 answer、prompt 和错误。
+The service should expose a persistent event/final-result read API. The detail page should load
+historical events or, at minimum, always display the final answer, prompt, and error.
 
-### P1：Setup 的安全说明与实际认证策略不一致
+### P1: Setup Security Guidance Conflicts with the Actual Authentication Policy
 
-Setup 当前写着“没有认证，非本机部署需要认证代理”。但服务端已经实现：
+Setup currently says that the service has “no authentication” and that non-local deployment
+requires an authenticating proxy. The server already implements the following:
 
-- 非 loopback 地址自动要求认证。
-- 未配置 `TABVIS_SERVER_ADMIN_TOKEN` 时拒绝启动。
-- 管理请求支持 Bearer Token。
+- Authentication is automatically required for non-loopback addresses.
+- Startup is rejected when `TABVIS_SERVER_ADMIN_TOKEN` is not configured.
+- Administrative requests support Bearer Token authentication.
 
-相关实现位于 `tabvis/browser/server_auth.py`。过时说明可能让用户误判部署风险或重复搭建认证层。
+The relevant implementation is in `tabvis/browser/server_auth.py`. Outdated guidance may cause users
+to misjudge deployment risk or build a redundant authentication layer.
 
-建议根据 bind host 和认证状态动态展示：
+The displayed guidance should adapt to the bind host and authentication state:
 
-- loopback：仅本机可达，默认无需 Token。
-- 非 loopback：必须设置 `TABVIS_SERVER_ADMIN_TOKEN`，并给出请求头示例。
-- 反向代理：作为额外加固方案，而不是唯一认证方式。
+- Loopback: reachable only from the local machine; no token required by default.
+- Non-loopback: `TABVIS_SERVER_ADMIN_TOKEN` is mandatory; include an example request header.
+- Reverse proxy: present it as an additional hardening option, not the only authentication method.
 
-### P2：移动导航缺少可访问名称
+### P2: Mobile Navigation Lacks Accessible Names
 
-`web/src/index.css` 在小屏下隐藏 `.nav-item` 中除图标外的所有文字，但 `NavLink` 没有
-`aria-label`。实测可访问名称变成单个符号。
+At small widths, `web/src/index.css` hides all text in `.nav-item` except the icon, while `NavLink`
+has no `aria-label`. In testing, each accessible name became a single symbol.
 
-建议为每个导航链接添加 `aria-label={n.label}`，并为当前页面保留 `aria-current="page"`。
+Add `aria-label={n.label}` to each navigation link and retain `aria-current="page"` for the active
+page.
 
-### P2：未知前端路由静默显示 Dashboard
+### P2: Unknown Frontend Routes Silently Display Dashboard
 
-`web/src/App.tsx` 的通配路由直接渲染 `<Dashboard />`，既不重定向也不提示错误。
+The wildcard route in `web/src/App.tsx` directly renders `<Dashboard />` without redirecting or
+showing an error.
 
-建议二选一：
+Choose one of the following:
 
-- 渲染明确的 Not Found 页面，并提供返回 Dashboard 的按钮。
-- 使用 `<Navigate to="/" replace />`，确保地址栏同步恢复为 `/`。
+- Render an explicit Not Found page with a button that returns to Dashboard.
+- Use `<Navigate to="/" replace />` so the address bar is also restored to `/`.
 
-### P2：Browser / Settings 信息密度过高
+### P2: Browser / Settings Has Excessive Information Density
 
-Browser 页面一次展示 21 个驱动和大量高级 stealth 设置；Settings 页面一次展示所有 Model、
-Browser、Stealth、Server、OCR、Artifacts 和 Project 字段。功能完整，但新用户难以定位目标。
+Browser displays 21 drivers and many advanced stealth settings at once. Settings displays every
+Model, Browser, Stealth, Server, OCR, Artifacts, and Project field on one page. The feature set is
+complete, but new users will struggle to locate the setting they need.
 
-建议：
+Recommendations:
 
-- 增加设置搜索。
-- 分组折叠或左侧锚点目录。
-- 默认收起与当前引擎不相关的字段。
-- 为多个 `Download` 按钮加入具体名称，例如 `Download CloakBrowser`。
+- Add settings search.
+- Use collapsible groups or a left-side anchor table of contents.
+- Collapse fields unrelated to the active engine by default.
+- Give each `Download` button a specific name, such as `Download CloakBrowser`.
 
-## 正向反馈
+## Positive Feedback
 
-- 首页健康状态与容量信息简洁，轮询后状态更新正确。
-- Sessions 的状态筛选和计数直观、响应及时。
-- 生产构建支持深层链接刷新，SPA fallback 行为可靠。
-- Browser 页面能明确区分 active engine、kernel、connection 和安装状态。
-- Secret 字段采用 write-only 设计，没有把完整凭据回传到页面。
-- Settings 只提交变化字段；无变更保存不会意外固化默认值。
-- Setup 的复制按钮在本地 HTTP 页面也能工作。
-- `390 × 844` 下没有横向滚动，基础响应式布局成立。
+- Home-page health and capacity information is concise and updates correctly after polling.
+- Session status filters and counts are intuitive and responsive.
+- The production build supports deep-link refreshes with reliable SPA fallback behavior.
+- Browser clearly distinguishes the active engine, kernel, connection, and installation status.
+- Secret fields use a write-only design and do not return complete credentials to the page.
+- Settings submits only changed fields; saving without changes does not accidentally persist defaults.
+- Setup copy buttons work even on a local HTTP page.
+- There is no horizontal scrolling at `390 × 844`; the basic responsive layout works.
 
-## 建议修复顺序
+## Recommended Fix Order
 
-1. 修复 `/run` 白屏并补 Error Boundary。
-2. 补齐历史会话的 prompt、result 和事件回放。
-3. 更新 Setup 认证说明。
-4. 修复移动导航可访问名称。
-5. 增加 Not Found 行为。
-6. 优化 Browser / Settings 的信息架构。
+1. Fix the `/run` blank screen and add an Error Boundary.
+2. Restore prompt, result, and event replay for historical sessions.
+3. Update Setup authentication guidance.
+4. Fix accessible names in mobile navigation.
+5. Add explicit Not Found behavior.
+6. Improve the information architecture of Browser and Settings.
 
-## 测试影响说明
+## Test Impact
 
-本轮没有安装驱动、切换浏览器引擎、取消/退出 Agent，也没有修改用户设置。唯一提交动作是
-Settings 的“无变更保存”，前端检测到没有差异后直接返回；另执行了一次本地剪贴板复制。
-由于 New run 页面白屏，本轮没有创建新的 Agent 任务。
+This round did not install drivers, switch browser engines, cancel or quit Agents, or modify user
+settings. The only submitted action was saving Settings without changes; the frontend detected no
+differences and returned immediately. One local clipboard-copy action was also performed. Because
+New run rendered a blank screen, no new Agent task was created during this round.

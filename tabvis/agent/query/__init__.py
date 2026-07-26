@@ -65,6 +65,18 @@ def _is_api_error_turn(assistant_messages: list[dict[str, Any]]) -> bool:
     return any(isinstance(m, dict) and m.get("isApiErrorMessage") for m in assistant_messages)
 
 
+def _is_terminal_api_error_turn(assistant_messages: list[dict[str, Any]]) -> bool:
+    """Errors whose retry budget was already exhausted below the Agent loop."""
+    return any(
+        isinstance(message, dict)
+        and (
+            message.get("apiError") == "model_stream_timeout"
+            or message.get("error") == "model_stream_timeout"
+        )
+        for message in assistant_messages
+    )
+
+
 def _restore_research_evidence_after_compaction(
     messages: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
@@ -166,7 +178,11 @@ async def query(params: QueryParams) -> AsyncGenerator[Any, None]:
             # api-error assistant message, no tool calls) is not the model choosing to stop. Give
             # such turns their own small budget: drop the internal sentinel and retry the model turn;
             # once that budget is exhausted, terminate normally.
-            if _is_api_error_turn(assistant_messages) and api_error_turns < _API_ERROR_TURN_LIMIT:
+            if (
+                _is_api_error_turn(assistant_messages)
+                and not _is_terminal_api_error_turn(assistant_messages)
+                and api_error_turns < _API_ERROR_TURN_LIMIT
+            ):
                 api_error_turns += 1
                 _drop = {id(m) for m in assistant_messages}
                 messages = [m for m in messages if id(m) not in _drop]

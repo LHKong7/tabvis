@@ -181,6 +181,81 @@ def test_launch_records_a_failed_run_on_error_result() -> None:
     asyncio.run(scenario())
 
 
+def test_model_timeout_retry_is_visible_and_preserves_specific_error_code() -> None:
+    async def scenario() -> None:
+        rs = RunStore()
+        messages = [
+            {
+                "type": "model_retry",
+                "reason": "model_stream_timeout",
+                "retry_attempt": 1,
+                "max_retries": 1,
+                "retry_in_ms": 500,
+            },
+            _assistant("Model response timed out."),
+            {
+                "type": "result",
+                "result": "Model response timed out.",
+                "is_error": True,
+                "error_code": "model_stream_timeout",
+            },
+        ]
+        launcher = _launcher(messages, rs)
+        orch = RunOrchestrator(rs, launcher=launcher)
+        run = await orch.create_and_start(
+            agent_id="ag_timeout",
+            session_id="ses_timeout",
+            command_id="cmd_timeout",
+            prompt="continue",
+        )
+        await launcher.join(run.run_id)
+
+        final = rs.get_run(run.run_id)
+        assert final.status == runs.FAILED
+        assert final.error_code == "model_stream_timeout"
+        events = get_event_store().read(aggregate_id=run.run_id)
+        retry = next(event for event in events if event.type == "run.retrying")
+        assert retry.data["retry_attempt"] == 1
+        assert "retrying 1/1" in retry.data["message"]
+        assert any(event.type == "run.resumed" for event in events)
+
+    asyncio.run(scenario())
+
+
+def test_retrying_run_can_be_cancelled() -> None:
+    async def scenario() -> None:
+        rs = RunStore()
+        retrying = asyncio.Event()
+        release = asyncio.Event()
+
+        async def stream(_run, _context):
+            yield {
+                "type": "model_retry",
+                "reason": "model_stream_timeout",
+                "retry_attempt": 1,
+                "max_retries": 1,
+                "retry_in_ms": 500,
+            }
+            retrying.set()
+            await release.wait()
+
+        launcher = AgentRunLauncher(run_store=rs, stream_fn=stream)
+        orch = RunOrchestrator(rs, launcher=launcher)
+        run = await orch.create_and_start(
+            agent_id="ag_retry_cancel",
+            session_id="ses_retry_cancel",
+            command_id="cmd_retry_cancel",
+            prompt="continue",
+        )
+        await retrying.wait()
+        await asyncio.sleep(0)
+        assert rs.get_run(run.run_id).status == runs.RETRYING
+        cancelled = await orch.cancel(run.run_id)
+        assert cancelled.status == runs.CANCELLED
+
+    asyncio.run(scenario())
+
+
 def test_launch_records_failed_on_exception_in_the_loop() -> None:
     async def scenario() -> None:
         rs = RunStore()

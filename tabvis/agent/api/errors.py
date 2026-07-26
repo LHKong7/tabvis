@@ -34,6 +34,7 @@ from typing import Any
 import anthropic
 from anthropic import APIConnectionError, APIError, APITimeoutError
 
+from tabvis.agent.api.stream_timeout import ModelStreamTimeoutError
 from tabvis.bootstrap.state import (
     get_is_non_interactive_session as _bootstrap_get_is_non_interactive_session,
 )
@@ -61,7 +62,10 @@ REPEATED_529_ERROR_MESSAGE = "Repeated 529 Overloaded errors"
 CUSTOM_OFF_SWITCH_MESSAGE = (
     "TABVIS Max is experiencing high load, please use /model to switch to TABVIS Balanced"
 )
-API_TIMEOUT_ERROR_MESSAGE = "Request timed out"
+API_TIMEOUT_ERROR_MESSAGE = (
+    "Model response timed out. Conversation and browser state were preserved; "
+    "use Continue to retry from this point."
+)
 
 # Interactive-only recovery hint appended to several 400 tool-use error messages.
 _REWIND_INSTRUCTION = " Run /rewind to recover the conversation."
@@ -200,7 +204,7 @@ def _header(error: Any, name: str) -> str | None:
 
 def _is_connection_timeout(error: Any) -> bool:
     """True for an ``APITimeoutError``, or an ``APIConnectionError`` with 'timeout' in the message."""
-    if isinstance(error, APITimeoutError):
+    if isinstance(error, (ModelStreamTimeoutError, APITimeoutError)):
         return True
     return isinstance(error, APIConnectionError) and "timeout" in _error_message(error).lower()
 
@@ -295,7 +299,9 @@ def get_assistant_message_from_error(
     if _is_connection_timeout(error):
         return create_assistant_api_error_message(
             content=API_TIMEOUT_ERROR_MESSAGE,
-            error="unknown",
+            api_error="model_stream_timeout",
+            error="model_stream_timeout",
+            error_details=_error_message(error),
         )
 
     # Emergency capacity off switch for Opus PAYG users.
@@ -555,7 +561,7 @@ def classify_api_error(error: Any) -> str:
 
     # Timeout errors.
     if _is_connection_timeout(error):
-        return "api_timeout"
+        return "model_stream_timeout"
 
     # Repeated 529 errors.
     if isinstance(error, Exception) and REPEATED_529_ERROR_MESSAGE in _error_message(error):

@@ -59,6 +59,25 @@ def test_post_agent_streams_legacy_frames_from_a_gateway_run() -> None:
     assert "event: result" in text and "event: done" in text
 
 
+def test_model_retry_uses_existing_agent_sse_frame() -> None:
+    messages = [
+        {
+            "type": "model_retry",
+            "reason": "model_stream_timeout",
+            "retry_attempt": 1,
+            "max_retries": 1,
+            "retry_in_ms": 500,
+        },
+        *_msgs(),
+    ]
+    app, _ = _app_with_fake_launcher(messages)
+    response = TestClient(app).post("/agent", json={"prompt": "do it"})
+    assert response.status_code == 200
+    assert "event: agent" in response.text
+    assert "Model stream stalled" in response.text
+    assert '"status": "retrying"' in response.text
+
+
 def test_post_agent_then_list_and_read_from_gateway() -> None:
     app, gw = _app_with_fake_launcher(_msgs())
     client = TestClient(app)

@@ -21,6 +21,7 @@ from collections.abc import AsyncGenerator
 from typing import Any
 
 from tabvis.constants.messages import NO_CONTENT_MESSAGE
+from tabvis.agent.api.errors import classify_api_error
 from tabvis.agent.query import QueryParams, Terminal, query
 from tabvis.agent.query.deps import QueryDeps, production_deps
 from tabvis.agent.api.empty_usage import empty_usage
@@ -194,7 +195,22 @@ async def ask(
                         "parent_tool_use_id": None,
                         "uuid": str(uuid.uuid4()),
                     }
-            # system sentinel: dropped at the SDK boundary.
+            elif t == "system" and item.get("subtype") == "api_error":
+                # Retry sentinels normally remain internal. A model-stream timeout is different:
+                # the Web run would otherwise appear silently frozen during its bounded retry.
+                error = item.get("error")
+                if classify_api_error(error) == "model_stream_timeout":
+                    yield {
+                        "type": "model_retry",
+                        "reason": "model_stream_timeout",
+                        "message": str(error),
+                        "retry_in_ms": int(item.get("retryInMs") or 0),
+                        "retry_attempt": int(item.get("retryAttempt") or 0),
+                        "max_retries": int(item.get("maxRetries") or 0),
+                        "session_id": session_id,
+                        "uuid": str(uuid.uuid4()),
+                    }
+            # Other system sentinels stay internal.
     finally:
         if not persisted:
             await _persist_session_transcript(mutable)
@@ -303,6 +319,11 @@ def _build_result(
         "subtype": "success",
         "is_error": is_api_error,
         "result": text_result,
+        "error_code": (
+            result_msg.get("error")
+            if is_api_error and isinstance(result_msg, dict)
+            else None
+        ),
         "structured_output": None,
         **base,
     }

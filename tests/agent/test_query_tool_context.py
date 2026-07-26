@@ -3,12 +3,17 @@
 from __future__ import annotations
 
 import asyncio
+import importlib
 from typing import Any
 
 from tabvis.agent.query import QueryDeps, QueryParams, Terminal, query
 from tabvis.agent.tools.file_write_tool import file_write_tool
 from tabvis.tool import ToolUseContext, ToolUseContextOptions
-from tabvis.utils.messages import create_assistant_message, create_user_message
+from tabvis.utils.messages import (
+    create_assistant_api_error_message,
+    create_assistant_message,
+    create_user_message,
+)
 
 
 def test_read_only_prompt_reaches_write_permission_check(tmp_path) -> None:
@@ -80,3 +85,72 @@ def test_read_only_prompt_reaches_write_permission_check(tmp_path) -> None:
         assert not target.exists()
 
     asyncio.run(scenario())
+
+
+def test_model_timeout_after_tool_does_not_repeat_tool_or_model_turn(monkeypatch) -> None:
+    """The timeout layer already retried once; the Agent loop must stop without replaying tools."""
+    query_module = importlib.import_module("tabvis.agent.query")
+    model_calls = 0
+    tool_runs = 0
+
+    async def call_model(**_kwargs: Any):
+        nonlocal model_calls
+        model_calls += 1
+        if model_calls == 1:
+            yield create_assistant_message(
+                content=[
+                    {
+                        "type": "tool_use",
+                        "id": "tool_once",
+                        "name": "BrowserClick",
+                        "input": {"ref": "e1"},
+                    }
+                ]
+            )
+        else:
+            yield create_assistant_api_error_message(
+                content="Model response timed out.",
+                api_error="model_stream_timeout",
+                error="model_stream_timeout",
+            )
+
+    async def run_tools_once(*_args: Any, **_kwargs: Any):
+        nonlocal tool_runs
+        tool_runs += 1
+        yield {
+            "message": create_user_message(
+                content=[
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "tool_once",
+                        "content": "clicked",
+                    }
+                ]
+            )
+        }
+
+    monkeypatch.setattr(query_module, "run_tools", run_tools_once)
+
+    async def scenario() -> None:
+        context = ToolUseContext(
+            options=ToolUseContextOptions(tools=[]),
+            messages=[],
+        )
+        items = [
+            item
+            async for item in query(
+                QueryParams(
+                    messages=[create_user_message(content="click once")],
+                    system_prompt=[],
+                    tools=[],
+                    can_use_tool=lambda *_a, **_kw: None,
+                    tool_use_context=context,
+                    deps=QueryDeps(call_model=call_model),
+                )
+            )
+        ]
+        assert isinstance(items[-1], Terminal)
+
+    asyncio.run(scenario())
+    assert model_calls == 2
+    assert tool_runs == 1

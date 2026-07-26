@@ -56,7 +56,7 @@ _TRANSITIONS: Final[dict[str, frozenset[str]]] = {
     ),
     WAITING_FOR_INPUT: frozenset({RUNNING, CANCELLING, CANCELLED}),
     WAITING_FOR_APPROVAL: frozenset({RUNNING, FAILED, CANCELLING, CANCELLED}),
-    RETRYING: frozenset({RUNNING, FAILED}),
+    RETRYING: frozenset({RUNNING, FAILED, CANCELLING, CANCELLED}),
     CANCELLING: frozenset({CANCELLED}),
     COMPLETED: frozenset(),
     FAILED: frozenset(),

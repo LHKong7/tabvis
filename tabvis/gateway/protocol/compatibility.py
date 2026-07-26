@@ -167,6 +167,19 @@ def legacy_frames_for(event: EventEnvelope) -> list[dict[str, Any]]:
 
     if et == EventType.RUN_CREATED:
         return [{"event": "agent", "data": {"agent_id": data.get("agent_id"), "run_id": run_id}}]
+    if et == EventType.RUN_RETRYING:
+        return [{
+            "event": "agent",
+            "data": {
+                "agent_id": event.scope.agent_id,
+                "run_id": run_id,
+                "status": "retrying",
+                "message": data.get("message") or "Model stalled · retrying",
+                "retry_attempt": data.get("retry_attempt"),
+                "max_retries": data.get("max_retries"),
+                "retry_in_ms": data.get("retry_in_ms"),
+            },
+        }]
     if et == EventType.ASSISTANT_MESSAGE_COMPLETED:
         text = data.get("text_preview", "")
         return [{

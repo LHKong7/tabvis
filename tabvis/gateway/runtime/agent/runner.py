@@ -179,6 +179,7 @@ class AgentRunLauncher:
         tool_calls = 0
         result_text: str | None = None
         is_error = False
+        result_error_code: str | None = None
         binding: BrowserBinding | None = None
         token = None
         try:
@@ -204,6 +205,19 @@ class AgentRunLauncher:
 
                 async for message in self._stream(run, context):
                     mtype = message.get("type")
+                    current = self._runs.get_run(run.run_id)
+                    if (
+                        current is not None
+                        and current.status == runs.RETRYING
+                        and mtype != "model_retry"
+                    ):
+                        self._runs.transition(
+                            run.run_id,
+                            runs.RUNNING,
+                            expected=runs.RETRYING,
+                            event_type=EventType.RUN_RESUMED,
+                            data={"reason": "model_retry_finished"},
+                        )
                     if mtype == "assistant":
                         turns += 1
                         tool_summaries = _tool_uses(message)
@@ -225,8 +239,39 @@ class AgentRunLauncher:
                     elif mtype == "result":
                         result_text = message.get("result")
                         is_error = bool(message.get("is_error"))
+                        result_error_code = message.get("error_code")
+                    elif mtype == "model_retry":
+                        current = self._runs.get_run(run.run_id)
+                        if current is not None and current.status == runs.RUNNING:
+                            attempt = int(message.get("retry_attempt") or 0)
+                            maximum = int(message.get("max_retries") or 0)
+                            retry_in_ms = int(message.get("retry_in_ms") or 0)
+                            self._runs.transition(
+                                run.run_id,
+                                runs.RETRYING,
+                                expected=runs.RUNNING,
+                                data={
+                                    "reason": message.get("reason") or "model_retry",
+                                    "message": (
+                                        f"Model stream stalled · retrying "
+                                        f"{attempt}/{maximum} in {retry_in_ms / 1000:.1f}s"
+                                    ),
+                                    "retry_attempt": attempt,
+                                    "max_retries": maximum,
+                                    "retry_in_ms": retry_in_ms,
+                                },
+                            )
 
                 terminal = runs.FAILED if is_error else runs.COMPLETED
+                current = self._runs.get_run(run.run_id)
+                if current is not None and current.status == runs.RETRYING:
+                    self._runs.transition(
+                        run.run_id,
+                        runs.RUNNING,
+                        expected=runs.RETRYING,
+                        event_type=EventType.RUN_RESUMED,
+                        data={"reason": "model_retry_finished"},
+                    )
                 # Persist the FULL (DLP-scrubbed but untruncated) result before the transition so a
                 # channel reply can deliver it in full; the event carries only the bounded preview
                 # (§7.9). Best-effort: a store hiccup must not fail the run — the preview still ships.
@@ -237,8 +282,11 @@ class AgentRunLauncher:
                         log_for_debugging(f"[GATEWAY] could not persist full result for {run.run_id}: {e}")
                 self._runs.transition(
                     run.run_id, terminal, expected=runs.RUNNING,
-                    error_code="agent_error" if is_error else None,
-                    data={"result_preview": _safe_preview("api", result_text)},
+                    error_code=(result_error_code or "agent_error") if is_error else None,
+                    data={
+                        "result_preview": _safe_preview("api", result_text),
+                        "error": _safe_preview("api", result_text) if is_error else None,
+                    },
                     turns=turns, tool_calls=tool_calls,
                 )
             finally:
@@ -442,8 +490,11 @@ class AgentRunLauncher:
 
     def _fail_best_effort(self, run_id: str, error: str, turns: int, tool_calls: int) -> None:
         try:
+            current = self._runs.get_run(run_id)
+            if current is None or current.status not in (runs.RUNNING, runs.RETRYING):
+                return
             self._runs.transition(
-                run_id, runs.FAILED, expected=runs.RUNNING, error_code="agent_exception",
+                run_id, runs.FAILED, expected=current.status, error_code="agent_exception",
                 data={"error": error}, turns=turns, tool_calls=tool_calls,
             )
         except Exception as e:  # noqa: BLE001 - already terminal (e.g. cancelled) → nothing to do

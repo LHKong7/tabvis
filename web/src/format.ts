@@ -17,6 +17,7 @@ export function summarize(ev: string, d: any): Summary {
     case '_id':
       return `agent ${d.agent_id}`
     case 'agent':
+      if (d.status === 'retrying') return d.message || 'Model stalled · retrying'
       return `${d.agent_id} · ${d.model ?? 'default model'}`
     case 'system':
       return `session ${String(d.session_id ?? '').slice(0, 8)}… · ${(d.tools || []).length} tools`

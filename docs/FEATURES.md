@@ -317,7 +317,7 @@ See [AGENT_GATEWAY_DESIGN.md](AGENT_GATEWAY_DESIGN.md) for the target architectu
 contract (verify → normalize → deliver) and the same inbound pipeline (dedupe → bind → message event
 → Run). **17 IM platforms** ship, in two transport shapes:
 
-- **Webhook** (an HTTP callback the plugin verifies): Feishu 飞书, DingTalk 钉钉, WeCom 企业微信, Slack,
+- **Webhook** (an HTTP callback the plugin verifies): Feishu, DingTalk, WeCom, Slack,
   Microsoft Teams, LINE, Google Chat, WhatsApp, and QQ.
 - **Client-loop** (a persistent connection that pushes into the pipeline): Telegram, Discord, Matrix,
   Mattermost, IRC, SimpleX, Signal, and iMessage.
@@ -332,6 +332,6 @@ starts the client-loop channels' read loops, and delivers each finished Run's re
 originating chat by subscribing to `run.completed`. End-to-end: a chat message → webhook / read-loop →
 verify → normalize → bind → **Run** → agent → reply delivered back to the chat.
 
-Not included as channels: personal WeChat (个人微信 — no official bot API; automating a personal account
-violates ToS; WeCom/企业微信 is the official enterprise path) and Tencent Yuanbao (腾讯元宝 — an assistant
+Not included as channels: personal WeChat (no official bot API; automating a personal account
+violates ToS; WeCom is the official enterprise path) and Tencent Yuanbao (an assistant
 app, not an IM). The `example_webhook` and `web` channels remain as the reference/console channels.

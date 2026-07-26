@@ -47,9 +47,13 @@ from typing import Any
 
 import httpcore
 import httpx
-from anthropic import APIConnectionError, APIError, APIStatusError
+from anthropic import APIConnectionError, APIError, APIStatusError, APITimeoutError
 
 from tabvis.agent.api.errors import REPEATED_529_ERROR_MESSAGE
+from tabvis.agent.api.stream_timeout import (
+    ModelStreamTimeoutError,
+    get_timeout_retries,
+)
 from tabvis.utils.abort import AbortSignal
 from tabvis.utils.debug import log_for_debugging
 from tabvis.utils.env_utils import is_env_truthy
@@ -62,6 +66,7 @@ __all__ = [
     "BASE_DELAY_MS",
     "CannotRetryError",
     "FallbackTriggeredError",
+    "ModelStreamTimeoutError",
     "RetryContext",
     "RetryError",
     "RetryResult",
@@ -409,6 +414,19 @@ def _is_retryable_transport_error(error: Any) -> bool:
     )
 
 
+def _is_model_timeout_error(error: Any) -> bool:
+    """Timeouts use a small dedicated retry budget, never the generic ten-retry budget."""
+    return isinstance(
+        error,
+        (
+            ModelStreamTimeoutError,
+            APITimeoutError,
+            httpx.TimeoutException,
+            httpcore.TimeoutException,
+        ),
+    )
+
+
 # --------------------------------------------------------------------------------------------
 # Retry-after / backoff math (withRetry.ts:395-424, 559-579)
 # --------------------------------------------------------------------------------------------
@@ -617,6 +635,8 @@ async def with_retry(
     consecutive_529_errors = options.initial_consecutive_529_errors
     last_error: Any = None
     persistent_attempt = 0
+    timeout_failures = 0
+    timeout_max_retries = get_timeout_retries()
 
     attempt = 1
     while attempt <= max_retries + 1:
@@ -657,6 +677,9 @@ async def with_retry(
             raise
         except Exception as error:  # noqa: BLE001 - the oracle catches all + re-classifies
             last_error = error
+            is_model_timeout = _is_model_timeout_error(error)
+            if is_model_timeout:
+                timeout_failures += 1
             log_for_debugging(
                 f"API error (attempt {attempt}/{max_retries + 1}): "
                 + (
@@ -670,6 +693,25 @@ async def with_retry(
             # Non-foreground sources bail immediately on 529 (no amplification).
             if is_529_error(error) and not should_retry_529(options.query_source):
                 raise CannotRetryError(error, retry_context) from error
+
+            # A stalled model stream is user-visible latency, not an ordinary transient network
+            # blip. Give it its own tiny retry budget (default one retry), emit a status heartbeat,
+            # and never let it consume the generic ten retries.
+            if is_model_timeout:
+                if timeout_failures > timeout_max_retries or attempt > max_retries:
+                    raise CannotRetryError(error, retry_context) from error
+                delay_ms = get_retry_delay(timeout_failures, max_delay_ms=2_000)
+                yield RetryError(
+                    message=create_system_api_error_message(
+                        error,
+                        delay_ms,
+                        timeout_failures,
+                        timeout_max_retries,
+                    )
+                )
+                await _sleep(delay_ms, options.signal, abort_error=_abort_error)
+                attempt += 1
+                continue
 
             # Track consecutive 529 errors (fallback gate).
             if is_529_error(error) and (
