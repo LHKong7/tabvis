@@ -320,9 +320,13 @@ async def agent_events_compat(request: Request) -> Response:
     async def _frames():
         import json
 
+        from tabvis.dlp.gateway import get_dlp_gateway
+
         for envelope in gateway.events.read(aggregate_id=run.run_id):
             for frame in legacy_frames_for(envelope):
-                yield {"event": frame["event"], "data": json.dumps(frame["data"], default=str)}
+                decision = get_dlp_gateway().scrub("api", frame["data"])
+                safe = {"error": "dlp_blocked"} if decision.blocked else decision.payload
+                yield {"event": frame["event"], "data": json.dumps(safe, default=str)}
 
     return EventSourceResponse(_frames())
 

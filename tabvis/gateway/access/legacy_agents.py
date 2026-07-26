@@ -21,6 +21,7 @@ from starlette.routing import Route
 
 from tabvis.gateway.access.http import (
     _error_response,
+    agent_events_compat,
     cancel_agent_compat,
     list_agents_compat,
     read_agent_compat,
@@ -259,6 +260,7 @@ def gateway_agent_handlers() -> dict[str, Any]:
         "list_agents": list_agents_compat,
         "get_agent": read_agent_compat,
         "cancel_agent": cancel_agent_compat,
+        "agent_events": agent_events_compat,
         "list_agent_interactions": list_agent_interactions,
         "respond_agent_interaction": respond_agent_interaction,
     }
@@ -272,6 +274,7 @@ def build_legacy_agent_routes() -> list[Route]:
         Route("/agents", list_agents_compat, methods=["GET"]),
         Route("/agents/{agent_id}", read_agent_compat, methods=["GET"]),
         Route("/agents/{agent_id}/cancel", cancel_agent_compat, methods=["POST"]),
+        Route("/agents/{agent_id}/events", agent_events_compat, methods=["GET"]),
         Route(
             "/agents/{agent_id}/interactions",
             list_agent_interactions,

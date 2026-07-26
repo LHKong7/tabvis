@@ -1,5 +1,7 @@
 // Presentation helpers shared by the panels.
 
+import type { Frame } from './types'
+
 export const ms = (n?: number | null): string =>
   n == null ? '—' : n < 1000 ? `${n}ms` : `${(n / 1000).toFixed(1)}s`
 
@@ -47,5 +49,15 @@ export function summarize(ev: string, d: any): Summary {
       return null
     default:
       return JSON.stringify(d).slice(0, 140)
+  }
+}
+
+export function frameFor(event: string, data: any): Frame | null {
+  const out = summarize(event, data)
+  if (out == null) return null
+  return {
+    event,
+    cls: typeof out === 'string' ? event : out.cls,
+    text: typeof out === 'string' ? out : out.text,
   }
 }

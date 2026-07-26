@@ -111,6 +111,13 @@ async def query(params: QueryParams) -> AsyncGenerator[Any, None]:
                 "query(): auto-compaction failed; continuing with un-compacted messages"
             )
 
+        # Keep the tool context attached to the authoritative conversation list. ``ask`` builds the
+        # context before it seeds the first user message, and compaction may replace ``messages``
+        # with a new list later. Without this synchronization permission adapters see the context's
+        # initial empty list, so request-level constraints such as "do not modify files" cannot be
+        # enforced when the model calls a tool.
+        tool_use_context.messages = messages
+
         assistant_messages: list[dict[str, Any]] = []
         tool_use_blocks: list[dict[str, Any]] = []
 

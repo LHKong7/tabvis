@@ -18,6 +18,7 @@ the browser adapter, ``deny`` wins regardless of position and grants layer highe
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from tabvis.policy import audit as policy_audit
@@ -83,12 +84,98 @@ _FS_READ_PROTECT_STRICT = [
 
 _STRICT_ENV = "TABVIS_PERMISSION_FS_STRICT"
 _TRUTHY = frozenset({"1", "true", "yes", "on"})
+_READ_ONLY_PROHIBITION_RE = re.compile(
+    r"\b(?:do not|don't|must not|without)\s+(?:writ(?:e|ing)|modify(?:ing)?|edit(?:ing)?|"
+    r"creat(?:e|ing)|chang(?:e|ing)|sav(?:e|ing)|delet(?:e|ing))\b",
+    re.IGNORECASE,
+)
+_READ_ONLY_PROHIBITION_ZH_RE = re.compile(
+    r"(?:不要|不得|禁止|无需).{0,8}(?:写|修改|创建|编辑|更改|保存|删除)"
+)
+_MUTATION_INTENT_RE = re.compile(
+    r"\b(?:write|save|create|update|edit|modify|fix|implement|build|add|remove|delete|patch|"
+    r"refactor)\b|(?:写入|写到|保存|创建|更新|编辑|修改|修复|实现|构建|新增|添加|移除|删除|"
+    r"补丁|重构)",
+    re.IGNORECASE,
+)
+_READ_ONLY_INTENT_RE = re.compile(
+    r"\b(?:research|compare|summarize|inspect|review|explain|answer|find|look\s+up|check|"
+    r"analy[sz]e|read|report)\b|(?:查询|查找|比较|对比|总结|分析|研究|解释|回答|看看|检查|"
+    r"获取|给出|读取)",
+    re.IGNORECASE,
+)
 
 
 def is_fs_strict() -> bool:
     """Whether strict filesystem mode is on (``TABVIS_PERMISSION_FS_STRICT``, default off)."""
     val = os.environ.get(_STRICT_ENV)
     return bool(val) and val.strip().lower() in _TRUTHY
+
+
+def _human_user_text(message: Any) -> str:
+    if not isinstance(message, dict) or message.get("type") != "user":
+        return ""
+    if message.get("isMeta") or message.get("toolUseResult") is not None:
+        return ""
+    content = (message.get("message") or {}).get("content")
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return ""
+    return "\n".join(
+        str(block.get("text") or "")
+        for block in content
+        if isinstance(block, dict) and block.get("type") == "text"
+    )
+
+
+def _request_intent(context: Any) -> str | None:
+    """Classify only clear human intent; ambiguous requests retain the configured policy."""
+    messages = getattr(context, "messages", None) if context is not None else None
+    if not isinstance(messages, list):
+        return None
+    for message in reversed(messages):
+        text = _human_user_text(message)
+        if not text.strip():
+            continue
+        if _READ_ONLY_PROHIBITION_RE.search(text) or _READ_ONLY_PROHIBITION_ZH_RE.search(text):
+            return "read_only"
+        if _MUTATION_INTENT_RE.search(text):
+            return "mutation"
+        if _READ_ONLY_INTENT_RE.search(text):
+            return "read_only"
+    return None
+
+
+def _apply_request_intent_guard(
+    decision: PermissionDecision,
+    *,
+    action: str,
+    resource: str,
+    context: Any,
+    input: Any,
+) -> PermissionDecision:
+    if (
+        action != "filesystem.write"
+        or decision.get("behavior") != "allow"
+        or is_shadow_mode()
+        or _request_intent(context) != "read_only"
+    ):
+        return decision
+    return {
+        "behavior": "ask",
+        "message": (
+            f"The current user request appears read-only and did not authorize file changes. "
+            f"Approve filesystem.write on {resource} once?"
+        ),
+        "updatedInput": input,
+        "decisionReason": {
+            "type": "request_intent",
+            "rule": "request-intent-read-only",
+            "action": action,
+            "resource": resource,
+        },
+    }
 
 
 def _fs_engine(context: Any) -> PolicyEngine:
@@ -162,8 +249,34 @@ def evaluate_path(action: str, path: str, context: Any, input: Any = None) -> Pe
     decision = _fs_engine(context).evaluate(action, resource)
     result = _to_permission_decision(decision.effect, decision.matched_rule_id, action, resource, input)
     served = _apply_shadow(result, input)
-    _emit_audit(context, action, resource, decision.effect, decision.matched_rule_id, decision.mode, served)
-    return served
+    guarded = _apply_request_intent_guard(
+        served,
+        action=action,
+        resource=resource,
+        context=context,
+        input=input,
+    )
+    if guarded is served:
+        _emit_audit(
+            context,
+            action,
+            resource,
+            decision.effect,
+            decision.matched_rule_id,
+            decision.mode,
+            served,
+        )
+    else:
+        _emit_audit(
+            context,
+            action,
+            resource,
+            "ask",
+            "request-intent-read-only",
+            decision.mode,
+            guarded,
+        )
+    return guarded
 
 
 class PolicyDenied(PermissionError):

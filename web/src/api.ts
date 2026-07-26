@@ -38,6 +38,13 @@ export const api = {
   list: (): Promise<{ agents: AgentSummary[] }> => fetch('/agents').then((r) => r.json()),
   get: (id: string): Promise<AgentRecord | null> =>
     fetch(`/agents/${id}`).then((r) => (r.ok ? r.json() : null)),
+  events: async (id: string): Promise<RunFrame[]> => {
+    const response = await fetch(`/agents/${id}/events`)
+    if (!response.ok) return []
+    const frames: RunFrame[] = []
+    await readSse(response, (frame) => frames.push(frame))
+    return frames
+  },
   browser: (id: string): Promise<BrowserView | null> =>
     fetch(`/agents/${id}/browser`).then((r) => (r.ok ? r.json() : null)),
   interactions: (id: string): Promise<{ interactions: InteractionRecord[] }> =>
@@ -83,6 +90,40 @@ export class RunError extends Error {
   held_by?: string
 }
 
+async function readSse(res: Response, onFrame: (frame: RunFrame) => void): Promise<void> {
+  if (!res.body) return
+  const reader = res.body.getReader()
+  const decoder = new TextDecoder()
+  let buffer = ''
+
+  const emit = (part: string) => {
+    let event = 'message'
+    const data: string[] = []
+    for (const raw of part.split(/\r?\n/)) {
+      const line = raw.trimEnd()
+      if (line.startsWith('event:')) event = line.slice(6).trim()
+      else if (line.startsWith('data:')) data.push(line.slice(5).trimStart())
+    }
+    if (data.length === 0) return
+    try {
+      onFrame({ event, data: JSON.parse(data.join('\n')) })
+    } catch {
+      /* skip malformed or keep-alive frames */
+    }
+  }
+
+  for (;;) {
+    const { done, value } = await reader.read()
+    if (done) break
+    buffer += decoder.decode(value, { stream: true })
+    const parts = buffer.split(/\r?\n\r?\n/)
+    buffer = parts.pop() ?? ''
+    parts.forEach(emit)
+  }
+  buffer += decoder.decode()
+  if (buffer.trim()) emit(buffer)
+}
+
 // POST /agent streams SSE. EventSource is GET-only, so we read the body stream and parse frames.
 export async function runAgent(
   body: Record<string, unknown>,
@@ -103,35 +144,7 @@ export async function runAgent(
     throw err
   }
   onFrame({ event: '_id', data: { agent_id: res.headers.get('X-Agent-Id') } })
-
-  const reader = res.body!.getReader()
-  const dec = new TextDecoder()
-  let buf = ''
-  for (;;) {
-    const { done, value } = await reader.read()
-    if (done) break
-    buf += dec.decode(value, { stream: true })
-    // sse-starlette terminates lines with CRLF, so frames are separated by \r\n\r\n.
-    // Splitting on '\n\n' alone matches nothing and you silently get an empty stream.
-    const parts = buf.split(/\r?\n\r?\n/)
-    buf = parts.pop() ?? '' // keep the incomplete tail
-    for (const part of parts) {
-      let ev = 'message'
-      let data = ''
-      for (const raw of part.split(/\r?\n/)) {
-        const line = raw.trimEnd()
-        if (line.startsWith('event:')) ev = line.slice(6).trim()
-        else if (line.startsWith('data:')) data += line.slice(5).trim()
-        // lines starting with ':' are keep-alive pings — ignore
-      }
-      if (!data) continue
-      try {
-        onFrame({ event: ev, data: JSON.parse(data) })
-      } catch {
-        /* skip bad frame */
-      }
-    }
-  }
+  await readSse(res, onFrame)
 }
 
 

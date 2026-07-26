@@ -825,6 +825,7 @@ def create_app(auth_required: bool = False, dev: bool = False) -> Any:
     list_agents = _gw_agent["list_agents"]
     get_agent = _gw_agent["get_agent"]
     cancel_agent = _gw_agent["cancel_agent"]
+    agent_events = _gw_agent["agent_events"]
     list_agent_interactions = _gw_agent["list_agent_interactions"]
     respond_agent_interaction = _gw_agent["respond_agent_interaction"]
 
@@ -842,6 +843,7 @@ def create_app(auth_required: bool = False, dev: bool = False) -> Any:
         ("/agents", list_agents, ["GET"]),
         ("/agents/{agent_id}", get_agent, ["GET"]),
         ("/agents/{agent_id}/cancel", cancel_agent, ["POST"]),
+        ("/agents/{agent_id}/events", agent_events, ["GET"]),
         ("/agents/{agent_id}/interactions", list_agent_interactions, ["GET"]),
         (
             "/agents/{agent_id}/interactions/{interaction_id}/responses",
