@@ -44,6 +44,12 @@ _PHONE = re.compile(
     r"(\+?\d[\d\-\s]{7,}\d)"
     r"(?![\w/?#&.\-])"
 )
+_PUBLIC_TIMESTAMP_PREFIX = re.compile(
+    r"(?:(?:\"|'|`)?(?:[A-Za-z_][\w-]*\.)*"
+    r"(?:time|timestamp|generated|updated|created(?:_at)?|published(?:_at)?)"
+    r"(?:\"|'|`)?(?:\s*\([^)\n]{0,40}\))?(?:\"|'|`)?\s*[:=]\s*)$",
+    re.IGNORECASE,
+)
 
 REDACTED = "[redacted]"
 
@@ -61,7 +67,26 @@ def mask_identifiers(text: str) -> str:
     if not text:
         return text
     text = _EMAIL.sub(REDACTED, text)
-    text = _PHONE.sub(REDACTED, text)
+
+    def _mask_phone(match: re.Match[str]) -> str:
+        raw = match.group(0)
+        digits = re.sub(r"\D", "", raw)
+        # Browser tools often return rendered JSON as a text snapshot. A bare Unix timestamp under
+        # an explicit time-like key is public page data, not a telephone number. The model can render
+        # the same field as Markdown (for example ``properties.time (first feature): 178…``), so the
+        # narrowly-scoped prefix also accepts dotted field paths, backticks, and a short qualifier.
+        # The same digits under ``phone`` or without a time-field label remain redacted.
+        if raw == digits and len(digits) in {10, 13}:
+            prefix = match.string[max(0, match.start() - 64) : match.start()]
+            # Accessibility snapshots quote a JSON document as one string, so its inner quotes are
+            # escaped (``{\"time\":178…}``). Normalize only those quote escapes for the contextual
+            # key check; the returned text itself remains byte-for-byte unchanged.
+            normalized_prefix = prefix.replace('\\"', '"').replace("\\'", "'")
+            if _PUBLIC_TIMESTAMP_PREFIX.search(normalized_prefix):
+                return raw
+        return REDACTED
+
+    text = _PHONE.sub(_mask_phone, text)
     return text
 
 

@@ -31,12 +31,45 @@ def _clean():
 # --------------------------------------------------------------------------- cleaners
 
 
-def test_clean_url_strips_userinfo_fragment_query_values() -> None:
-    out = clean_url("https://user:pass@ex.com/login?token=abc123&x=1#frag")
+def test_clean_url_strips_userinfo_fragment_and_sensitive_query_values() -> None:
+    out = clean_url(
+        "https://user:pass@ex.com/login?token=abc123&x=1&format=geojson"
+        "&starttime=2026-07-25T05:55:10&limit=5#frag"
+    )
     assert "user" not in out and "pass" not in out
     assert "abc123" not in out and "#frag" not in out
     assert out.startswith("https://ex.com/login")
     assert "token=" in out and "x=" in out  # keys kept, values dropped
+    assert "format=geojson" in out
+    assert "starttime=2026-07-25T05%3A55%3A10" in out
+    assert "limit=5" in out
+
+
+def test_clean_url_rejects_secret_shaped_values_even_for_public_keys() -> None:
+    out = clean_url(
+        "https://example.test/data?format=PrivateExportV1"
+        "&starttime=not-a-date&limit=1234567890&terms-0-operator=secret"
+    )
+    assert "PrivateExportV1" not in out
+    assert "not-a-date" not in out
+    assert "1234567890" not in out
+    assert "secret" not in out
+    assert "format=" in out and "starttime=" in out and "limit=" in out
+
+
+def test_clean_url_preserves_bounded_arxiv_structural_values() -> None:
+    out = clean_url(
+        "https://arxiv.org/search/advanced?terms-0-field=abstract"
+        "&terms-0-operator=OR&date-date_type=submitted_date"
+        "&date-from_date=2026-06-26&date-to_date=2026-07-26"
+        "&classification-computer_science=include"
+    )
+    assert "terms-0-field=abstract" in out
+    assert "terms-0-operator=OR" in out
+    assert "date-date_type=submitted_date" in out
+    assert "date-from_date=2026-06-26" in out
+    assert "date-to_date=2026-07-26" in out
+    assert "classification-computer_science=include" in out
 
 
 def test_redact_headers() -> None:
@@ -68,6 +101,49 @@ def test_mask_identifiers_preserves_iso_dates_and_numeric_query_values() -> None
     assert mask_identifiers(text) == text
 
 
+def test_mask_identifiers_preserves_json_timestamps_but_masks_phone_fields() -> None:
+    snapshot = (
+        '{"metadata":{"generated":1785045310000},'
+        '"properties":{"time":1785029564000,"updated":1785031000000},'
+        '"phone":1577551000}'
+    )
+    cleaned = mask_identifiers(snapshot)
+    assert '"generated":1785045310000' in cleaned
+    assert '"time":1785029564000' in cleaned
+    assert '"updated":1785031000000' in cleaned
+    assert '"phone":[redacted]' in cleaned
+
+
+def test_mask_identifiers_preserves_timestamps_in_escaped_accessibility_json() -> None:
+    snapshot = (
+        r'- generic [ref=e2]: "{\"metadata\":{\"generated\":1785045310000},'
+        r'\"features\":[{\"properties\":{\"time\":1785029564000,'
+        r'\"updated\":1785031000000,\"phone\":1577551000}}]}"'
+    )
+    cleaned = mask_identifiers(snapshot)
+    assert r'\"generated\":1785045310000' in cleaned
+    assert r'\"time\":1785029564000' in cleaned
+    assert r'\"updated\":1785031000000' in cleaned
+    assert r'\"phone\":[redacted]' in cleaned
+
+
+def test_mask_identifiers_preserves_labeled_timestamp_output_but_not_bare_number() -> None:
+    result = (
+        "Raw integer values:\n"
+        "- `metadata.generated`: 1785046322000\n"
+        "- `properties.time (first feature)`: 1785029564077\n"
+        "- updated: 1785031604040\n"
+        "- phone: 1577551000\n"
+        "- unlabeled: 1785046322000"
+    )
+    cleaned = mask_identifiers(result)
+    assert "`metadata.generated`: 1785046322000" in cleaned
+    assert "`properties.time (first feature)`: 1785029564077" in cleaned
+    assert "updated: 1785031604040" in cleaned
+    assert "phone: [redacted]" in cleaned
+    assert "unlabeled: [redacted]" in cleaned
+
+
 def test_gateway_preserves_numeric_document_paths_in_nested_browser_data() -> None:
     url = "https://home.alibabagroup.com/en-US/document-1991237455038119936"
     decision = DLPGateway().scrub(
@@ -80,6 +156,32 @@ def test_gateway_preserves_numeric_document_paths_in_nested_browser_data() -> No
     assert not decision.blocked
     assert decision.payload["snapshot"].endswith(f'href="{url}"')
     assert decision.payload["links"][0]["href"] == url
+
+
+def test_gateway_preserves_public_api_window_and_timestamp_fields() -> None:
+    url = (
+        "https://earthquake.usgs.gov/fdsnws/event/1/query?format=geojson"
+        "&starttime=2026-07-25T05:55:10&orderby=magnitude&limit=5&api_key=secret"
+    )
+    decision = DLPGateway().scrub(
+        "model_request",
+        {
+            "url": url,
+            "snapshot": (
+                '{"metadata":{"generated":1785045310000},'
+                '"features":[{"properties":{"time":1785029564000}}]}'
+            ),
+        },
+    )
+    assert not decision.blocked
+    cleaned_url = decision.payload["url"]
+    assert "format=geojson" in cleaned_url
+    assert "starttime=2026-07-25T05%3A55%3A10" in cleaned_url
+    assert "orderby=magnitude" in cleaned_url
+    assert "limit=5" in cleaned_url
+    assert "secret" not in cleaned_url
+    assert '"generated":1785045310000' in decision.payload["snapshot"]
+    assert '"time":1785029564000' in decision.payload["snapshot"]
 
 
 def test_redact_mapping_sensitive_keys() -> None:
