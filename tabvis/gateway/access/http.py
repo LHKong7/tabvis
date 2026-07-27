@@ -519,6 +519,7 @@ def create_gateway_app(gateway: GatewayApplication | None = None, *, launcher: A
 
     @contextlib.asynccontextmanager
     async def lifespan(_app: Starlette):
+        app_gateway.recover()  # retire runs a previous process left non-terminal
         await app_gateway.scheduler.start()
         try:
             yield

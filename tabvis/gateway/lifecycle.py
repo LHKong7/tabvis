@@ -28,6 +28,7 @@ from tabvis.gateway.runtime.scheduled_tasks import (
     ScheduledTaskStore,
 )
 from tabvis.gateway.store import db
+from tabvis.utils.debug import log_for_debugging
 from tabvis.utils.env_utils import is_env_truthy
 
 GatewayStatus = Literal[
@@ -117,6 +118,28 @@ class GatewayApplication:
 
             self.authentication = get_managed_authentication_runtime()
         self.status = "ready" if self.orchestrator.has_launcher else "degraded"
+
+    def recover(self) -> None:
+        """Clear state a previous process left behind. Called once per real server boot.
+
+        Runs left non-terminal by a crash are never closed by anything else: the process that owned
+        them is gone, they keep counting toward ``count_active_runs``, and a crash with ``max_runs``
+        in flight leaves the gateway permanently unable to start a run — and every scheduled task
+        wedged, since a task will not fire while its previous Run is non-terminal.
+
+        This belongs to the ASGI lifespan rather than :meth:`startup`, alongside the scheduler's
+        equivalent claim recovery: building an application object must stay side-effect-free, and at
+        lifespan time nothing in THIS process has launched a run yet, so every active run is by
+        definition orphaned. Best-effort — recovery must never stop the control plane from serving.
+        """
+        try:
+            retired = self.runs.retire_orphaned_runs()
+            if retired:
+                log_for_debugging(
+                    f"[GATEWAY] retired {len(retired)} run(s) orphaned by a previous process"
+                )
+        except Exception:  # noqa: BLE001
+            pass
 
     def drain(self) -> None:
         """Stop accepting new work and close the store (design §2.1 shutdown order, abbreviated)."""

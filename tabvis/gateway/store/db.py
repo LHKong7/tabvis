@@ -396,6 +396,23 @@ def count_active_runs(active_states: tuple[str, ...]) -> int:
     return int(row["n"])
 
 
+def list_run_ids_by_status(active_states: tuple[str, ...]) -> list[tuple[str, str]]:
+    """``(run_id, status)`` for every run currently in one of ``active_states``, oldest first.
+
+    Feeds the startup sweep that retires runs orphaned by a crash — they are non-terminal forever
+    otherwise, and each one holds a slot in ``count_active_runs``.
+    """
+    placeholders = ",".join("?" for _ in active_states)
+    with _lock:
+        conn = connect()
+        rows = conn.execute(
+            f"SELECT run_id, status FROM runs WHERE status IN ({placeholders}) "
+            "ORDER BY created_at ASC, rowid ASC",
+            tuple(active_states),
+        ).fetchall()
+    return [(r["run_id"], r["status"]) for r in rows]
+
+
 def list_all_runs() -> list[dict[str, Any]]:
     """Every run, newest first — the source for the legacy agent projection (design §9.8)."""
     with _lock:

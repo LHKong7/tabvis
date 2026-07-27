@@ -785,6 +785,7 @@ def create_app(auth_required: bool = False, dev: bool = False) -> Any:
                 await _dev_server.start()  # fail loud if npm/web deps are missing
             _gw = getattr(_app.state, "gateway", None)
             if _gw is not None:
+                _gw.recover()  # retire runs a previous process left non-terminal
                 await _gw.scheduler.start()
             if _gw is not None and getattr(_gw, "channels", None) is not None:
                 await _gw.channels.start()  # subscribe outbound delivery + start client-loop read loops

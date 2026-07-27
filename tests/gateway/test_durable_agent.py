@@ -143,9 +143,11 @@ def test_http_agent_view_and_zero_run_agent() -> None:
     from tabvis.gateway.access.http import create_gateway_app
 
     app = create_gateway_app()
-    run = app.state.gateway.runs.create_run(agent_id="ag_http", session_id="ses", command_id="cmd",
-                                            model="m", profile="pf")
     with TestClient(app) as client:
+        # Created inside the lifespan: boot retires runs left non-terminal by a previous process,
+        # and a run cannot predate the process that serves it.
+        run = app.state.gateway.runs.create_run(agent_id="ag_http", session_id="ses",
+                                                command_id="cmd", model="m", profile="pf")
         view = client.get("/v1/agents/ag_http").json()
         assert view["agent_id"] == "ag_http" and view["status"] == "queued"
         assert view["agent_status"] == ACTIVE and view["profile"] == "pf"

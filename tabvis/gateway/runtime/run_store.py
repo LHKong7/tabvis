@@ -243,6 +243,40 @@ class RunStore:
         self._events.notify_live(envelope)
         return record
 
+    def retire_orphaned_runs(self, *, correlation_id: str | None = None) -> list[RunRecord]:
+        """Drive runs left non-terminal by a stopped process to a terminal state (design §7.4).
+
+        Nothing else ever closes them: the process that owned them is gone, so they stay ``running``
+        (or ``queued``/``preparing``/``waiting_*``) forever, keep counting toward
+        ``count_active_runs``, and permanently exhaust gateway capacity — a crash with ``max_runs``
+        active runs means no run can ever start again. A scheduled task is wedged the same way, since
+        it refuses to fire while its previous Run is non-terminal.
+
+        Uses only declared edges: ``running`` has an ``interrupted`` edge (exactly this case, and it
+        maps to the legacy ``failed`` status); every other active state reaches ``cancelled``.
+        Idempotent — a second call finds nothing left to retire.
+        """
+        retired: list[RunRecord] = []
+        for run_id, status in db.list_run_ids_by_status(tuple(sorted(runs.ACTIVE))):
+            to_status = runs.INTERRUPTED if status == runs.RUNNING else runs.CANCELLED
+            if not runs.can_transition(status, to_status):
+                continue
+            try:
+                retired.append(
+                    self.transition(
+                        run_id,
+                        to_status,
+                        expected=status,
+                        error_code="process_restarted" if to_status == runs.INTERRUPTED else None,
+                        correlation_id=correlation_id,
+                    )
+                )
+            except GatewayError:
+                # Lost a race with a live transition, or the edge moved underneath us. The point is
+                # to free capacity, so one stubborn row must not abort the sweep.
+                continue
+        return retired
+
     # --- reads ----------------------------------------------------------------------------------
 
     def get_run(self, run_id: str) -> RunRecord | None:
