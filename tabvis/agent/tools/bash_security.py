@@ -547,11 +547,30 @@ def validate_git_commit(context: ValidationContext) -> PermissionResult:
             "message": "Git commit contains backslash, needs full validation",
         }
 
+    if "\r" in original_command:
+        return {
+            "behavior": "passthrough",
+            "message": "Git commit contains a carriage return, needs full validation",
+        }
+
     message_match = _GIT_COMMIT_MSG_RE.match(original_command)
     if message_match:
         quote = message_match.group(1)
         message_content = message_match.group(2)
         remainder = message_match.group(3)
+
+        # The message group spans newlines so that a real multi-line ``-m`` body still fast-paths.
+        # That also lets it BACKTRACK past the true closing quote and swallow a newline plus a whole
+        # extra command, e.g. ``git commit -m "wip"\nrm -rf ~ ; echo "done"`` — the tail quote closes
+        # the group, the remainder looks clean, and the ``allow`` below would skip every main
+        # validator (newline, shell-metacharacter, dangerous-pattern). A single quoted argument can
+        # never contain its own delimiter here (backslashes already passthrough above), so a
+        # delimiter inside the body means the match escaped its quotes.
+        if quote in message_content:
+            return {
+                "behavior": "passthrough",
+                "message": "Git commit message is not a single quoted argument",
+            }
 
         if quote == '"' and message_content and _SUBSTITUTION_IN_MSG_RE.search(message_content):
             _log(BASH_SECURITY_CHECK_IDS["GIT_COMMIT_SUBSTITUTION"], 1)

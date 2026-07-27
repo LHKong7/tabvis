@@ -49,10 +49,14 @@ __all__ = [
     "base_create_assistant_message",
     "create_assistant_api_error_message",
     "create_assistant_message",
+    "create_compact_boundary_message",
     "create_progress_message",
     "create_system_api_error_message",
     "create_user_message",
     "get_assistant_message_text",
+    "get_last_assistant_message",
+    "get_messages_after_compact_boundary",
+    "is_compact_boundary_message",
     "normalize_content_from_api",
     "normalize_messages_for_api",
 ]
@@ -296,6 +300,68 @@ def create_progress_message(
         "timestamp": _utc_iso(),
     }
     return message
+
+
+def create_compact_boundary_message(
+    trigger: str,
+    pre_compact_token_count: int,
+    last_pre_compact_uuid: str | None = None,
+    user_feedback: str | None = None,
+    summarized_message_count: int | None = None,
+) -> dict[str, Any]:
+    """The ``system``/``compact_boundary`` marker that separates a summary from what preceded it.
+
+    ``normalize_messages_for_api`` drops non-local-command system messages, so this never reaches
+    the model — it exists for the transcript, for ``preservedSegment`` relinking in
+    ``session_storage``, and to carry ``preCompactDiscoveredTools`` across the boundary.
+    ``compactMetadata`` is always present so callers can annotate it without a guard.
+    """
+    metadata: dict[str, Any] = {
+        "trigger": trigger,
+        "preCompactTokenCount": pre_compact_token_count,
+    }
+    if last_pre_compact_uuid is not None:
+        metadata["lastPreCompactUuid"] = last_pre_compact_uuid
+    if user_feedback:
+        metadata["userFeedback"] = user_feedback
+    if summarized_message_count is not None:
+        metadata["summarizedMessageCount"] = summarized_message_count
+    return {
+        "type": "system",
+        "subtype": "compact_boundary",
+        "compactMetadata": metadata,
+        "uuid": _new_uuid(),
+        "timestamp": _utc_iso(),
+    }
+
+
+def is_compact_boundary_message(message: Any) -> bool:
+    """Whether ``message`` is a ``system``/``compact_boundary`` envelope."""
+    return (
+        isinstance(message, dict)
+        and message.get("type") == "system"
+        and message.get("subtype") == "compact_boundary"
+    )
+
+
+def get_messages_after_compact_boundary(messages: list[Message]) -> list[Message]:
+    """The messages following the LAST compact boundary (all of them when there is none).
+
+    Used to build the summarization request for an already-compacted conversation, so only the
+    post-boundary segment is re-summarized rather than the whole transcript again.
+    """
+    for index in range(len(messages) - 1, -1, -1):
+        if is_compact_boundary_message(messages[index]):
+            return list(messages[index + 1 :])
+    return list(messages)
+
+
+def get_last_assistant_message(messages: list[Message]) -> AssistantMessage | None:
+    """The last ``assistant`` envelope in ``messages``, or ``None``."""
+    for message in reversed(messages):
+        if isinstance(message, dict) and message.get("type") == "assistant":
+            return message  # type: ignore[return-value]
+    return None
 
 
 def create_system_api_error_message(
@@ -561,10 +627,16 @@ def normalize_messages_for_api(
 ) -> list[Message]:
     """Normalize the messages for api.
 
-    Drops progress / non-local-command system / virtual / synthetic-api-error messages, merges
-    consecutive user messages into one user turn, and passes user/assistant through. Local-command
-    system messages are converted to user messages (so the model can reference prior output) and
-    merged into the running user turn.
+    Drops progress / non-local-command system / virtual / synthetic-api-error / attachment
+    messages, merges consecutive user messages into one user turn, and passes user/assistant
+    through. Local-command system messages are converted to user messages (so the model can
+    reference prior output) and merged into the running user turn.
+
+    Attachment envelopes carry no ``message`` payload and this build has no attachment→content
+    renderer, so they are transcript artifacts only. They MUST be dropped here: compaction splices
+    post-compact file/hook attachments straight into the conversation, and passing one through
+    reaches ``_messages_to_api_params``, which treats every non-``user`` envelope as an assistant
+    turn and raises ``KeyError: 'message'`` on the first model call after a compaction.
 
     This build does not (1) reorder attachments, (2) strip PDF/image blocks from the meta user
     message that preceded a size error, (3) strip tool_search tool_reference blocks or inject a
@@ -588,7 +660,7 @@ def normalize_messages_for_api(
         m
         for m in reordered
         if not (
-            m.get("type") == "progress"
+            m.get("type") in ("progress", "attachment")
             or (
                 m.get("type") == "system"
                 and not _is_system_local_command_message(m)
@@ -644,7 +716,10 @@ def normalize_messages_for_api(
             result.append(message)
             continue
 
-        # Any other message type (e.g. attachment) is passed through for the skeleton.
-        result.append(message)
+        # Backstop for any envelope shape not handled above: only pass through what the API-param
+        # builder can actually represent, i.e. something carrying a ``message`` payload. Anything
+        # else would be treated as an assistant turn and blow up on ``message["message"]``.
+        if isinstance(message, dict) and "message" in message:
+            result.append(message)
 
     return result

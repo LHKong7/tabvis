@@ -194,10 +194,10 @@ def _get_mcp_instructions_delta_attachment(*args: Any) -> list[Any]:
     return get_mcp_instructions_delta_attachment(*args)
 
 
-async def _process_session_start_hooks(*args: Any) -> list[HookResultMessage]:
+async def _process_session_start_hooks(*args: Any, **kwargs: Any) -> list[HookResultMessage]:
     from tabvis.utils.session_start import process_session_start_hooks
 
-    return await process_session_start_hooks(*args)
+    return await process_session_start_hooks(*args, **kwargs)
 
 
 async def _execute_pre_compact_hooks(payload: dict[str, Any], signal: Any) -> Any:
@@ -576,7 +576,7 @@ async def compact_conversation(
             context.options.tools,
             context.options.main_loop_model,
             [],
-            call_site="compact_full",
+            {"callSite": "compact_full"},
         ):
             post_compact_file_attachments.append(_create_attachment_message(att))
         for att in _get_agent_listing_delta_attachment(context, []):
@@ -594,7 +594,7 @@ async def compact_conversation(
         )
         # Execute SessionStart hooks after successful compaction.
         hook_messages = await _process_session_start_hooks(
-            "compact", {"model": context.options.main_loop_model}
+            "compact", model=context.options.main_loop_model
         )
 
         boundary_marker = _create_compact_boundary_message(
@@ -806,7 +806,7 @@ async def partial_compact_conversation(
             context.options.tools,
             context.options.main_loop_model,
             messages_to_keep,
-            call_site="compact_partial",
+            {"callSite": "compact_partial"},
         ):
             post_compact_file_attachments.append(_create_attachment_message(att))
         for att in _get_agent_listing_delta_attachment(context, messages_to_keep):
@@ -823,7 +823,7 @@ async def partial_compact_conversation(
             context, {"type": "hooks_start", "hookType": "session_start"}
         )
         hook_messages = await _process_session_start_hooks(
-            "compact", {"model": context.options.main_loop_model}
+            "compact", model=context.options.main_loop_model
         )
 
         post_compact_token_count = _token_count_from_last_api_response([summary_response])

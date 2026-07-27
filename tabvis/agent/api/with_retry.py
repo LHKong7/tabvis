@@ -414,6 +414,41 @@ def _is_retryable_transport_error(error: Any) -> bool:
     )
 
 
+# The gateway makes the LOOP provider-blind, but not this layer: the openai / google-genai SDKs
+# raise their OWN exception types, so a transient 429/5xx from an OpenAI- or Gemini-backed endpoint
+# is not an ``anthropic.APIError``, fails the ``isinstance`` gate in ``with_retry``, and would kill
+# the run on the FIRST attempt while the identical anthropic status retries ten times. Recognise the
+# status those SDKs carry and retry on the same terms. 401 is deliberately excluded: the anthropic
+# path retries it only to re-run the API-key helper, which third-party providers do not have, so
+# there a 401 is a real credential failure and retrying just burns the budget.
+_RETRYABLE_PROVIDER_STATUSES = frozenset({408, 409, 429})
+
+
+def _provider_status_code(error: Any) -> int | None:
+    """HTTP status carried by a non-anthropic provider SDK error.
+
+    ``openai`` exposes ``status_code``, ``google-genai`` exposes ``code``, and some wrappers only
+    keep the ``httpx`` response. Values outside the HTTP range are ignored so an unrelated ``code``
+    attribute cannot be mistaken for a status.
+    """
+    for value in (
+        getattr(error, "status_code", None),
+        getattr(error, "code", None),
+        getattr(getattr(error, "response", None), "status_code", None),
+    ):
+        if isinstance(value, int) and 400 <= value < 600:
+            return value
+    return None
+
+
+def _is_retryable_provider_error(error: Any) -> bool:
+    """True for a provider-SDK error whose status matches anthropic's retryable set."""
+    status = _provider_status_code(error)
+    if status is None:
+        return False
+    return status in _RETRYABLE_PROVIDER_STATUSES or status >= 500
+
+
 def _is_model_timeout_error(error: Any) -> bool:
     """Timeouts use a small dedicated retry budget, never the generic ten-retry budget."""
     return isinstance(
@@ -743,7 +778,9 @@ async def with_retry(
             # are not anthropic.APIError instances, so they would otherwise fail the APIError gate
             # below and raise CannotRetryError. They are transient — retry them.
             if not isinstance(error, APIError):
-                if not _is_retryable_transport_error(error):
+                if not _is_retryable_transport_error(
+                    error
+                ) and not _is_retryable_provider_error(error):
                     raise CannotRetryError(error, retry_context) from error
             elif not _should_retry(error):
                 raise CannotRetryError(error, retry_context) from error

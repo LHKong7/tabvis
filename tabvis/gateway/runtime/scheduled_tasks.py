@@ -155,6 +155,12 @@ class ScheduledTaskStore:
         # PATCH preserves the current next occurrence instead.
         if {"schedule_type", "run_at", "interval_seconds"} & payload.keys():
             merged["next_run_at"] = None
+            # An interval edit that does not carry a new start must re-anchor from *now*. The
+            # stored ``run_at`` is the original creation anchor and is normally far in the past
+            # for a long-lived schedule, so reusing it would recompute a due-in-the-past next
+            # occurrence and fire the task immediately on the very next poll.
+            if "run_at" not in payload and merged.get("schedule_type") == INTERVAL:
+                merged["run_at"] = None
         values = self._validated_values(merged, now=now, partial=False)
         for key, value in values.items():
             setattr(current, key, value)

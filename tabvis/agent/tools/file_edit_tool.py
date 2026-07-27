@@ -215,32 +215,51 @@ def apply_edit_to_file(
     """Apply a single edit and return the updated content.
 
     ``replace_all`` replaces every occurrence, otherwise only the first. When deleting
-    (``new_string == ''``) and ``old_string`` lacks a trailing newline but appears
-    immediately before one in the file, the matched trailing ``\\n`` is consumed too so
-    the deletion doesn't leave a blank line.
+    (``new_string == ''``) and ``old_string`` lacks a trailing newline but spans a WHOLE
+    line, the matched trailing ``\\n`` is consumed too so the deletion doesn't leave a
+    blank line. A match that covers only part of a line keeps its newline — consuming it
+    there would silently join that line with the next one.
 
     ``new_string`` is always treated as a literal replacement (no ``$``-style
     backreference expansion), matching how ``str.replace`` already works.
     """
-    if replace_all:
-
-        def _f(content: str, search: str, replace: str) -> str:
-            return content.replace(search, replace)
-    else:
-
-        def _f(content: str, search: str, replace: str) -> str:
-            return content.replace(search, replace, 1)
-
     if new_string != "":
-        return _f(original_content, old_string, new_string)
+        if replace_all:
+            return original_content.replace(old_string, new_string)
+        return original_content.replace(old_string, new_string, 1)
 
-    strip_trailing_newline = (not old_string.endswith("\n")) and (
-        (old_string + "\n") in original_content
-    )
+    if old_string == "" or old_string.endswith("\n"):
+        return original_content
 
-    if strip_trailing_newline:
-        return _f(original_content, old_string + "\n", new_string)
-    return _f(original_content, old_string, new_string)
+    return _delete_occurrences(original_content, old_string, replace_all=replace_all)
+
+
+def _delete_occurrences(content: str, old_string: str, *, replace_all: bool) -> str:
+    """Delete occurrences of ``old_string``, absorbing the newline only for whole-line matches.
+
+    The trailing-newline rule has to be decided per occurrence and by POSITION. A containment
+    test like ``(old_string + "\\n") in content`` is both too broad — ``x = 1  # note`` deleting
+    ``  # note`` would absorb the newline and produce ``x = 1y = 2`` — and able to retarget the
+    edit, since ``content.replace(old_string + "\\n", "", 1)`` may land on a later occurrence than
+    the first plain match the caller's uniqueness check validated.
+    """
+    parts: list[str] = []
+    pos = 0
+    width = len(old_string)
+    while True:
+        start = content.find(old_string, pos)
+        if start == -1:
+            break
+        end = start + width
+        whole_line = (start == 0 or content[start - 1] == "\n") and content.startswith(
+            "\n", end
+        )
+        parts.append(content[pos:start])
+        pos = end + 1 if whole_line else end
+        if not replace_all:
+            break
+    parts.append(content[pos:])
+    return "".join(parts)
 
 
 def get_patch_for_edit(

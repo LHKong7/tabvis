@@ -328,7 +328,16 @@ def process_hook_json_output(
             if hook_specific.get("updatedInput"):
                 result["updatedInput"] = hook_specific["updatedInput"]
             result["additionalContext"] = hook_specific.get("additionalContext")
-        elif event_name in ("UserPromptSubmit", "Setup", "SubagentStart", "PostToolUseFailure"):
+        elif event_name in (
+            "UserPromptSubmit",
+            "Setup",
+            "SubagentStart",
+            "PostToolUseFailure",
+            # PreCompact supplies extra summarization instructions this way, PostCompact extra
+            # context about the summary it just saw.
+            "PreCompact",
+            "PostCompact",
+        ):
             result["additionalContext"] = hook_specific.get("additionalContext")
         elif event_name == "PostToolUse":
             result["additionalContext"] = hook_specific.get("additionalContext")
@@ -842,6 +851,61 @@ async def execute_post_tool_hooks(
         timeout_ms=timeout_ms,
     ):
         yield result
+
+
+async def _aggregate_compact_hooks(
+    hook_event: str, payload: dict[str, Any], signal: Any
+) -> dict[str, Any]:
+    """Drive the Pre/PostCompact hooks and fold their results into one aggregate.
+
+    Compaction is a single synchronous step, so unlike the tool hooks these do not stream: the
+    caller awaits one object and reads ``newCustomInstructions`` / ``userDisplayMessage`` off it.
+    ``signal`` is accepted for symmetry with the tool-hook signatures; ``execute_hooks`` owns its
+    own per-hook timeout, and an abort between hooks is handled by the caller unwinding.
+    """
+    trigger = payload.get("trigger") or "manual"
+    hook_input: dict[str, Any] = {
+        **create_base_hook_input(None, None, {}),
+        "hook_event_name": hook_event,
+        "trigger": trigger,
+    }
+    if payload.get("customInstructions"):
+        hook_input["custom_instructions"] = payload["customInstructions"]
+    if payload.get("compactSummary"):
+        hook_input["compact_summary"] = payload["compactSummary"]
+
+    instructions: list[str] = []
+    display: list[str] = []
+    async for result in execute_hooks(
+        hook_input=hook_input, tool_use_id=hook_event, match_query=trigger
+    ):
+        if signal is not None and getattr(signal, "aborted", False):
+            break
+        context = result.get("additionalContext")
+        if context:
+            instructions.append(context)
+        system_message = result.get("systemMessage")
+        if system_message:
+            display.append(system_message)
+
+    return {
+        "newCustomInstructions": "\n\n".join(instructions) or None,
+        "userDisplayMessage": "\n".join(display) or None,
+    }
+
+
+async def execute_pre_compact_hooks(
+    payload: dict[str, Any], signal: Any = None
+) -> dict[str, Any]:
+    """Run ``PreCompact`` hooks; ``additionalContext`` becomes extra summarization instructions."""
+    return await _aggregate_compact_hooks("PreCompact", payload, signal)
+
+
+async def execute_post_compact_hooks(
+    payload: dict[str, Any], signal: Any = None
+) -> dict[str, Any]:
+    """Run ``PostCompact`` hooks once the summary exists."""
+    return await _aggregate_compact_hooks("PostCompact", payload, signal)
 
 
 def _agent_info_from_context(context: Any) -> dict[str, str]:

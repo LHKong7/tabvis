@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import os
 from collections import OrderedDict
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from typing import Any, TypedDict
 
 
@@ -194,9 +194,19 @@ def create_file_state_cache_with_size_limit(
     return FileStateCache(max_entries, max_size_bytes)
 
 
-def cache_to_object(cache: FileStateCache) -> dict[str, FileState]:
-    """Convert a cache to a plain dict (used by compaction)."""
-    return dict(cache.entries())
+def cache_to_object(cache: FileStateCache | Mapping[str, FileState]) -> dict[str, FileState]:
+    """Convert a cache to a plain dict (used by compaction).
+
+    Accepts either shape: ``ToolUseContext.read_file_state`` is declared as a plain ``dict`` and
+    the tools write to it directly, while other call sites hold a real :class:`FileStateCache`.
+    The Read tool's own accessors already straddle both, and compaction hands this whatever the
+    context carries — assuming only the cache class made every real compaction die here with
+    ``AttributeError: 'dict' object has no attribute 'entries'``.
+    """
+    entries = getattr(cache, "entries", None)
+    if callable(entries):
+        return dict(entries())
+    return dict(cache)
 
 
 def cache_keys(cache: FileStateCache) -> list[str]:

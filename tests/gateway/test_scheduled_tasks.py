@@ -90,6 +90,41 @@ def test_schedule_crud_is_durable_and_rejects_fast_intervals() -> None:
     assert cold_store.get(record.scheduled_task_id) is None
 
 
+def test_interval_edit_reanchors_from_now_instead_of_the_stale_start() -> None:
+    """Editing only the interval must not resurrect the original (long past) ``run_at`` anchor."""
+    created_at = datetime(2026, 7, 27, 10, tzinfo=timezone.utc)
+    record = ScheduledTaskStore(clock=lambda: created_at).create(
+        {
+            "name": "Hourly check",
+            "prompt": "open example.com",
+            "schedule_type": "interval",
+            "interval_seconds": 3600,
+        },
+        principal_id="local-admin",
+    )
+    assert record.run_at == _iso(created_at + timedelta(hours=1))
+
+    # Three days of firings later the stored anchor is stale; only ``next_run_at`` has moved on.
+    later = created_at + timedelta(days=3)
+    store = ScheduledTaskStore(clock=lambda: later)
+    stale = store.get(record.scheduled_task_id)
+    assert stale is not None
+    stale.next_run_at = _iso(later + timedelta(minutes=42))
+    with db.transaction() as conn:
+        db.update_scheduled_task_in(conn, stale.to_dict())
+
+    edited = store.update(record.scheduled_task_id, {"interval_seconds": 7200})
+    assert edited.next_run_at == _iso(later + timedelta(hours=2))
+    assert not db.list_due_scheduled_tasks(_iso(later), limit=8)
+
+    # An explicit start still wins over the re-anchor.
+    moved = store.update(
+        record.scheduled_task_id,
+        {"interval_seconds": 7200, "run_at": _iso(later + timedelta(minutes=5))},
+    )
+    assert moved.next_run_at == _iso(later + timedelta(minutes=5))
+
+
 def test_due_once_task_creates_a_fresh_run_and_disables_itself() -> None:
     now = datetime(2026, 7, 27, 10, tzinfo=timezone.utc)
     launcher = _RecordingLauncher()
