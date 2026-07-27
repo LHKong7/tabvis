@@ -339,7 +339,11 @@ def create_app(auth_required: bool = False, dev: bool = False) -> Any:
     from starlette.routing import Route, WebSocketRoute
 
     from tabvis.browser.server_auth import SecurityMiddleware, resolve_principal
-    from tabvis.policy.runtime_adapter import authorize_agent
+    from tabvis.policy.runtime_adapter import (
+        authorize_agent,
+        authorize_workspace,
+        filter_visible_agents,
+    )
     from tabvis.browser.manager import (
         close_browser,
         get_profile_holder,
@@ -363,6 +367,33 @@ def create_app(auth_required: bool = False, dev: bool = False) -> Any:
         if decision.get("behavior") != "allow":
             return JSONResponse({"error": decision.get("message", "forbidden")}, status_code=403)
         return None
+
+    def _guard_workspace(request: Request, action: str, workspace_id: str) -> JSONResponse | None:
+        """Return a 401/403 response if the caller may not touch ``workspace_id``; else None.
+
+        A workspace belongs to exactly one agent (the manager keys one workspace per agent/profile),
+        so ``authorize_workspace`` against that owner is the authority. An unknown workspace is
+        authorized against an empty owner, which an admin passes (the handler then answers its own
+        404) and a scoped agent principal does not — so the id space cannot be probed for existence.
+        """
+        from tabvis.browser import workspace as ws_module
+
+        principal = _principal(request)
+        if principal is None:
+            return JSONResponse({"error": "authentication required"}, status_code=401)
+        record = ws_module.get_workspace(workspace_id)
+        owner = record.agent_id if record is not None else ""
+        decision = authorize_workspace(principal, action, workspace_id, owner)
+        if decision.get("behavior") != "allow":
+            return JSONResponse({"error": decision.get("message", "forbidden")}, status_code=403)
+        return None
+
+    def _visible_owner_ids(request: Request, owners: list[str]) -> list[str] | None:
+        """The owner agent ids this caller may see, or None when unauthenticated."""
+        principal = _principal(request)
+        if principal is None:
+            return None
+        return filter_visible_agents(principal, owners)
 
     async def health(_request: Request) -> JSONResponse:
         # Counts come from the gateway's durable Run/Agent stores (design §7 Phase 6 convergence).
@@ -474,9 +505,14 @@ def create_app(auth_required: bool = False, dev: bool = False) -> Any:
 
         return EventSourceResponse(events())
 
-    async def list_browsers(_request: Request) -> JSONResponse:
-        """Every persistent browser workspace still open (they outlive the runs that used them)."""
+    async def list_browsers(request: Request) -> JSONResponse:
+        """Persistent browser workspaces the caller owns (they outlive the runs that used them)."""
         ws = list_workspaces()
+        visible = _visible_owner_ids(request, [w.get("owner_agent") or "" for w in ws])
+        if visible is None:
+            return JSONResponse({"error": "authentication required"}, status_code=401)
+        allowed = set(visible)
+        ws = [w for w in ws if (w.get("owner_agent") or "") in allowed]
         return JSONResponse({"browsers": ws, "count": len(ws)})
 
     async def close_browser_route(request: Request) -> JSONResponse:
@@ -494,6 +530,19 @@ def create_app(auth_required: bool = False, dev: bool = False) -> Any:
         user_data_dir = payload.get("user_data_dir") or resolve_profile_dir(
             payload.get("agent_id") or "", profile
         )
+        # Closing a browser is another agent's business unless the caller owns it. The workspace
+        # list is the only place the owner is recorded, so resolve it from there.
+        owner = next(
+            (
+                w.get("owner_agent") or ""
+                for w in list_workspaces()
+                if w.get("user_data_dir") == user_data_dir
+            ),
+            "",
+        )
+        denied = _guard_agent(request, "runtime.manage", owner)
+        if denied is not None:
+            return denied
         holder = get_profile_holder(user_data_dir)
         if holder is not None:
             return JSONResponse(
@@ -617,23 +666,36 @@ def create_app(auth_required: bool = False, dev: bool = False) -> Any:
         """
         from tabvis.browser import workspace as ws_module
 
-        snap = ws_module.snapshot(request.path_params["workspace_id"])
+        workspace_id = request.path_params["workspace_id"]
+        denied = _guard_workspace(request, "runtime.read", workspace_id)
+        if denied is not None:
+            return denied
+        snap = ws_module.snapshot(workspace_id)
         if snap is None:
             return JSONResponse({"error": "unknown workspace_id"}, status_code=404)
         return JSONResponse(snap)
 
-    async def list_workspaces_route(_request: Request) -> JSONResponse:
-        """Every first-class workspace, as snapshots (WS-6)."""
+    async def list_workspaces_route(request: Request) -> JSONResponse:
+        """Every first-class workspace the caller may see, as snapshots (WS-6)."""
         from tabvis.browser import workspace as ws_module
 
         snaps = ws_module.list_workspace_snapshots()
+        visible = _visible_owner_ids(request, [s.get("agent_id", "") for s in snaps])
+        if visible is None:
+            return JSONResponse({"error": "authentication required"}, status_code=401)
+        allowed = set(visible)
+        snaps = [s for s in snaps if s.get("agent_id", "") in allowed]
         return JSONResponse({"workspaces": snaps, "count": len(snaps)})
 
     async def pause_workspace(request: Request) -> JSONResponse:
         """Pause a workspace — the browser stays open, the workspace is marked paused (WS-6)."""
         from tabvis.browser import workspace as ws_module
 
-        record = ws_module.pause(request.path_params["workspace_id"])
+        workspace_id = request.path_params["workspace_id"]
+        denied = _guard_workspace(request, "runtime.manage", workspace_id)
+        if denied is not None:
+            return denied
+        record = ws_module.pause(workspace_id)
         if record is None:
             return JSONResponse({"error": "unknown workspace_id"}, status_code=404)
         return JSONResponse({"workspace_id": record.workspace_id, "status": record.status})
@@ -643,6 +705,9 @@ def create_app(auth_required: bool = False, dev: bool = False) -> Any:
         from tabvis.browser import workspace as ws_module
 
         workspace_id = request.path_params["workspace_id"]
+        denied = _guard_workspace(request, "runtime.manage", workspace_id)
+        if denied is not None:
+            return denied
         if ws_module.get_workspace(workspace_id) is None:
             return JSONResponse({"error": "unknown workspace_id"}, status_code=404)
         closed = await ws_module.close_workspace(workspace_id)
@@ -701,6 +766,11 @@ def create_app(auth_required: bool = False, dev: bool = False) -> Any:
         from tabvis.browser.manager import bind_agent, unbind_agent
 
         workspace_id = request.path_params["workspace_id"]
+        # Driving someone else's browser is the most powerful thing on this surface — guard before
+        # the body is even read.
+        denied = _guard_workspace(request, "runtime.manage", workspace_id)
+        if denied is not None:
+            return denied
         record = ws_module.get_workspace(workspace_id)
         if record is None:
             return JSONResponse({"error": "unknown workspace_id"}, status_code=404)
