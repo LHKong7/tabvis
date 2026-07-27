@@ -43,6 +43,12 @@ class RunCreateHandler:
 
         existing = db.get_run_by_command(command.command_id)
         if existing is not None:
+            # ``command_id`` is client-supplied (``x-tabvis-command-id``), so the row this finds is
+            # not necessarily the caller's. The check above authorized the agent_id in the REQUEST
+            # BODY; re-check the run actually found, or a scoped agent principal reads back another
+            # agent's run — prompt included — just by reusing its command id.
+            if not ctx.principal.can_access_agent(existing.get("agent_id")):
+                raise GatewayError("FORBIDDEN", details={"command_id": command.command_id})
             return CommandResult(command.command_id, data={"run": existing}, duplicate=True)
 
         # Resume Plus (§12.3): a resume MUST continue the prior transcript lineage. Honor

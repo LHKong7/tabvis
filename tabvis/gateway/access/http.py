@@ -140,7 +140,7 @@ async def subscribe_events(request: Request) -> Response:
     from sse_starlette.sse import EventSourceResponse
 
     try:
-        await _principal(request)  # authenticate; scoping filters below
+        principal = await _principal(request)
     except GatewayError as e:
         return _error_response(e)
 
@@ -156,6 +156,7 @@ async def subscribe_events(request: Request) -> Response:
         aggregate_id=aggregate_id,
         follow=follow,
         is_disconnected=request.is_disconnected,
+        principal=principal,
     )
     return EventSourceResponse(generator)
 

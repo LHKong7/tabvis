@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 from typing import Any, AsyncIterator, Awaitable, Callable
 
+from tabvis.gateway.auth.principals import Principal
 from tabvis.gateway.events.store import EventStore
 from tabvis.gateway.events.subscriptions import LiveBus, get_live_bus
 from tabvis.gateway.protocol.events import EventEnvelope, _cursor_str
@@ -31,6 +32,18 @@ def _frame(envelope: EventEnvelope) -> dict[str, Any]:
     }
 
 
+def _visible_to(envelope: EventEnvelope, principal: Principal | None) -> bool:
+    """Whether ``principal`` may see this event (design §13.2 ownership isolation).
+
+    ``aggregate_id`` is a client-supplied filter, not an authorization boundary, so without this a
+    scoped agent credential streams the whole global log — every other agent's runs, prompts and
+    tool activity. ``None`` means the caller already scoped the read (in-process use).
+    """
+    if principal is None or principal.is_admin:
+        return True
+    return principal.can_access_agent(envelope.scope.agent_id)
+
+
 async def event_stream(
     store: EventStore,
     *,
@@ -40,8 +53,13 @@ async def event_stream(
     live_bus: LiveBus | None = None,
     is_disconnected: Callable[[], Awaitable[bool]] | None = None,
     idle_tick: float = 15.0,
+    principal: Principal | None = None,
 ) -> AsyncIterator[dict[str, Any]]:
-    """Yield SSE frames: durable replay after ``after_cursor``, then (if ``follow``) live events."""
+    """Yield SSE frames: durable replay after ``after_cursor``, then (if ``follow``) live events.
+
+    Frames outside ``principal``'s scope are skipped in BOTH the replay and the live tail. The
+    cursor still advances over them, so a resuming client never re-reads what it was not shown.
+    """
     bus = live_bus or get_live_bus()
     queue: asyncio.Queue[EventEnvelope] = asyncio.Queue()
     unsubscribe: Callable[[], None] | None = None
@@ -54,6 +72,8 @@ async def event_stream(
         last = after_cursor
         for envelope in store.read(after_cursor=after_cursor, aggregate_id=aggregate_id):
             last = max(last, envelope.cursor)
+            if not _visible_to(envelope, principal):
+                continue
             yield _frame(envelope)
 
         if not follow:
@@ -72,6 +92,8 @@ async def event_stream(
             if aggregate_id is not None and envelope.aggregate_id != aggregate_id:
                 continue
             last = envelope.cursor
+            if not _visible_to(envelope, principal):
+                continue
             yield _frame(envelope)
     finally:
         if unsubscribe is not None:

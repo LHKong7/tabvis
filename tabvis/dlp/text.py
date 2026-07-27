@@ -29,6 +29,31 @@ _SENSITIVE_KEYS = re.compile(
     r"session_?storage|api[_-]?key|credential)",
     re.IGNORECASE,
 )
+# Token *counts* are usage accounting, not credentials, but ``token`` above matches by substring so
+# ``input_tokens`` / ``cache_read_input_tokens`` / ``tokenizer`` were rewritten to "[redacted]" and
+# every usage record that crossed the DLP gateway lost its numbers. Exempting an explicit list of
+# known accounting names (rather than a shape like ``*_tokens``) keeps a genuine
+# ``refresh_tokens``-style key redacted. Compared with separators stripped so camelCase and
+# snake_case spellings both hit.
+_TOKEN_ACCOUNTING_KEYS = frozenset(
+    {
+        "inputtokens",
+        "outputtokens",
+        "totaltokens",
+        "prompttokens",
+        "completiontokens",
+        "reasoningtokens",
+        "thinkingtokens",
+        "cachedtokens",
+        "cachecreationinputtokens",
+        "cachereadinputtokens",
+        "tokencount",
+        "tokencounts",
+        "maxtokens",
+        "maxoutputtokens",
+        "tokenizer",
+    }
+)
 _EMAIL = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
 # Do not start a phone match in a URL/path/query token.  The old digit-only boundary treated
 # opaque web identifiers as phone numbers, so paths such as ``/document-1991237455038119936`` and
@@ -41,7 +66,11 @@ _PHONE = re.compile(
     # ISO calendar dates are public facts, not identifiers. Keep this guard adjacent to the phone
     # pattern so a date at the start of a sentence is not redacted merely because it has ten digits.
     r"(?!\d{4}-\d{2}-\d{2}(?!\d))"
-    r"(\+?\d[\d\-\s]{7,}\d)"
+    # Separators are spaces/tabs only, never a line break. ``\s`` let one match run across rows, so
+    # an extracted table like "2021 4820193\n2022 5910442\n2023 6733120" collapsed into a single
+    # "[redacted]" and every figure the browser had just read was destroyed. A phone number never
+    # spans lines, so confining the match to one line costs no real coverage.
+    r"(\+?\d[\d\- \t]{7,}\d)"
     r"(?![\w/?#&.\-])"
 )
 _PUBLIC_TIMESTAMP_PREFIX = re.compile(
@@ -90,11 +119,20 @@ def mask_identifiers(text: str) -> str:
     return text
 
 
+def _is_token_accounting_key(key: str) -> bool:
+    """Whether ``key`` names a token count/tokenizer rather than a credential."""
+    return key.replace("_", "").replace("-", "").lower() in _TOKEN_ACCOUNTING_KEYS
+
+
 def redact_mapping(data: dict) -> dict:
     """Recursively redact values whose key looks sensitive (form field values, storage, tokens)."""
     out: dict = {}
     for key, value in data.items():
-        if isinstance(key, str) and _SENSITIVE_KEYS.search(key):
+        if (
+            isinstance(key, str)
+            and _SENSITIVE_KEYS.search(key)
+            and not _is_token_accounting_key(key)
+        ):
             out[key] = REDACTED
         elif isinstance(value, dict):
             out[key] = redact_mapping(value)

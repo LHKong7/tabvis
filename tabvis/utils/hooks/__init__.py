@@ -881,12 +881,12 @@ async def _aggregate_compact_hooks(
     ):
         if signal is not None and getattr(signal, "aborted", False):
             break
-        context = result.get("additionalContext")
-        if context:
-            instructions.append(context)
-        system_message = result.get("systemMessage")
-        if system_message:
-            display.append(system_message)
+        # ``execute_hooks`` yields ``additionalContexts`` as a LIST, and never yields
+        # ``systemMessage`` directly — it wraps the text in a ``hook_system_message`` attachment.
+        instructions.extend(result.get("additionalContexts") or [])
+        attachment = (result.get("message") or {}).get("attachment") or {}
+        if attachment.get("type") == "hook_system_message" and attachment.get("content"):
+            display.append(str(attachment["content"]))
 
     return {
         "newCustomInstructions": "\n\n".join(instructions) or None,
