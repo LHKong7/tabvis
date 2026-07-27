@@ -432,6 +432,23 @@ class BashTool(Tool):
 # ---------------------------------------------------------------------------
 
 
+def _kill_process_tree(proc: Any) -> None:
+    """SIGKILL the whole process group, not just the ``bash -c`` child.
+
+    A long ``forge test`` spawns solc/anvil/test grandchildren; killing only the bash PID leaves
+    them alive holding the stdout pipe open, so a post-kill drain blocks forever on EOF and freezes
+    the single-threaded agent loop. ``start_new_session=True`` at spawn made the child its own group
+    leader precisely so this can reap the tree.
+    """
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError):
+        try:
+            proc.kill()
+        except (ProcessLookupError, OSError):
+            pass
+
+
 async def _run_shell_command(
     command: str, timeout_ms: int, context: ToolUseContext
 ) -> tuple[str, int, bool]:
@@ -463,23 +480,22 @@ async def _run_shell_command(
         stdout_bytes, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout_s)
     except TimeoutError:
         interrupted = True
-        # Kill the ENTIRE process group, not just the `bash -c` child: a long `forge test` spawns
-        # solc/anvil/test grandchildren, and SIGKILLing only the bash PID leaves them alive holding
-        # the stdout pipe open -> the post-kill drain below would block forever on EOF and freeze the
-        # whole single-threaded agent loop. start_new_session=True above made proc the group leader.
-        try:
-            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-        except (ProcessLookupError, PermissionError, OSError):
-            try:
-                proc.kill()
-            except ProcessLookupError:
-                pass
+        _kill_process_tree(proc)
         # Drain whatever was buffered so the model still sees partial output — but BOUND it so a
         # surviving grandchild that kept the pipe open can never hang the loop indefinitely.
         try:
             stdout_bytes, _ = await asyncio.wait_for(proc.communicate(), timeout=5.0)
         except Exception:  # noqa: BLE001 - best-effort, time-bounded drain
             stdout_bytes = b""
+    except BaseException:
+        # Cancellation (a user abort / Ctrl-C, or the enclosing turn being torn down) unwinds
+        # through here. ``asyncio.CancelledError`` derives from BaseException, so the timeout branch
+        # above never sees it — and ``start_new_session=True`` put the command in its OWN session,
+        # so it does not even die with the agent's terminal. Without this the whole `bash -c` tree
+        # (a dev server, a test run, an `npm install`) keeps running detached, holding ports and
+        # CPU, for the rest of the machine's uptime.
+        _kill_process_tree(proc)
+        raise
 
     code = proc.returncode if proc.returncode is not None else (143 if interrupted else 0)
     merged = stdout_bytes.decode("utf-8", errors="replace") if stdout_bytes else ""
