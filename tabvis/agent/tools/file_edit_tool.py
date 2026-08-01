@@ -508,6 +508,10 @@ class FileEditTool(Tool):
     max_result_size_chars = 100_000
     strict = True
     input_schema = FileEditInput
+    # The result echoes the edited file region back to the model, which must stay byte-exact so
+    # follow-up edits match the real file. DLP masking would corrupt it; keep the fail-closed
+    # secret/canary block, skip only the mutating rewrite.
+    dlp_verbatim_result = True
 
     async def check_permissions(self, input: Any, context: ToolUseContext) -> Any:
         # PP-7: route edits (writes) through the filesystem policy adapter.

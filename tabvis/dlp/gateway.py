@@ -70,7 +70,7 @@ class DLPGateway:
     def __init__(self, *, on_secret_blocked: Callable[[DLPBlockEvent], None] | None = None) -> None:
         self._on_blocked = on_secret_blocked
 
-    def scrub(self, surface: str, payload: object) -> DLPDecision:
+    def scrub(self, surface: str, payload: object, *, rewrite: bool = True) -> DLPDecision:
         # 1. forbidden-object check: a secret-bearing object must never be serialized outward (§11.2).
         if _contains_forbidden_object(payload):
             return self._block(surface, fingerprint="forbidden-object")
@@ -81,8 +81,13 @@ class DLPGateway:
             if fp is not None:
                 return self._block(surface, fingerprint=fp)
 
-        # 3. format-based redaction.
-        return DLPDecision(surface=surface, blocked=False, payload=_deep_clean(payload))
+        # 3. format-based redaction.  The fail-closed secret defense above (steps 1-2) always runs;
+        # ``rewrite=False`` skips only the *mutating* identifier/URL/header rewrite for surfaces that
+        # must round-trip bytes verbatim — e.g. a file Read/Edit tool result whose content the model
+        # has to reproduce exactly to build a matching ``old_string``.  Masking that content would
+        # corrupt the model's view and silently break the Read->Edit workflow.
+        payload_out = _deep_clean(payload) if rewrite else payload
+        return DLPDecision(surface=surface, blocked=False, payload=payload_out)
 
     def _block(self, surface: str, *, fingerprint: str) -> DLPDecision:
         if self._on_blocked is not None:

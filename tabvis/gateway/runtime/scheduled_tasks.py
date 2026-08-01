@@ -351,11 +351,23 @@ class ScheduledTaskStore:
             )
             run_at = iso(parsed_run_at)
             existing_next = payload.get("next_run_at")
-            next_run_at = (
-                iso(parse_timestamp(existing_next, "next_run_at"))
-                if existing_next and payload.get("scheduled_task_id")
-                else run_at
-            )
+            is_update = bool(payload.get("scheduled_task_id"))
+            if existing_next and is_update:
+                next_run_at = iso(parse_timestamp(existing_next, "next_run_at"))
+            elif is_update:
+                # Re-anchoring a scheduling edit (an interval change clears next_run_at). The stored
+                # run_at is the ORIGINAL anchor — already in the past once the task has fired — so
+                # reusing it would make the task immediately "due" AND reuse a past occurrence's
+                # deterministic command_id, whereupon the catch-up dispatch dedupes to the old run and
+                # silently does not execute (and last_run_id regresses). Step forward by whole intervals
+                # to the next strictly-future occurrence (mirrors _advance), preserving schedule phase.
+                anchor = parsed_run_at
+                if anchor <= now:
+                    skipped = int((now - anchor).total_seconds() // interval_seconds) + 1
+                    anchor = anchor + timedelta(seconds=interval_seconds * skipped)
+                next_run_at = iso(anchor)
+            else:
+                next_run_at = run_at
 
         resume_agent_id = str(payload.get("resume_agent_id") or "").strip() or None
         profile = str(payload.get("profile") or "").strip() or None

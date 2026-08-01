@@ -241,25 +241,38 @@ class AgentRunLauncher:
                         is_error = bool(message.get("is_error"))
                         result_error_code = message.get("error_code")
                     elif mtype == "model_retry":
+                        attempt = int(message.get("retry_attempt") or 0)
+                        maximum = int(message.get("max_retries") or 0)
+                        retry_in_ms = int(message.get("retry_in_ms") or 0)
+                        retry_data = {
+                            "reason": message.get("reason") or "model_retry",
+                            "message": (
+                                f"Model stream stalled · retrying "
+                                f"{attempt}/{maximum} in {retry_in_ms / 1000:.1f}s"
+                            ),
+                            "retry_attempt": attempt,
+                            "max_retries": maximum,
+                            "retry_in_ms": retry_in_ms,
+                        }
                         current = self._runs.get_run(run.run_id)
                         if current is not None and current.status == runs.RUNNING:
-                            attempt = int(message.get("retry_attempt") or 0)
-                            maximum = int(message.get("max_retries") or 0)
-                            retry_in_ms = int(message.get("retry_in_ms") or 0)
                             self._runs.transition(
                                 run.run_id,
                                 runs.RETRYING,
                                 expected=runs.RUNNING,
-                                data={
-                                    "reason": message.get("reason") or "model_retry",
-                                    "message": (
-                                        f"Model stream stalled · retrying "
-                                        f"{attempt}/{maximum} in {retry_in_ms / 1000:.1f}s"
-                                    ),
-                                    "retry_attempt": attempt,
-                                    "max_retries": maximum,
-                                    "retry_in_ms": retry_in_ms,
-                                },
+                                data=retry_data,
+                            )
+                        elif current is not None and current.status == runs.RETRYING:
+                            # A consecutive stall with no assistant message in between: the run is
+                            # already RETRYING (RETRYING->RETRYING is not a legal transition), so surface
+                            # the new attempt as a fresh run.retrying event rather than dropping it — else
+                            # the label freezes at "retrying 1/M" for the whole multi-attempt stall.
+                            self._events.append(
+                                AGGREGATE_RUN,
+                                run.run_id,
+                                EventType.RUN_RETRYING,
+                                scope=scope,
+                                data=retry_data,
                             )
 
                 terminal = runs.FAILED if is_error else runs.COMPLETED

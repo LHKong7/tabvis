@@ -187,6 +187,56 @@ def test_due_interval_advances_to_the_next_future_occurrence() -> None:
     assert next_run <= now + timedelta(hours=1)
 
 
+def test_editing_interval_reanchors_next_run_to_a_future_occurrence() -> None:
+    # Bug: editing interval_seconds cleared next_run_at, which was then recomputed from the ORIGINAL
+    # (past) run_at — making the task immediately "due" and reusing a past occurrence's deterministic
+    # command_id, so the catch-up dispatch deduped back to the first run and silently did not execute.
+    now = datetime(2026, 7, 27, 10, tzinfo=timezone.utc)
+    gateway = GatewayApplication.build(launcher=_RecordingLauncher())
+    store = ScheduledTaskStore(clock=lambda: now)
+    scheduler = ScheduledTaskScheduler(
+        store, gateway.router, gateway.runs, gateway.agents, max_runs=4
+    )
+    record = store.create(
+        {
+            "name": "Interval edit",
+            "prompt": "check periodically",
+            "schedule_type": "interval",
+            "interval_seconds": 3600,
+            "run_at": _iso(now - timedelta(minutes=5)),  # first occurrence is already due
+        },
+        principal_id="local-admin",
+    )
+    # First firing consumes the occurrence at run_at (command_id = hash(id, run_at)).
+    asyncio.run(scheduler.run_due())
+    first = store.get(record.scheduled_task_id)
+    assert first is not None and first.last_run_id is not None
+    first_run_id = first.last_run_id
+    # The stub launcher never terminalizes the run; do it so the no-overlap guard permits the next fire
+    # (isolating the command-id/re-anchor behavior under test).
+    gateway.runs.transition(first_run_id, runs.PREPARING)
+    gateway.runs.transition(first_run_id, runs.RUNNING)
+    gateway.runs.transition(first_run_id, runs.COMPLETED)
+    runs_after_first = len(db.list_all_runs())
+
+    # Editing the interval must re-anchor to a STRICTLY-FUTURE occurrence, not the past run_at.
+    edited = store.update(record.scheduled_task_id, {"interval_seconds": 1800})
+    next_run = datetime.fromisoformat(edited.next_run_at or "")
+    assert next_run > now
+
+    # When that occurrence fires it must create a NEW run — no command_id collision that would
+    # dedupe back to the first run and skip execution.
+    future_store = ScheduledTaskStore(clock=lambda: next_run)
+    future_scheduler = ScheduledTaskScheduler(
+        future_store, gateway.router, gateway.runs, gateway.agents, max_runs=4
+    )
+    asyncio.run(future_scheduler.run_due())
+    after = future_store.get(record.scheduled_task_id)
+    assert after is not None and after.last_run_id is not None
+    assert after.last_run_id != first_run_id
+    assert len(db.list_all_runs()) == runs_after_first + 1
+
+
 def test_recovered_claim_replays_the_same_occurrence_run() -> None:
     now = datetime(2026, 7, 27, 10, tzinfo=timezone.utc)
     gateway = GatewayApplication.build(launcher=_RecordingLauncher())

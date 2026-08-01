@@ -691,6 +691,10 @@ class FileReadTool(Tool):
     max_result_size_chars = float("inf")
     strict = True
     input_schema = FileReadInput
+    # The model must see file bytes verbatim to reason about them and to build exact-match Edit
+    # old_strings; DLP identifier/URL masking would corrupt that view. The fail-closed secret/canary
+    # block still applies — only the mutating rewrite is skipped for this result.
+    dlp_verbatim_result = True
 
     # --- discovery / classification ---
     def is_concurrency_safe(self, input: Any) -> bool:  # noqa: ARG002

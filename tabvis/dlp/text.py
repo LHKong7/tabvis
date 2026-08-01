@@ -42,7 +42,11 @@ _PHONE = re.compile(
     # pattern so a date at the start of a sentence is not redacted merely because it has ten digits.
     r"(?!\d{4}-\d{2}-\d{2}(?!\d))"
     r"(\+?\d[\d\-\s]{7,}\d)"
-    r"(?![\w/?#&.\-])"
+    # Trailing boundary: reject a digit run that continues into a URL/path token, but NOT one that
+    # merely ends a sentence.  ``.`` is deliberately excluded here — the leading lookbehind already
+    # prevents starting a match inside a path, so a period after a number is sentence punctuation, and
+    # keeping it in this class silently let sentence-final phone numbers escape redaction.
+    r"(?![\w/?#&\-])"
 )
 _PUBLIC_TIMESTAMP_PREFIX = re.compile(
     r"(?:(?:\"|'|`)?(?:[A-Za-z_][\w-]*\.)*"

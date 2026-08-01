@@ -84,6 +84,88 @@ def test_mask_identifiers() -> None:
     assert "555" not in mask_identifiers("call +1 555-123-4567 please")
 
 
+def test_mask_identifiers_redacts_sentence_final_phone_numbers() -> None:
+    # Regression: the trailing boundary previously included '.', so a phone number ending a sentence
+    # escaped redaction (the ordinary case). It must be masked now, while a digit run inside a
+    # URL/path token (blocked by the leading lookbehind) is still preserved.
+    assert "555-123-4567" not in mask_identifiers("Call me at 555-123-4567.")
+    assert "2671" not in mask_identifiers("My number is +1 415 555 2671.")
+    url = "https://home.alibabagroup.com/en-US/document-1991237455038119936"
+    assert mask_identifiers(f"See {url}.") == f"See {url}."
+
+
+def test_scrub_rewrite_false_keeps_secret_block_but_skips_masking() -> None:
+    # A verbatim-content surface opts out of the mutating identifier/URL rewrite, but the fail-closed
+    # secret/canary defense (steps 1-2) must still fire.
+    gw = DLPGateway()
+    payload = {"content": "MAX_ID = 123456789 by jane@example.com at https://x.com/a?t=k"}
+    decision = gw.scrub("model_request", payload, rewrite=False)
+    assert not decision.blocked
+    assert decision.payload == payload  # unchanged bytes
+
+    # canary still blocks even with rewrite=False
+    canary.register(b"CanarySecretValue1", tag="password:p1")
+    blocked = gw.scrub("model_request", {"content": "leak CanarySecretValue1"}, rewrite=False)
+    assert blocked.blocked and blocked.payload is None
+    # and a forbidden secret-bearing object is still refused
+    assert gw.scrub("model_request", {"c": secret_from_str("hunter2xyz")}, rewrite=False).blocked
+
+
+def test_verbatim_tool_result_skips_masking_while_default_tool_is_masked() -> None:
+    # Bug ①: FileRead-style content shown to the model must not be identifier-masked (it breaks
+    # exact-match Edit and corrupts the model's view); a default tool result stays masked.
+    class Input(BaseModel):
+        pass
+
+    class _Base(Tool):
+        input_schema = Input
+        max_result_size_chars = 1000
+
+        async def call(self, *args, **kwargs):
+            return ToolResult(data={"file": {"content": "MAX_ID = 123456789 by jane@example.com"}})
+
+        async def description(self, input, options):
+            return self.name
+
+        async def prompt(self, options):
+            return self.name
+
+        def map_tool_result_to_tool_result_block_param(self, content: Any, tool_use_id: str):
+            return {"tool_use_id": tool_use_id, "type": "tool_result",
+                    "content": str(content), "is_error": False}
+
+    class VerbatimTool(_Base):
+        name = "Verbatim"
+        dlp_verbatim_result = True
+
+    class DefaultTool(_Base):
+        name = "Defaulty"  # inherits dlp_verbatim_result = False
+
+    def _model_visible_content(tool: Tool) -> str:
+        context = ToolUseContext(options=ToolUseContextOptions(tools=[tool]))
+
+        async def allow(*_args):
+            return {"behavior": "allow"}
+
+        async def scenario():
+            return [
+                update
+                async for update in run_tool_use(
+                    {"id": "tu", "name": tool.name, "input": {}}, {"uuid": "a"}, allow, context
+                )
+            ]
+
+        updates = asyncio.run(scenario())
+        return updates[-1]["message"]["message"]["content"][0]["content"]
+
+    verbatim = _model_visible_content(VerbatimTool())
+    assert "123456789" in verbatim and "jane@example.com" in verbatim
+
+    masked = _model_visible_content(DefaultTool())
+    assert "123456789" not in masked and "jane@example.com" not in masked
+    assert "[redacted]" in masked
+
+
 def test_mask_identifiers_preserves_numeric_web_identifiers() -> None:
     alibaba = "https://home.alibabagroup.com/en-US/document-1991237455038119936"
     sec = "https://www.sec.gov/Archives/edgar/data/1577551/000110465926000001/report.htm"

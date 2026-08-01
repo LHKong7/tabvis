@@ -78,6 +78,24 @@ def test_model_retry_uses_existing_agent_sse_frame() -> None:
     assert '"status": "retrying"' in response.text
 
 
+def test_consecutive_model_retries_advance_the_attempt_label() -> None:
+    # Bug #4: while the run is already RETRYING, later model_retry sentinels were dropped, freezing the
+    # label at "1/M". Consecutive stalls (no assistant message between) must each surface their attempt.
+    messages = [
+        {"type": "model_retry", "reason": "model_stream_timeout",
+         "retry_attempt": 1, "max_retries": 3, "retry_in_ms": 500},
+        {"type": "model_retry", "reason": "model_stream_timeout",
+         "retry_attempt": 2, "max_retries": 3, "retry_in_ms": 500},
+        *_msgs(),
+    ]
+    app, _ = _app_with_fake_launcher(messages)
+    response = TestClient(app).post("/agent", json={"prompt": "do it"})
+    assert response.status_code == 200
+    assert "retrying 1/3" in response.text
+    assert "retrying 2/3" in response.text  # the second attempt is no longer dropped
+    assert "event: result" in response.text  # and the run still terminalizes normally
+
+
 def test_post_agent_then_list_and_read_from_gateway() -> None:
     app, gw = _app_with_fake_launcher(_msgs())
     client = TestClient(app)
