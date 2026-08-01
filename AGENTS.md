@@ -2,9 +2,9 @@
 
 This file provides guidance to Codex (Codex.ai/code) when working with code in this repository.
 
-Tabvis is a **headless** browser-native AI agent: one reasoning loop that drives a real Playwright
-browser *and* edits files / runs shell / calls MCP tools. It runs as a one-shot CLI (`-p`) or a local
-HTTP/SSE service (`--serve`). There is no interactive terminal UI and no built-in web UI.
+Tabvis is a browser-native AI agent: one reasoning loop that drives a real Playwright browser *and*
+edits files / runs shell / calls MCP tools. It runs as a non-interactive one-shot CLI (`-p`) or as a
+local Web console plus HTTP/SSE service (`tabvis` / `--serve`). There is no interactive terminal UI.
 
 ## Commands
 
@@ -13,8 +13,9 @@ Python (uv-managed, Python 3.10+; repo pins 3.13):
 ```bash
 uv sync                                   # install deps
 uv run playwright install chromium        # download the default browser engine
-uv run tabvis -p "summarize this repo"    # one-shot agent run (a prompt is REQUIRED — no args prints guidance, exit 1)
-uv run tabvis --serve                     # HTTP/SSE API on 127.0.0.1:8765 (no UI unless --serve --dev)
+uv run tabvis -p "summarize this repo"    # one-shot agent run
+uv run tabvis                             # Web console + HTTP/SSE API on 127.0.0.1:8765
+uv run tabvis --serve                     # explicit equivalent of the command above
 
 uv run pytest -q                          # full suite
 uv run pytest tests/gateway -q            # one directory
@@ -28,12 +29,12 @@ clear install hint): `uv sync --extra <name>` where name ∈ `cloak camoufox` (s
 `openai gemini` (model providers), `ocr` (text-only-model image OCR), and the IM channels needing
 crypto/websockets: `feishu wecom teams google_chat qq discord mattermost simplex`.
 
-Web console (a separate Vite/React app; Tabvis ships no UI):
+Web console (Vite/React source; the production build ships inside the Python package):
 
 ```bash
 cd web && npm install
 uv run tabvis --serve --dev               # server starts Vite + reverse-proxies the console at :8765/ (HMR via :5173)
-cd web && npm run build                   # static bundle -> web/dist/ (self-host, point at the API)
+cd web && npm run build                   # production bundle -> tabvis/browser/static/
 ```
 
 ## Configuration model

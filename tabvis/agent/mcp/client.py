@@ -34,6 +34,11 @@ from __future__ import annotations
 import contextlib
 from typing import TYPE_CHECKING, Any
 
+try:
+    from builtins import BaseExceptionGroup as _BaseExceptionGroup
+except ImportError:  # Python 3.10
+    from exceptiongroup import BaseExceptionGroup as _BaseExceptionGroup
+
 from tabvis.agent.mcp.types import (
     ConnectedMCPServer,
     FailedMCPServer,
@@ -206,7 +211,7 @@ async def _fetch_tools_for_client(client: MCPServerConnection) -> list[Tool]:
         return []
     try:
         result = await client.client.list_tools()
-    except (Exception, BaseExceptionGroup) as error:  # noqa: BLE001 - anyio wraps in groups
+    except (Exception, _BaseExceptionGroup) as error:  # noqa: BLE001 - anyio wraps in groups
         log_for_debugging(f"[MCP] Failed to fetch tools for '{client.name}': {_error_message(error)}")
         return []
     tools: list[Tool] = []
@@ -229,7 +234,7 @@ async def _fetch_resources_for_client(client: MCPServerConnection) -> list[Serve
         return []
     try:
         result = await client.client.list_resources()
-    except (Exception, BaseExceptionGroup) as error:  # noqa: BLE001 - anyio wraps in groups
+    except (Exception, _BaseExceptionGroup) as error:  # noqa: BLE001 - anyio wraps in groups
         log_for_debugging(
             f"[MCP] Failed to fetch resources for '{client.name}': {_error_message(error)}"
         )
@@ -311,7 +316,7 @@ async def get_mcp_tools_commands_and_resources(
                         "resources": resources or None,
                     }
                 )
-        except (Exception, BaseExceptionGroup) as error:  # noqa: BLE001 - isolate per-server failures
+        except (Exception, _BaseExceptionGroup) as error:  # noqa: BLE001 - isolate per-server failures
             log_for_debugging(
                 f"[MCP] Error processing server '{name}': {_error_message(error)}"
             )

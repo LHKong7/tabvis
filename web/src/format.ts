@@ -1,5 +1,7 @@
 // Presentation helpers shared by the panels.
 
+import type { Frame } from './types'
+
 export const ms = (n?: number | null): string =>
   n == null ? '—' : n < 1000 ? `${n}ms` : `${(n / 1000).toFixed(1)}s`
 
@@ -15,6 +17,7 @@ export function summarize(ev: string, d: any): Summary {
     case '_id':
       return `agent ${d.agent_id}`
     case 'agent':
+      if (d.status === 'retrying') return d.message || 'Model stalled · retrying'
       return `${d.agent_id} · ${d.model ?? 'default model'}`
     case 'system':
       return `session ${String(d.session_id ?? '').slice(0, 8)}… · ${(d.tools || []).length} tools`
@@ -26,7 +29,11 @@ export function summarize(ev: string, d: any): Summary {
           .join('\n') || null
       ) // null => hide empty turns
     case 'tool_use':
-      return `${d.name}(${JSON.stringify(d.input ?? {}).slice(0, 110)})`
+      {
+        const encoded = JSON.stringify(d.input ?? {})
+        const shown = encoded.length > 600 ? `${encoded.slice(0, 600)}… [truncated]` : encoded
+        return `${d.name}(${shown})`
+      }
     case 'tool_result':
       return (d.is_error ? '✗ ' : '') + String(d.content ?? '').split('\n').slice(0, 4).join('  ')
     case 'result':
@@ -43,5 +50,15 @@ export function summarize(ev: string, d: any): Summary {
       return null
     default:
       return JSON.stringify(d).slice(0, 140)
+  }
+}
+
+export function frameFor(event: string, data: any): Frame | null {
+  const out = summarize(event, data)
+  if (out == null) return null
+  return {
+    event,
+    cls: typeof out === 'string' ? event : out.cls,
+    text: typeof out === 'string' ? out : out.text,
   }
 }

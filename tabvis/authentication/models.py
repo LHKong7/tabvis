@@ -103,6 +103,10 @@ class CredentialProfile(BaseModel):
 
     session_ttl_seconds: int = 3600
     reusable_across_tasks: bool = False
+    # Optional strong signal for Session Vault restoration. A restored storage state is never
+    # considered authenticated merely because the URL changed or a form disappeared; the Browser
+    # Host must confirm this configured cookie exists (its value is never returned).
+    session_validation_cookie_name: str | None = None
     max_uses: int | None = None
     expires_at: datetime | None = None
 

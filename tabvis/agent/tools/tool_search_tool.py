@@ -8,8 +8,10 @@ name only, and this tool fetches their full schemas. A query is either:
 * free-text keywords (optionally ``+required`` terms) ranked over tool names + descriptions.
 
 It operates over ``context.options.tools`` (the live tool pool), filtering to the deferred
-subset via :func:`is_deferred_tool`. The result block uses Anthropic ``tool_reference`` content
-blocks — the wire signal that loads each matched tool's schema for subsequent turns.
+subset via :func:`is_deferred_tool`. Search results carry a provider-neutral marker in the
+internal ``toolUseResult`` envelope. On the following model turn, ``model_client`` reads that
+marker and sends only the matched schemas. This works with Anthropic, OpenAI-compatible, and
+Gemini providers instead of relying on Anthropic-only ``tool_reference`` content blocks.
 
 Implementation notes:
 
@@ -22,9 +24,9 @@ Implementation notes:
 * The description cache (memoized lookup + invalidation) is an optimization with no observable
   behavior change; it is a module-level dict keyed by tool name and invalidated when the
   deferred-tool set changes.
-* The output dict and the ``tool_result`` block use fixed wire keys (``matches``/``query``/
-  ``total_deferred_tools``/``pending_mcp_servers``; ``tool_use_id``/``type``/``content``/
-  ``tool_name``) consumed downstream by the SDK.
+* The output dict and the ``tool_result`` block use fixed wire keys
+  (``type``/``matches``/``query``/``total_deferred_tools``/``pending_mcp_servers``;
+  ``tool_use_id``/``type``/``content``) consumed downstream by the SDK.
 """
 
 from __future__ import annotations
@@ -57,36 +59,61 @@ _PROMPT_HEAD = "Fetches full schema definitions for deferred tools so they can b
 
 _PROMPT_TAIL = (
     " Until fetched, only the name is known — there is no parameter schema, so the tool cannot "
-    "be invoked. This tool takes a query, matches it against the deferred tool list, and returns "
-    "the matched tools' complete JSONSchema definitions inside a <functions> block. Once a tool's "
-    "schema appears in that result, it is callable exactly like any tool defined at the top of "
-    "the prompt.\n\n"
-    'Result format: each matched tool appears as one <function>{"description": "...", '
-    '"name": "...", "parameters": {...}}</function> line inside the <functions> block — the same '
-    "encoding as the tool list at the top of this prompt.\n\n"
+    "be invoked reliably. This tool takes a query and matches it against the deferred tool list. "
+    "The matched tools' complete schemas are added to the NEXT model turn. The result confirms "
+    "which tools were loaded; after receiving it, call those tools exactly like any initially "
+    "available tool.\n\n"
     "Query forms:\n"
     '- "select:Read,Edit,Grep" — fetch these exact tools by name\n'
     '- "notebook jupyter" — keyword search, up to max_results best matches\n'
     '- "+slack send" — require "slack" in the name, rank by remaining terms'
 )
 
+_DEFERRED_NAMES_MAX_CHARS = 12_000
 
-def _get_tool_location_hint() -> str:
-    """Compute the tool-location hint for the deferred-tools prompt.
 
-    The delta-enabled gate is disabled in this build, so the hint always uses the
-    ``<available-deferred-tools>`` wording.
+def _render_deferred_tool_names(tools: Any | None) -> str:
+    """Render a bounded, name-only deferred registry for discoverability.
+
+    Full descriptions and parameter schemas stay server-side until searched. Keeping the
+    names in ToolSearch's own description lets any provider discover capabilities without
+    paying the much larger schema cost up front.
     """
+    if not tools:
+        return (
+            "Deferred tools are searchable by exact name or capability keywords. "
+            "Their full schemas are not loaded yet."
+        )
+    names = sorted({t.name for t in tools if is_deferred_tool(t)})
+    if not names:
+        return "There are currently no deferred tools."
 
-    delta_enabled = False
-    if delta_enabled:
-        return "Deferred tools appear by name in <system-reminder> messages."
-    return "Deferred tools appear by name in <available-deferred-tools> messages."
+    prefix = f"Available deferred tools ({len(names)} total; names only):\n"
+    rendered: list[str] = []
+    used = len(prefix) + len("<available-deferred-tools>\n</available-deferred-tools>")
+    omitted = 0
+    for name in names:
+        line = f"- {name}\n"
+        if used + len(line) > _DEFERRED_NAMES_MAX_CHARS:
+            omitted += 1
+            continue
+        rendered.append(line)
+        used += len(line)
+    if omitted:
+        rendered.append(
+            f"- … {omitted} additional names omitted; use capability keywords to search them.\n"
+        )
+    return (
+        prefix
+        + "<available-deferred-tools>\n"
+        + "".join(rendered)
+        + "</available-deferred-tools>"
+    )
 
 
-def get_prompt() -> str:
-    """Assemble the tool's prompt text — head + location hint + tail."""
-    return _PROMPT_HEAD + _get_tool_location_hint() + _PROMPT_TAIL
+def get_prompt(tools: Any | None = None) -> str:
+    """Assemble the prompt with a bounded name-only capability catalogue."""
+    return _PROMPT_HEAD + _render_deferred_tool_names(tools) + _PROMPT_TAIL
 
 
 def is_deferred_tool(tool: Tool) -> bool:
@@ -350,6 +377,7 @@ def _build_search_result(
 ) -> ToolResult[dict[str, Any]]:
     """Assemble the result dict with its fixed wire keys."""
     data: dict[str, Any] = {
+        "type": "tool_search_result",
         "matches": matches,
         "query": query,
         "total_deferred_tools": total_deferred_tools,
@@ -388,10 +416,10 @@ class ToolSearchTool(Tool):
         return ""
 
     async def description(self, input: Any, options: dict[str, Any]) -> str:
-        return get_prompt()
+        return get_prompt(options.get("tools"))
 
     async def prompt(self, options: dict[str, Any]) -> str:
-        return get_prompt()
+        return get_prompt(options.get("tools"))
 
     async def call(
         self,
@@ -496,13 +524,16 @@ class ToolSearchTool(Tool):
                 "content": text,
             }
 
-        # tool_reference blocks: the wire signal that loads each matched tool's schema.
+        # Provider-neutral text on the API wire; the structured ``toolUseResult`` envelope keeps
+        # the exact match list for model_client to load on the next request.
+        names = ", ".join(str(name) for name in matches)
         return {
             "type": "tool_result",
             "tool_use_id": tool_use_id,
-            "content": [
-                {"type": "tool_reference", "tool_name": name} for name in matches
-            ],
+            "content": (
+                f"Loaded deferred tool schemas for the next turn: {names}. "
+                "You may now call these tools."
+            ),
         }
 
 

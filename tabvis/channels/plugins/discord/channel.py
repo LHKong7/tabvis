@@ -41,6 +41,7 @@ class DiscordChannel(ClientLoopChannel):
         version="0.1.0",
         capabilities=frozenset({CAP_TEXT_INBOUND, CAP_TEXT_OUTBOUND}),
         signed_webhooks=False,
+        max_message_chars=2000,  # Discord rejects a message body over 2000 chars
     )
 
     def __init__(
@@ -81,8 +82,8 @@ class DiscordChannel(ClientLoopChannel):
             return None
         author = data.get("author") or {}
         author_id = author.get("id")
-        if author_id and str(author_id) == str(self._config.bot_user_id):
-            return None  # our own message
+        if author_id and self._config.bot_user_id and str(author_id) == str(self._config.bot_user_id):
+            return None  # our own message — always dropped, even when allow_bots is on (self-echo loop)
         if author.get("bot") and not self._config.allow_bots:
             return None  # ignore other bots (avoid bot-to-bot loops) unless explicitly opted in
         content = data.get("content")
@@ -91,8 +92,13 @@ class DiscordChannel(ClientLoopChannel):
         channel_id = data.get("channel_id")
         if not channel_id:
             return None
+        message_id = data.get("id")
+        if not message_id:
+            # An id-less message can't be deduped; drop it rather than collapse every id-less message
+            # onto one ledger key (which would discard all but the first as "duplicates").
+            return None
         return InboundMessage(
-            external_event_id=str(data.get("id") or ""),
+            external_event_id=str(message_id),
             external_conversation_id=str(channel_id),  # a channel id addresses both guild channels and DMs
             external_account_ref=self._account_id,
             text=str(content),
@@ -157,6 +163,12 @@ class DiscordChannel(ClientLoopChannel):
                         last_seq = frame["s"]
                     if frame.get("op") == 1:  # server-requested heartbeat
                         await socket.send(json.dumps({"op": 1, "d": last_seq}))
+                    elif frame.get("op") == 0 and frame.get("t") == "READY":
+                        # Learn our own user id so own-authored messages are always dropped (prevents a
+                        # self-echo loop when allow_bots is on and bot_user_id wasn't configured).
+                        bot_id = ((frame.get("d") or {}).get("user") or {}).get("id")
+                        if bot_id:
+                            self._config.bot_user_id = str(bot_id)
                     elif frame.get("op") == 0 and frame.get("t") == "MESSAGE_CREATE":
                         await self._handle(frame.get("d") or {})
             finally:

@@ -11,7 +11,7 @@ agent — which is what :meth:`Principal.can_access_agent` keys on.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Literal
 
 

@@ -19,7 +19,6 @@ from tabvis.gateway.runtime.context import budget as budget_mod
 from tabvis.gateway.runtime.context.pack import (
     KIND_MESSAGE,
     KIND_RESOURCE,
-    KIND_SYSTEM,
     KIND_TOOL,
     ContextPack,
     ContextSection,

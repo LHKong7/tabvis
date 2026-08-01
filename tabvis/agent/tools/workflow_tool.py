@@ -128,6 +128,10 @@ class WorkflowTool(Tool):
     search_hint = "orchestrate many sub-agents from a script"
     input_schema = WorkflowToolInput
     max_result_size_chars = 100_000
+    # This is a powerful but infrequent orchestration surface with a comparatively large schema.
+    # Keep only its name in the initial ToolSearch catalogue and load the full Python-workflow
+    # contract when a task actually needs multi-agent orchestration.
+    should_defer = True
 
     async def description(self, input: Any, options: dict[str, Any]) -> str:
         return "Run a dynamic multi-agent workflow"

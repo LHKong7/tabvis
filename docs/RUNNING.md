@@ -5,9 +5,8 @@ runtime, and the local HTTP/SSE server. For *what* Tabvis can do (tools and subs
 [FEATURES.md](FEATURES.md); for the control-plane design, see
 [AGENT_GATEWAY_DESIGN.md](AGENT_GATEWAY_DESIGN.md).
 
-> Tabvis is **headless**. There is no interactive terminal UI and no built-in web UI. You drive it
-> with `-p/--print` (one-shot) or `--serve` (HTTP/SSE service), and optionally attach the React
-> console with `--serve --dev`.
+> Tabvis has no interactive terminal UI. Use `-p/--print` for a non-interactive one-shot run, or
+> start the bundled React console and HTTP/SSE service with `tabvis` / `tabvis --serve`.
 
 ---
 
@@ -15,7 +14,7 @@ runtime, and the local HTTP/SSE server. For *what* Tabvis can do (tools and subs
 
 - [uv](https://docs.astral.sh/uv/)
 - Python 3.10+
-- Node.js + npm — only if you want the web console (`--serve --dev` or a `web/` build)
+- Node.js + npm — only for Web-console development or rebuilding its bundled production assets
 
 ```bash
 uv sync                              # install Tabvis and its dependencies
@@ -64,11 +63,10 @@ hand-rolled scanner (not argparse); a few flags are **positional** (noted below)
 
 | Mode | How | Behavior |
 |---|---|---|
-| **One-shot** | `tabvis -p "<goal>"` | Runs the agent loop once and exits with the result. This is the default. |
-| **Server** | `tabvis --serve` | Starts the HTTP/SSE service (see §7). `--serve` must be the **first** argument. |
+| **One-shot** | `tabvis -p "<goal>"` | Runs the agent loop once and exits with the result. |
+| **Web + server** | `tabvis` or `tabvis --serve` | Starts the bundled Web console and HTTP/SSE service (see §7). `--serve`, when used, must be the **first** argument. |
 | **Dump prompt** | `tabvis --dump-system-prompt` | Prints the system prompt and exits. Must be the **first** argument. |
 | **Version** | `tabvis --version` | Prints the version. Must be the **only** argument. |
-| **No arguments** | `tabvis` | Prints headless-only guidance to stderr and exits `1`. It does **not** start an interactive UI. |
 
 ### 3.2 Flags
 
@@ -79,10 +77,10 @@ hand-rolled scanner (not argparse); a few flags are **positional** (noted below)
 | `--browser-engine`, `--browser` | engine key | `chromium` | Sets `TABVIS_BROWSER_ENGINE` for the run. An unknown key exits `2` with the valid list. |
 | `--output-format` | `text` \| `json` \| `stream-json` | `text` | See §3.3. |
 | `--max-turns` | integer | none (unbounded) | Caps model turns; the run ends with an `error_max_turns` result if it hits the cap. |
-| `--serve` | — | off | Start the server (first arg only). See §7. |
+| `--serve` | — | off | Explicitly start the Web console and server (first arg only). Equivalent to no arguments. See §7. |
 | `--host` | host | `127.0.0.1` | Server bind host (only read under `--serve`). |
 | `--port` | integer | `8765` | Server bind port (only read under `--serve`). |
-| `--dev` | — | off | Attach the live Vite web console (only under `--serve`). Equivalent to `TABVIS_WEB_DEV=1`. |
+| `--dev` | — | off | Replace the bundled console with live Vite/HMR (only under `--serve`). Equivalent to `TABVIS_WEB_DEV=1`. |
 | `--dump-system-prompt` | — | — | Render the system prompt and exit (first arg only; honors a trailing `--model`). |
 | `--bare` | — | off | Minimal prompt; skips MCP assembly and project instructions. Equivalent to `TABVIS_SIMPLE=1`. |
 | `--version`, `-v`, `-V` | — | — | Print version (sole arg only). |
@@ -102,7 +100,7 @@ hand-rolled scanner (not argparse); a few flags are **positional** (noted below)
 
 > **Scripting note:** a *task* failure (including `error_max_turns`) is reported **inside** the
 > `result` message with `is_error: true` — the process still exits `0`. Only argument errors exit
-> non-zero: `1` (no prompt / bad invocation), `2` (invalid `--browser-engine`).
+> non-zero: `1` (a malformed one-shot invocation), `2` (invalid `--browser-engine`).
 
 ### 3.4 Examples
 
@@ -210,9 +208,10 @@ A `[1m]`/`[2m]` suffix requests an extended context window and is stripped befor
 Aliases resolve only via `TABVIS_MODEL`/`settings.model` — **not** via the `--model` CLI flag, which
 is sent verbatim.
 
-Other model knobs: `TABVIS_MAX_OUTPUT_TOKENS` (default `8192`), `TABVIS_MAX_RETRIES` (default `10`),
-`TABVIS_STREAM_IDLE_TIMEOUT` (seconds to wait for the next stream chunk, default `90`),
-`TABVIS_CUSTOM_HEADERS` (extra request headers, `Name: Value` per line).
+Other model knobs: `TABVIS_MAX_OUTPUT_TOKENS` (blank = the selected model's advertised default;
+normally `32000`), `TABVIS_MAX_RETRIES` (default `10`), `TABVIS_STREAM_IDLE_TIMEOUT` (seconds to
+wait for the next stream chunk, default `90`), `TABVIS_CUSTOM_HEADERS` (extra request headers,
+`Name: Value` per line).
 
 ### 5.3 Vision & OCR
 
@@ -282,11 +281,17 @@ Pacing is a **process-wide** limiter shared across concurrent agents; loopback h
 
 | Var | Default | Meaning |
 |---|---|---|
-| `TABVIS_BROWSER_MIN_REQUEST_INTERVAL_MS` | `1000` | Min gap between navigations/clicks to the same host (`0` disables per-host pacing) |
-| `TABVIS_BROWSER_MAX_REQUESTS_PER_MINUTE` | `0` (off) | Per-host burst ceiling over a 60s window |
-| `TABVIS_BROWSER_MIN_ACTION_INTERVAL_MS` | `0` (off) | Min gap between *any* two browser actions |
-| `TABVIS_BROWSER_REQUEST_JITTER_MS` | `0` | Random 0..N ms added per paced slot |
-| `TABVIS_BROWSER_MAX_PACING_WAIT_MS` | `60000` | Safety cap on a single pacing wait |
+| `TABVIS_BROWSER_MIN_REQUEST_INTERVAL_MS` | `1500` | Min gap between request-causing actions to the same host (`0` disables per-host pacing) |
+| `TABVIS_BROWSER_MAX_REQUESTS_PER_MINUTE` | `12` | Per-host hard rolling ceiling over a 60s window (`0` disables it) |
+| `TABVIS_BROWSER_MIN_ACTION_INTERVAL_MS` | `120` | Min gap between *any* two browser actions |
+| `TABVIS_BROWSER_REQUEST_JITTER_MS` | `250` | Random 0..N ms added per paced slot |
+| `TABVIS_BROWSER_MAX_PACING_WAIT_MS` | `60000` | Maximum allowed wait; actions needing longer fail closed without sending a request |
+
+These limits are reserved under one process-wide lock, so multiple agents share the same host
+budget. Already-reserved future slots are included in the rolling window; excess calls cannot pile
+up and burst together when the window turns over. Top-level 403/429/503 responses also establish a
+shared host cooldown (honoring numeric `Retry-After`). Browser interaction tools use native mouse
+and keyboard events by default and do not fall back to DOM `click()`/`focus()`/`scrollBy()`.
 
 ### 6.4 Artifacts (browsing trail)
 
@@ -309,7 +314,7 @@ timezone is cloak-only); inert otherwise.
 | Var | Default | Meaning |
 |---|---|---|
 | `TABVIS_BROWSER_PROXY` | — | Proxy URL (`http://`, `https://`, `socks5://`; inline creds are stripped from logs) |
-| `TABVIS_BROWSER_HUMANIZE` | `0` | Human-like mouse/keystroke timing (adds latency) |
+| `TABVIS_BROWSER_HUMANIZE` | `0` | Cloak-only advanced mouse curves/keystroke timing on top of the native-input baseline |
 | `TABVIS_BROWSER_HUMAN_PRESET` | `default` | `default` \| `careful` |
 | `TABVIS_BROWSER_GEOIP` | `0` | Derive timezone/locale from the proxy exit IP |
 | `TABVIS_BROWSER_TIMEZONE` / `TABVIS_BROWSER_LOCALE` | host | IANA timezone / locale overrides |
@@ -317,14 +322,18 @@ timezone is cloak-only); inert otherwise.
 
 Downloads land in a per-run workspace (`<session-dir>/workspace/`, or an absolute
 `TABVIS_WORKSPACE_DIR`); filenames are sanitized to a basename and de-collided so a hostile download
-name cannot escape the directory.
+name cannot escape the directory. Direct PDF navigation reports `captured_not_read`, the local path,
+and page count. For research, `Read(file_path=..., pages="1-20")` returns explicit page markers,
+cumulative page coverage, and `nextPages`; successful ranges are also stored in the artifact JSONL
+so compact/resume does not turn an abstract-only source into a falsely “read” paper.
 
 ---
 
-## 7. The HTTP/SSE server (`--serve`)
+## 7. The Web console and HTTP/SSE server (`tabvis` / `--serve`)
 
 ```bash
-uv run tabvis --serve                       # JSON/SSE API on http://127.0.0.1:8765
+uv run tabvis                               # Web console + API on http://127.0.0.1:8765/
+uv run tabvis --serve                       # explicit equivalent
 uv run tabvis --serve --host 0.0.0.0 --port 9000
 ```
 
@@ -364,7 +373,7 @@ console `/` is intentionally not versioned).
 | GET | `/health` | Fleet status: running/capacity, agents, browsers, config readiness. Use this as the liveness probe. |
 | GET | `/config` | Current editable settings (secrets report set/hint only). |
 | POST | `/config` | Apply + persist settings live (loopback-only); merged into `.env`. Body `{"values": {KEY: val}}`. |
-| GET | `/` | **Not** a console by default — returns a `404` JSON pointer. Under `--dev` it reverse-proxies the Vite console. |
+| GET | `/` | Bundled production console. Under `--dev`, reverse-proxies the Vite console instead. |
 
 **Agents (runs)**
 
@@ -422,9 +431,11 @@ cutover); the browser-bundle endpoints stay registry-backed either way.
 
 ### 7.4 The web console
 
-Tabvis serves no UI by default. Two ways to get the console:
+`tabvis` and `tabvis --serve` serve the bundled production console at
+`http://127.0.0.1:8765/`. Static assets and React Router fallback routes are handled by the Python
+server, while `/health`, `/agent`, `/agents`, `/config`, `/browsers`, and `/v1/*` remain API routes.
 
-**A — live dev console (recommended for local use)**
+**Live frontend development**
 
 ```bash
 uv run tabvis --serve --dev        # or  TABVIS_WEB_DEV=1 uv run tabvis --serve
@@ -435,14 +446,14 @@ whole app is live at `http://127.0.0.1:8765/` on one origin with hot-reload. Req
 `web/node_modules` (`cd web && npm install`); it fails loudly without them. HMR connects straight to
 Vite on `:5173`.
 
-**B — self-hosted static build**
+**Rebuild the bundled production console**
 
 ```bash
-cd web && npm run build            # bundles to web/dist/
+cd web && npm run build            # bundles to tabvis/browser/static/
 ```
 
-Serve `web/dist/` from any static host and make sure its API calls reach a running Tabvis server —
-simplest is the same origin behind a reverse proxy. See [`web/README.md`](../web/README.md).
+The output is inside the Python package, so source checkouts and built wheels serve the same UI.
+See [`web/README.md`](../web/README.md).
 
 Dev-mode knobs: `TABVIS_WEB_DIR` (override the `web/` location), `TABVIS_WEB_DEV_HOST`/
 `TABVIS_WEB_DEV_PORT` (Vite bind, default `127.0.0.1:5173`), `TABVIS_SERVER` (Vite-standalone API
@@ -469,7 +480,7 @@ Settings page).
 | `TABVIS_SERVER_ALLOW_REMOTE_CONFIG` | off | Allow `POST /config` / install from non-loopback |
 | `TABVIS_GATEWAY` | **on** | Mount the gateway control plane (`0`/`false`/`no`/`off` disable) |
 | `TABVIS_GATEWAY_AGENTS` | off | Serve legacy `/agents` from gateway Run data |
-| `TABVIS_WEB_DEV` | off | Attach the Vite console (= `--dev`) |
+| `TABVIS_WEB_DEV` | off | Replace the bundled console with Vite/HMR (= `--dev`) |
 
 ### 8.2 Permissions & policy
 
@@ -536,11 +547,8 @@ The web console has its own toolchain — see [`web/README.md`](../web/README.md
 **`RuntimeError: TABVIS_BASE_URL is required`** — set `TABVIS_BASE_URL` in `.env`. Tabvis refuses to
 use a default model endpoint.
 
-**`tabvis` prints guidance and exits 1** — you ran it with no prompt. Use `-p "<goal>"`, or `--serve`.
-Remember `--serve`/`--version` are positional (put `--serve` first).
-
-**`GET /` returns 404 with no console** — expected. Tabvis serves no UI by default; run
-`--serve --dev` or host a `web/` build (§7.4). Health-check `/health`, not `/`.
+**`GET /` returns 503** — the bundled console is missing from this source checkout. Run
+`cd web && npm install && npm run build`, then restart Tabvis. Packaged releases include the build.
 
 **`--serve --dev` fails to start** — the dev console needs Node/npm and `web/node_modules`. Run
 `cd web && npm install`. Override the source dir with `TABVIS_WEB_DIR`.

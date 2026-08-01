@@ -28,6 +28,7 @@ SUBSCRIPTION_PREFIX: Final = "sub_"
 WORKSPACE_PREFIX: Final = "ws_"
 DELIVERY_PREFIX: Final = "dlv_"
 CONTEXT_PACK_PREFIX: Final = "ctx_"
+SCHEDULED_TASK_PREFIX: Final = "sched_"
 
 _ENTROPY_BYTES: Final = 6
 
@@ -86,6 +87,10 @@ def new_delivery_id() -> str:
 
 def new_context_pack_id() -> str:
     return _mint(CONTEXT_PACK_PREFIX)
+
+
+def new_scheduled_task_id() -> str:
+    return _mint(SCHEDULED_TASK_PREFIX)
 
 
 # --- validators --------------------------------------------------------------------------------

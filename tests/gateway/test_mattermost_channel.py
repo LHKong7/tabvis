@@ -159,6 +159,13 @@ def test_to_inbound_ignores_non_text_and_non_posted() -> None:
     assert ch._to_inbound({"event": "posted", "data": {"post": "not json"}}) is None
 
 
+def test_id_less_post_is_dropped() -> None:
+    # Bug #18: an id-less post can't be deduped; drop it rather than collapse every id-less post onto
+    # one ledger key (which would discard all but the first as "duplicates").
+    ch = _channel()
+    assert ch._to_inbound(_posted("", "chan_1", "no id here")) is None
+
+
 def test_to_inbound_dm_needs_no_mention() -> None:
     ch = _channel(bot_username="hermes-bot")
     raw = _posted("post_dm", "chan_dm", "what is 2+2", channel_type="D")

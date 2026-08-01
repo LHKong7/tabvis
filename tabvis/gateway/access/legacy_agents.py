@@ -21,6 +21,7 @@ from starlette.routing import Route
 
 from tabvis.gateway.access.http import (
     _error_response,
+    agent_events_compat,
     cancel_agent_compat,
     list_agents_compat,
     read_agent_compat,
@@ -83,15 +84,25 @@ async def run_agent_gw(request: Request) -> Response:
 
     # Reuse an existing agent (continuation) or mint a fresh one.
     resume = False
+    latest = None
+    durable_agent = None
     if body_agent:
-        if gateway.runs.latest_run_for_agent(body_agent) is None:
+        # Existence is a property of the durable Agent, not of a prior Run: a registered zero-run
+        # agent must be runnable on its first POST /agent (else register→run 404s). Resume only when
+        # the agent has actually run before.
+        durable_agent = gateway.agents.get(body_agent)
+        if durable_agent is None:
             return JSONResponse({"error": f"unknown agent_id {body_agent!r}; omit it to create a new agent"}, status_code=404)
-        agent_id, resume = body_agent, True
+        agent_id = body_agent
+        latest = gateway.runs.latest_run_for_agent(body_agent)
+        resume = latest is not None
     else:
         agent_id = ids.new_agent_id()
 
     # A browser profile is bundled to an agent for its life — off-limits to another owner (design §10.5).
     profile = body.get("profile")
+    if resume and profile is None and durable_agent is not None:
+        profile = durable_agent.profile
     try:
         from tabvis.browser.manager import get_workspace_owner, resolve_profile_dir
 
@@ -103,8 +114,21 @@ async def run_agent_gw(request: Request) -> Response:
         pass
 
     command = Command(type=CommandType.RUN_CREATE, data={
-        "agent_id": agent_id, "message": {"text": prompt}, "model": body.get("model"),
-        "max_turns": body.get("max_turns"), "profile": profile, "resume": resume,
+        "agent_id": agent_id,
+        "message": {"text": prompt},
+        "model": body.get("model") or (latest.model if latest is not None else None),
+        "max_turns": (
+            body.get("max_turns")
+            if body.get("max_turns") is not None
+            else (latest.max_turns if latest is not None else None)
+        ),
+        "profile": profile,
+        "resume": resume,
+        # A continuation must name the transcript lineage it resumes. Previously the legacy Web
+        # route sent only ``resume=True``; RunCreate correctly rejected that ambiguous request,
+        # which surfaced in the console as a failed Continue action.
+        "resume_from_session_id": latest.session_id if latest is not None else None,
+        "resume_mode": "plus" if resume else "fresh",
         "stream": bool(body.get("stream", False)),
     })
     ctx = CommandContext(principal=principal, trace_id=f"tr_{ids.new_command_id()[4:]}")
@@ -124,6 +148,13 @@ async def _legacy_agent_stream(gateway: GatewayApplication, run_id: str):
 
     queue: asyncio.Queue = asyncio.Queue()
 
+    def render(frame: dict[str, Any]) -> dict[str, str]:
+        from tabvis.dlp.gateway import get_dlp_gateway
+
+        decision = get_dlp_gateway().scrub("api", frame["data"])
+        safe = {"error": "dlp_blocked"} if decision.blocked else decision.payload
+        return {"event": frame["event"], "data": json.dumps(safe, default=str)}
+
     def _listen(envelope):
         if envelope.aggregate_id == run_id:
             queue.put_nowait(envelope)
@@ -134,7 +165,7 @@ async def _legacy_agent_stream(gateway: GatewayApplication, run_id: str):
         for envelope in gateway.events.read(aggregate_id=run_id):
             last = envelope.cursor
             for frame in legacy_frames_for(envelope):
-                yield {"event": frame["event"], "data": json.dumps(frame["data"], default=str)}
+                yield render(frame)
             if envelope.type in _TERMINAL_EVENTS:
                 return
         while True:
@@ -147,11 +178,79 @@ async def _legacy_agent_stream(gateway: GatewayApplication, run_id: str):
                 continue
             last = envelope.cursor
             for frame in legacy_frames_for(envelope):
-                yield {"event": frame["event"], "data": json.dumps(frame["data"], default=str)}
+                yield render(frame)
             if envelope.type in _TERMINAL_EVENTS:
                 return
     finally:
         unsubscribe()
+
+
+async def list_agent_interactions(request: Request) -> Response:
+    """Pending questions/approvals for one legacy Web-console Agent."""
+    gateway: GatewayApplication = request.app.state.gateway
+    agent_id = request.path_params["agent_id"]
+    try:
+        principal = resolve_principal(request.headers, host=gateway.host)
+        if gateway.agents.get(agent_id) is None:
+            raise GatewayError("NOT_FOUND", details={"agent_id": agent_id})
+        if not principal.can_access_agent(agent_id):
+            raise GatewayError("FORBIDDEN", details={"agent_id": agent_id})
+        records = [
+            item.to_dict()
+            for item in gateway.interactions.list_pending()
+            if item.agent_id == agent_id
+        ]
+        return JSONResponse({"interactions": records, "count": len(records)})
+    except GatewayError as e:
+        return _error_response(e)
+
+
+async def respond_agent_interaction(request: Request) -> Response:
+    """Answer one pending interaction while enforcing that it belongs to the URL's Agent."""
+    gateway: GatewayApplication = request.app.state.gateway
+    agent_id = request.path_params["agent_id"]
+    interaction_id = request.path_params["interaction_id"]
+    try:
+        principal = resolve_principal(request.headers, host=gateway.host)
+        record = gateway.interactions.get(interaction_id)
+        if record is None:
+            raise GatewayError(
+                "INTERACTION_NOT_FOUND", details={"interaction_id": interaction_id}
+            )
+        if record.agent_id != agent_id:
+            raise GatewayError(
+                "FORBIDDEN",
+                details={"agent_id": agent_id, "interaction_id": interaction_id},
+            )
+        if not principal.can_access_agent(agent_id):
+            raise GatewayError("FORBIDDEN", details={"agent_id": agent_id})
+        try:
+            body = await request.json()
+        except Exception:  # noqa: BLE001
+            raise GatewayError("VALIDATION_FAILED", message="Request body must be valid JSON")
+        if not isinstance(body, dict):
+            raise GatewayError(
+                "VALIDATION_FAILED", message="Request body must be a JSON object"
+            )
+        command = Command(
+            type=CommandType.INTERACTION_RESPOND,
+            data={**body, "interaction_id": interaction_id},
+            command_id=(
+                request.headers.get("x-tabvis-command-id")
+                or body.get("command_id")
+                or ids.new_command_id()
+            ),
+        )
+        result = await gateway.router.dispatch(
+            command,
+            CommandContext(
+                principal=principal,
+                trace_id=f"tr_{ids.new_command_id()[4:]}",
+            ),
+        )
+        return JSONResponse(result.data)
+    except GatewayError as e:
+        return _error_response(e)
 
 
 def gateway_agent_handlers() -> dict[str, Any]:
@@ -161,6 +260,9 @@ def gateway_agent_handlers() -> dict[str, Any]:
         "list_agents": list_agents_compat,
         "get_agent": read_agent_compat,
         "cancel_agent": cancel_agent_compat,
+        "agent_events": agent_events_compat,
+        "list_agent_interactions": list_agent_interactions,
+        "respond_agent_interaction": respond_agent_interaction,
     }
 
 
@@ -172,4 +274,15 @@ def build_legacy_agent_routes() -> list[Route]:
         Route("/agents", list_agents_compat, methods=["GET"]),
         Route("/agents/{agent_id}", read_agent_compat, methods=["GET"]),
         Route("/agents/{agent_id}/cancel", cancel_agent_compat, methods=["POST"]),
+        Route("/agents/{agent_id}/events", agent_events_compat, methods=["GET"]),
+        Route(
+            "/agents/{agent_id}/interactions",
+            list_agent_interactions,
+            methods=["GET"],
+        ),
+        Route(
+            "/agents/{agent_id}/interactions/{interaction_id}/responses",
+            respond_agent_interaction,
+            methods=["POST"],
+        ),
     ]

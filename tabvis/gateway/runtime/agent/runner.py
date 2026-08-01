@@ -21,7 +21,7 @@ default is the real :func:`tabvis.ui.cli.print.stream_agent`.
 from __future__ import annotations
 
 import asyncio
-from typing import Any, Awaitable, Callable
+from typing import Any, Callable
 
 from tabvis.gateway.events.store import EventStore, get_event_store
 from tabvis.gateway.protocol.errors import GatewayError
@@ -61,6 +61,69 @@ def _assistant_text(message: dict[str, Any]) -> str:
         parts = [b.get("text", "") for b in content if isinstance(b, dict) and b.get("type") == "text"]
         return "".join(parts)
     return ""
+
+
+def _tool_uses(message: dict[str, Any]) -> list[dict[str, Any]]:
+    """Bounded, DLP-safe tool summaries for the durable diagnostic stream."""
+    inner = message.get("message") or {}
+    content = inner.get("content") if isinstance(inner, dict) else None
+    if not isinstance(content, list):
+        return []
+    out: list[dict[str, Any]] = []
+    from tabvis.dlp.gateway import get_dlp_gateway
+
+    for block in content:
+        if not isinstance(block, dict) or block.get("type") != "tool_use":
+            continue
+        payload = {
+            "name": str(block.get("name") or "tool")[:120],
+            "input": block.get("input") if isinstance(block.get("input"), dict) else {},
+        }
+        decision = get_dlp_gateway().scrub("audit", payload)
+        if decision.blocked or not isinstance(decision.payload, dict):
+            out.append({"name": payload["name"], "input": {"error": "dlp_blocked"}})
+        else:
+            safe = decision.payload
+            # Inputs are diagnostic hints, not a transcript replacement. Bound them before storing.
+            import json
+
+            encoded = json.dumps(safe.get("input") or {}, ensure_ascii=False, default=str)
+            out.append({
+                "name": str(safe.get("name") or "tool")[:120],
+                "input": safe.get("input") if len(encoded) <= 1500 else {"preview": encoded[:1500]},
+            })
+    return out
+
+
+def _safe_preview(surface: str, value: str | None) -> str:
+    """DLP-gate content before it enters the durable event log / API projection."""
+    from tabvis.dlp.gateway import get_dlp_gateway
+
+    decision = get_dlp_gateway().scrub(surface, value or "")
+    if decision.blocked:
+        return "[dlp_blocked]"
+    return str(decision.payload)[:_PREVIEW_CHARS]
+
+
+def _safe_full(value: str | None) -> str:
+    """DLP-gate a Run's full result for delivery — scrubbed like the preview, but NOT truncated."""
+    from tabvis.dlp.gateway import get_dlp_gateway
+
+    decision = get_dlp_gateway().scrub("api", value or "")
+    return "[dlp_blocked]" if decision.blocked else str(decision.payload)
+
+
+def _wire_input(value: Any) -> dict[str, Any]:
+    """Serialize a validated tool input back to its public wire keys."""
+    if isinstance(value, dict):
+        return dict(value)
+    dump = getattr(value, "model_dump", None)
+    if callable(dump):
+        return dump(by_alias=True, exclude_none=True)
+    try:
+        return dict(value)
+    except (TypeError, ValueError):
+        return {}
 
 
 class AgentRunLauncher:
@@ -116,6 +179,7 @@ class AgentRunLauncher:
         tool_calls = 0
         result_text: str | None = None
         is_error = False
+        result_error_code: str | None = None
         binding: BrowserBinding | None = None
         token = None
         try:
@@ -141,27 +205,101 @@ class AgentRunLauncher:
 
                 async for message in self._stream(run, context):
                     mtype = message.get("type")
+                    current = self._runs.get_run(run.run_id)
+                    if (
+                        current is not None
+                        and current.status == runs.RETRYING
+                        and mtype != "model_retry"
+                    ):
+                        self._runs.transition(
+                            run.run_id,
+                            runs.RUNNING,
+                            expected=runs.RETRYING,
+                            event_type=EventType.RUN_RESUMED,
+                            data={"reason": "model_retry_finished"},
+                        )
                     if mtype == "assistant":
                         turns += 1
-                        tool_calls += _count_tool_uses(message)
+                        tool_summaries = _tool_uses(message)
+                        tool_calls += len(tool_summaries)
                         self._events.append(
                             AGGREGATE_RUN, run.run_id, EventType.ASSISTANT_MESSAGE_COMPLETED, scope=scope,
-                            data={"turn": turns, "text_preview": _assistant_text(message)[:_PREVIEW_CHARS]},
+                            data={"turn": turns, "text_preview": _safe_preview(
+                                "transcript", _assistant_text(message)
+                            )},
                         )
-                        for _ in range(_count_tool_uses(message)):
+                        for summary in tool_summaries:
                             self._events.append(
                                 AGGREGATE_RUN, run.run_id, EventType.TOOL_COMPLETED, scope=scope,
-                                data={"turn": turns},
+                                data={"turn": turns, **summary},
                             )
+                        self._runs.record_progress(
+                            run.run_id, turns=turns, tool_calls=tool_calls
+                        )
                     elif mtype == "result":
                         result_text = message.get("result")
                         is_error = bool(message.get("is_error"))
+                        result_error_code = message.get("error_code")
+                    elif mtype == "model_retry":
+                        attempt = int(message.get("retry_attempt") or 0)
+                        maximum = int(message.get("max_retries") or 0)
+                        retry_in_ms = int(message.get("retry_in_ms") or 0)
+                        retry_data = {
+                            "reason": message.get("reason") or "model_retry",
+                            "message": (
+                                f"Model stream stalled · retrying "
+                                f"{attempt}/{maximum} in {retry_in_ms / 1000:.1f}s"
+                            ),
+                            "retry_attempt": attempt,
+                            "max_retries": maximum,
+                            "retry_in_ms": retry_in_ms,
+                        }
+                        current = self._runs.get_run(run.run_id)
+                        if current is not None and current.status == runs.RUNNING:
+                            self._runs.transition(
+                                run.run_id,
+                                runs.RETRYING,
+                                expected=runs.RUNNING,
+                                data=retry_data,
+                            )
+                        elif current is not None and current.status == runs.RETRYING:
+                            # A consecutive stall with no assistant message in between: the run is
+                            # already RETRYING (RETRYING->RETRYING is not a legal transition), so surface
+                            # the new attempt as a fresh run.retrying event rather than dropping it — else
+                            # the label freezes at "retrying 1/M" for the whole multi-attempt stall.
+                            self._events.append(
+                                AGGREGATE_RUN,
+                                run.run_id,
+                                EventType.RUN_RETRYING,
+                                scope=scope,
+                                data=retry_data,
+                            )
 
                 terminal = runs.FAILED if is_error else runs.COMPLETED
+                current = self._runs.get_run(run.run_id)
+                if current is not None and current.status == runs.RETRYING:
+                    self._runs.transition(
+                        run.run_id,
+                        runs.RUNNING,
+                        expected=runs.RETRYING,
+                        event_type=EventType.RUN_RESUMED,
+                        data={"reason": "model_retry_finished"},
+                    )
+                # Persist the FULL (DLP-scrubbed but untruncated) result before the transition so a
+                # channel reply can deliver it in full; the event carries only the bounded preview
+                # (§7.9). Best-effort: a store hiccup must not fail the run — the preview still ships.
+                if result_text and not is_error:
+                    try:
+                        self._runs.record_result(run.run_id, _safe_full(result_text))
+                    except Exception as e:  # noqa: BLE001
+                        log_for_debugging(f"[GATEWAY] could not persist full result for {run.run_id}: {e}")
                 self._runs.transition(
                     run.run_id, terminal, expected=runs.RUNNING,
-                    error_code="agent_error" if is_error else None,
-                    data={"result_preview": (result_text or "")[:_PREVIEW_CHARS]},
+                    error_code=(result_error_code or "agent_error") if is_error else None,
+                    data={
+                        "result_preview": _safe_preview("api", result_text),
+                        "error": _safe_preview("api", result_text) if is_error else None,
+                    },
                     turns=turns, tool_calls=tool_calls,
                 )
             finally:
@@ -207,7 +345,11 @@ class AgentRunLauncher:
             )
             rendered = render_system_context(pack)
             if rendered:
-                context.extra["system_context"] = rendered
+                from tabvis.dlp.gateway import get_dlp_gateway
+
+                decision = get_dlp_gateway().scrub("model_request", rendered)
+                if not decision.blocked:
+                    context.extra["system_context"] = str(decision.payload)
             # The pack is now authoritative for project instructions + memory too, so tell the loop to
             # suppress the base prompt's copies (full base-prompt migration under the gateway path).
             context.extra["owns_system_context"] = True
@@ -229,6 +371,14 @@ class AgentRunLauncher:
         # only new input is extra_system_context — the Context Runtime's situational block, appended to
         # the system prompt inside stream_agent.
         from tabvis.ui.cli.print import stream_agent
+        from tabvis.gateway.runtime.agents import get_agent_store
+
+        durable_agent = get_agent_store().get(run.agent_id)
+        principal_id = (
+            durable_agent.principal_id
+            if durable_agent is not None and durable_agent.principal_id
+            else "principal_local"
+        )
 
         async for m in stream_agent(
             context.prompt,
@@ -246,17 +396,118 @@ class AgentRunLauncher:
             # transcript/RunContext agree with the durable Run (Resume Plus §4.1, item 1).
             run_id=run.run_id,
             resume_mode=(context.resume_mode or ("plus" if context.resume else "fresh")),
+            principal_id=principal_id,
             # When a browser binding was acquired above, the runtime owns init/release (item 2).
             skip_browser_init=bool(context.extra.get("skip_browser_init")),
             # A conversation-only resume does not write Agent Memory (§5.1).
             write_memory=(context.resume_mode != "conversation_only"),
+            # Unlike the one-shot CLI, the Web runtime has a durable interaction transport. Policy
+            # asks and AskUserQuestion therefore pause the same Run until the console responds.
+            can_use_tool=self._interactive_can_use_tool(run),
         ):
             yield m
 
+    def _interactive_can_use_tool(self, run: RunRecord):
+        async def decide(
+            tool: Any,
+            input: Any,
+            tool_context: Any,
+            assistant_message: dict[str, Any],  # noqa: ARG001
+            tool_use_id: str,  # noqa: ARG001
+            force_decision: Any | None = None,  # noqa: ARG001
+        ) -> dict[str, Any]:
+            from tabvis.agent.tools.ask_user_question_tool import (
+                ASK_USER_QUESTION_TOOL_NAME,
+            )
+            from tabvis.gateway.runtime import interactions
+            from tabvis.gateway.runtime.interaction_service import get_interaction_service
+            from tabvis.tool import get_empty_tool_permission_context
+            from tabvis.utils.permissions.permissions import get_deny_rule_for_tool
+
+            app_state = (
+                tool_context.get_app_state()
+                if getattr(tool_context, "get_app_state", None)
+                else None
+            )
+            permission_context = (
+                (app_state or {}).get("toolPermissionContext")
+                or get_empty_tool_permission_context()
+            )
+            if get_deny_rule_for_tool(permission_context, tool):
+                return {
+                    "behavior": "deny",
+                    "message": f"{tool.name} is denied by a permission rule.",
+                    "decisionReason": {"type": "rule"},
+                }
+
+            decision = await tool.check_permissions(input, tool_context)
+            behavior = decision.get("behavior")
+            if behavior == "passthrough":
+                return {
+                    "behavior": "allow",
+                    "updatedInput": decision.get("updatedInput", input),
+                }
+            if behavior != "ask":
+                return decision
+
+            kind = (
+                interactions.KIND_QUESTION
+                if tool.name == ASK_USER_QUESTION_TOOL_NAME
+                else interactions.KIND_APPROVAL
+            )
+            wire = _wire_input(decision.get("updatedInput", input))
+            request_payload: dict[str, Any] = {
+                "tool": tool.name,
+                "message": decision.get("message") or "User input required",
+            }
+            if kind == interactions.KIND_QUESTION:
+                request_payload["questions"] = wire.get("questions") or []
+            else:
+                request_payload["input"] = wire
+                if decision.get("decisionReason") is not None:
+                    request_payload["decisionReason"] = decision["decisionReason"]
+
+            from tabvis.dlp.gateway import get_dlp_gateway
+
+            scrubbed = get_dlp_gateway().scrub("api", request_payload)
+            if scrubbed.blocked or not isinstance(scrubbed.payload, dict):
+                return {
+                    "behavior": "deny",
+                    "message": "DLP blocked the interaction request.",
+                    "decisionReason": {"type": "dlp"},
+                }
+
+            service = get_interaction_service()
+            interaction = service.request(run.run_id, kind, scrubbed.payload)
+            answer = await service.wait(interaction.interaction_id)
+            if kind == interactions.KIND_QUESTION:
+                wire["answers"] = answer.get("answers", answer)
+                return {
+                    "behavior": "allow",
+                    "updatedInput": wire,
+                    "userModified": True,
+                }
+            if bool(answer.get("allow")):
+                return {
+                    "behavior": "allow",
+                    "updatedInput": wire,
+                    "userModified": True,
+                }
+            return {
+                "behavior": "deny",
+                "message": "The user denied this action.",
+                "decisionReason": {"type": "user"},
+            }
+
+        return decide
+
     def _fail_best_effort(self, run_id: str, error: str, turns: int, tool_calls: int) -> None:
         try:
+            current = self._runs.get_run(run_id)
+            if current is None or current.status not in (runs.RUNNING, runs.RETRYING):
+                return
             self._runs.transition(
-                run_id, runs.FAILED, expected=runs.RUNNING, error_code="agent_exception",
+                run_id, runs.FAILED, expected=current.status, error_code="agent_exception",
                 data={"error": error}, turns=turns, tool_calls=tool_calls,
             )
         except Exception as e:  # noqa: BLE001 - already terminal (e.g. cancelled) → nothing to do

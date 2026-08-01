@@ -201,6 +201,41 @@ def test_service_account_assertion_is_a_verifiable_rs256_jwt() -> None:
     assert crypto._verify_rs256(pub, signing_input, signature)
 
 
+def _public_jwk(pub, kid: str) -> dict:
+    numbers = pub.public_numbers()
+
+    def _int_b64url(value: int) -> str:
+        raw = value.to_bytes((value.bit_length() + 7) // 8, "big")
+        return crypto._b64url_encode(raw)
+
+    return {"kid": kid, "kty": "RSA", "n": _int_b64url(numbers.n), "e": _int_b64url(numbers.e)}
+
+
+def test_certs_cache_bounds_refetch_on_unknown_kid() -> None:
+    # Bug #9: an unauthenticated caller controls the JWT header `kid` (before the signature is checked).
+    # An unknown kid must not force a blocking JWKS fetch on every request — the cooldown holds it off.
+    class _CountingClient:
+        def __init__(self, jwks: dict) -> None:
+            self.gets = 0
+            self._jwks = jwks
+
+        def get(self, _url: str) -> httpx.Response:
+            self.gets += 1
+            return httpx.Response(200, json=self._jwks)
+
+        def close(self) -> None:
+            pass
+
+    client = _CountingClient({"keys": [_public_jwk(_PUB, "real")]})
+    cache = crypto.GoogleCertsCache(http_client=client, ttl=300.0, min_refetch_interval=3600.0)
+
+    assert cache.get_key("real") is not None  # first miss populates the cache
+    assert client.gets == 1
+    for i in range(50):  # a flood of attacker-chosen kids
+        assert cache.get_key(f"attacker-{i}") is None
+    assert client.gets == 1  # no per-request refetch amplification
+
+
 # --- webhook decoding: bearer verification -----------------------------------------------------
 
 

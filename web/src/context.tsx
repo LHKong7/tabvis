@@ -1,8 +1,8 @@
-import { createContext, useCallback, useContext, useEffect, useRef, useState } from 'react'
+import { createContext, useCallback, useContext, useEffect, useState } from 'react'
 import type { ReactNode } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { api, runAgent, RunError } from './api'
-import { summarize } from './format'
+import { api, apiErrorMessage, runAgent, RunError } from './api'
+import { frameFor } from './format'
 import type { AgentSummary, Frame, Health } from './types'
 
 // App-wide shared state: the polled fleet/session list, and the live run lifecycle (which persists as
@@ -11,11 +11,10 @@ interface AppValue {
   health: Health | null
   agents: AgentSummary[]
   ready: boolean
-  frames: Frame[]
+  framesFor: (id: string | undefined) => Frame[]
   busy: boolean
   cancelling: boolean
   runOn: string // '' = new agent; else an agent_id to continue
-  streamFor: string | null // agent_id whose live stream `frames` holds
   setRunOn: (id: string) => void
   launch: (body: Record<string, unknown>, setErr: (e: string) => void) => void
   cancel: (id: string) => Promise<void>
@@ -34,12 +33,10 @@ export function useApp(): AppValue {
 export function AppProvider({ children }: { children: ReactNode }) {
   const [health, setHealth] = useState<Health | null>(null)
   const [agents, setAgents] = useState<AgentSummary[]>([])
-  const [frames, setFrames] = useState<Frame[]>([])
+  const [framesByAgent, setFramesByAgent] = useState<Record<string, Frame[]>>({})
   const [busy, setBusy] = useState(false)
   const [cancelling, setCancel] = useState(false)
   const [runOn, setRunOn] = useState('')
-  const [streamFor, setStreamFor] = useState<string | null>(null)
-  const streamRef = useRef<string | null>(null)
   const navigate = useNavigate()
 
   // Poll the fleet + session list.
@@ -63,30 +60,43 @@ export function AppProvider({ children }: { children: ReactNode }) {
     }
   }, [])
 
-  const push = useCallback((event: string, data: any) => {
-    const out = summarize(event, data)
-    if (out == null) return
-    const text = typeof out === 'string' ? out : out.text
-    const cls = typeof out === 'string' ? event : out.cls
-    setFrames((f) => [...f, { event, cls, text }])
+  const push = useCallback((agentId: string, event: string, data: any) => {
+    const frame = frameFor(event, data)
+    if (frame == null) return
+    setFramesByAgent((current) => ({
+      ...current,
+      [agentId]: [...(current[agentId] || []), frame],
+    }))
   }, [])
 
   const launch = useCallback(
     (body: Record<string, unknown>, setErr: (e: string) => void) => {
       setBusy(true)
-      setFrames([])
       const continuing = !!body.agent_id
+      let requestAgentId = typeof body.agent_id === 'string' ? body.agent_id : ''
+      if (requestAgentId) {
+        setFramesByAgent((current) => ({ ...current, [requestAgentId]: [] }))
+      }
+      let openedSession = false
       runAgent(body, ({ event, data }) => {
         if (event === '_id' || event === 'agent') {
           const id = data.agent_id
-          if (id && streamRef.current !== id) {
-            streamRef.current = id
-            setStreamFor(id)
-            if (!continuing) setRunOn(id) // chat continuation
-            navigate(`/sessions/${id}`)
+          if (id) {
+            if (!requestAgentId) {
+              requestAgentId = id
+              setFramesByAgent((current) => ({ ...current, [id]: [] }))
+            }
+            // A second Run may continue the same Agent ID. De-duplicate the two opening frames
+            // within this request, not against the previous request's Agent ID, or the second
+            // Continue stays forever on /run despite having started successfully.
+            if (!openedSession) {
+              openedSession = true
+              if (!continuing) setRunOn(id) // chat continuation
+              navigate(`/sessions/${id}`)
+            }
           }
         }
-        push(event, data)
+        if (requestAgentId) push(requestAgentId, event, data)
       })
         .catch((e: RunError) => {
           const extra = e.status === 409 ? ` (held by ${e.held_by})` : ''
@@ -109,7 +119,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
     async (id: string) => {
       setCancel(true)
       const { ok, body } = await api.cancel(id)
-      if (!ok) push('error', { message: body.error })
+      if (!ok) push(id, 'error', { message: apiErrorMessage(body, 'Cancel failed') })
       setCancel(false)
     },
     [push],
@@ -119,7 +129,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
     async (id: string) => {
       setCancel(true)
       const { ok, body } = await api.quit(id)
-      if (!ok) push('error', { message: body.error })
+      if (!ok) push(id, 'error', { message: apiErrorMessage(body, 'Quit failed') })
       setCancel(false)
     },
     [push],
@@ -129,11 +139,10 @@ export function AppProvider({ children }: { children: ReactNode }) {
     health,
     agents,
     ready: health?.config?.ready !== false,
-    frames,
+    framesFor: (id) => (id ? framesByAgent[id] || [] : []),
     busy,
     cancelling,
     runOn,
-    streamFor,
     setRunOn,
     launch,
     cancel,

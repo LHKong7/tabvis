@@ -42,6 +42,11 @@ DETAILED_ANALYSIS_INSTRUCTION_BASE = """Before providing your final summary, wra
      - full code snippets
      - function signatures
      - file edits
+     - exact research source URLs, titles, publication dates, numeric findings, and which claims
+       each source supports
+     - for PDF sources, the local/source URL, page count, exact page ranges already read, remaining
+       ranges, and whether evidence came from full text, OCR, or abstract-only material
+     - the requested report path, its source-ledger state, and the last evidence already written
    - Errors that you ran into and how you fixed them
    - Pay special attention to specific user feedback that you received, especially if the user told you to do something differently.
 2. Double-check for technical accuracy and completeness, addressing each required element thoroughly."""
@@ -57,6 +62,11 @@ DETAILED_ANALYSIS_INSTRUCTION_PARTIAL = """Before providing your final summary, 
      - full code snippets
      - function signatures
      - file edits
+     - exact research source URLs, titles, publication dates, numeric findings, and which claims
+       each source supports
+     - for PDF sources, the local/source URL, page count, exact page ranges already read, remaining
+       ranges, and whether evidence came from full text, OCR, or abstract-only material
+     - the requested report path, its source-ledger state, and the last evidence already written
    - Errors that you ran into and how you fixed them
    - Pay special attention to specific user feedback that you received, especially if the user told you to do something differently.
 2. Double-check for technical accuracy and completeness, addressing each required element thoroughly."""

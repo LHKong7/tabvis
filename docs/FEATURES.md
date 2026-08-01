@@ -37,7 +37,7 @@ the model calls.
 
 | Tool | Purpose |
 |---|---|
-| `Read` | Read a file — text, images (shown visually), PDFs (`pages` range), and `.ipynb` notebooks with outputs. |
+| `Read` | Read a file — text defaults to a bounded 2,000-line window; PDF ranges include page markers, cumulative coverage, and the next unread range; also supports images and `.ipynb` notebooks. |
 | `Edit` | Exact string replacement in a file (`replace_all` optional). |
 | `Write` | Create or overwrite a file. |
 | `Glob` | Find files by glob pattern. |
@@ -79,9 +79,12 @@ interface, and every page is rendered with JavaScript in a real browser context.
 | `mcp__<server>__<tool>` | One wrapped tool per connected MCP server tool (added dynamically; schema loaded on demand via `ToolSearch`). |
 
 **Gating.** `TABVIS_SIMPLE`/`--bare` reduces the registry to `Bash`/`Read`/`Edit` and skips MCP.
-`NotebookEdit`, `TodoWrite`, `AskUserQuestion`, and every MCP tool are *deferred* — their schemas are
-withheld from the initial prompt and loaded on demand via `ToolSearch` to keep the prompt small.
-Permission deny-rules can remove any tool.
+`Workflow`, `NotebookEdit`, `TodoWrite`, `AskUserQuestion`, and every MCP tool are *deferred* —
+only their names appear in the initial `ToolSearch` catalogue. A search records the selected names
+in durable transcript metadata and the next model request receives just those full schemas. This is
+server-side and provider-neutral (Anthropic, OpenAI-compatible, and Gemini); set
+`ENABLE_TOOL_SEARCH=false` to load every schema up front, or `auto[:N]` to use a context-percentage
+threshold. Permission deny-rules can remove any tool.
 
 ---
 
@@ -109,10 +112,14 @@ workspaces expire (`TABVIS_BROWSER_IDLE_TIMEOUT_MS`).
 **Downloads.** Files land in a per-run workspace, with names sanitized to a basename and de-collided
 so a hostile `suggested_filename` can't escape the directory. Three capture paths: Playwright
 download events, PDF navigations (Chromium's PDF viewer is unreadable to the accessibility tree), and
-the explicit `BrowserDownload` tool. New files are announced to the agent to `Read`.
+the explicit `BrowserDownload` tool. A captured PDF is explicitly marked `captured_not_read`; the
+agent must use paged `Read` calls before treating it as full-text evidence. Each successful PDF text
+range records its source URL, pages, cumulative coverage, next range, and bounded text as durable
+research evidence.
 
 **Artifacts.** An append-only browsing trail (navigations, page snapshots, interactions, and
-content-addressed DOM blobs) is recorded per session and exposed at `GET /agents/{id}/artifacts`.
+content-addressed DOM blobs) plus structured Web/PDF research evidence is recorded per session and
+exposed at `GET /agents/{id}/artifacts`.
 
 **Engines & pacing.** Chromium, Firefox, WebKit, installed browsers, stealth engines (CloakBrowser,
 Camoufox), and remote/CDP sessions all drive through the same tool interface. Request pacing is on by
@@ -310,7 +317,7 @@ See [AGENT_GATEWAY_DESIGN.md](AGENT_GATEWAY_DESIGN.md) for the target architectu
 contract (verify → normalize → deliver) and the same inbound pipeline (dedupe → bind → message event
 → Run). **17 IM platforms** ship, in two transport shapes:
 
-- **Webhook** (an HTTP callback the plugin verifies): Feishu 飞书, DingTalk 钉钉, WeCom 企业微信, Slack,
+- **Webhook** (an HTTP callback the plugin verifies): Feishu, DingTalk, WeCom, Slack,
   Microsoft Teams, LINE, Google Chat, WhatsApp, and QQ.
 - **Client-loop** (a persistent connection that pushes into the pipeline): Telegram, Discord, Matrix,
   Mattermost, IRC, SimpleX, Signal, and iMessage.
@@ -325,6 +332,6 @@ starts the client-loop channels' read loops, and delivers each finished Run's re
 originating chat by subscribing to `run.completed`. End-to-end: a chat message → webhook / read-loop →
 verify → normalize → bind → **Run** → agent → reply delivered back to the chat.
 
-Not included as channels: personal WeChat (个人微信 — no official bot API; automating a personal account
-violates ToS; WeCom/企业微信 is the official enterprise path) and Tencent Yuanbao (腾讯元宝 — an assistant
+Not included as channels: personal WeChat (no official bot API; automating a personal account
+violates ToS; WeCom is the official enterprise path) and Tencent Yuanbao (an assistant
 app, not an IM). The `example_webhook` and `web` channels remain as the reference/console channels.

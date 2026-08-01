@@ -15,6 +15,9 @@ def test_declared_edges_are_allowed() -> None:
     assert runs.can_transition(runs.RUNNING, runs.WAITING_FOR_INPUT)
     assert runs.can_transition(runs.WAITING_FOR_INPUT, runs.RUNNING)
     assert runs.can_transition(runs.RUNNING, runs.COMPLETED)
+    assert runs.can_transition(runs.RUNNING, runs.RETRYING)
+    assert runs.can_transition(runs.RETRYING, runs.RUNNING)
+    assert runs.can_transition(runs.RETRYING, runs.CANCELLING)
     assert runs.can_transition(runs.CANCELLING, runs.CANCELLED)
 
 

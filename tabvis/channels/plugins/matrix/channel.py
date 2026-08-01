@@ -25,6 +25,7 @@ from tabvis.channels.core.contract import (
 )
 from tabvis.channels.plugins._platform.loop import ClientLoopChannel
 from tabvis.channels.plugins.matrix.client import MatrixClient, MatrixConfig
+from tabvis.utils.debug import log_for_debugging
 
 PLUGIN_ID = "matrix"
 _STARTUP_GRACE_MS = 5000
@@ -63,12 +64,17 @@ class MatrixChannel(ClientLoopChannel):
     # --- read loop ------------------------------------------------------------------------------
 
     async def _run_loop(self) -> None:
+        # Resolve our own MXID on BOTH paths — the self-message fail-safe drops everything when it is
+        # unknown, so an injected source with no configured user_id would otherwise lose all inbound.
+        if not self._user_id:
+            try:
+                self._user_id = await self._client.whoami()
+            except Exception as exc:  # noqa: BLE001 - degrade to config value rather than kill the loop
+                log_for_debugging(f"[matrix] whoami failed: {exc}")
         if self._source is not None:  # test / alternative-transport path — events carry room_id already
             async for event in self._source:
                 await self._handle(event)
             return
-        if not self._user_id:  # resolve our MXID so we can drop our own echoed messages (fail-safe)
-            self._user_id = await self._client.whoami()
         since: str | None = None
         first = True
         startup_ms = time.time() * 1000
@@ -109,8 +115,13 @@ class MatrixChannel(ClientLoopChannel):
         room_id = event.get("room_id")
         if not room_id:
             return None
+        event_id = event.get("event_id")
+        if not event_id:
+            # An id-less event can't be deduped; dropping it beats collapsing every id-less event onto
+            # one ledger key (which would silently discard all but the first as "duplicates").
+            return None
         return InboundMessage(
-            external_event_id=str(event.get("event_id") or ""),
+            external_event_id=str(event_id),
             external_conversation_id=str(room_id),
             external_account_ref=self._account_id,
             text=str(body),

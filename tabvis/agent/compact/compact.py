@@ -504,10 +504,6 @@ async def compact_conversation(
         _call_opt(context, "set_response_length", lambda _length: 0)
         _on_compact_progress(context, {"type": "compact_start"})
 
-        prompt_cache_sharing_enabled = _get_feature_value(
-            "tengu_compact_cache_prefix", True
-        )
-
         compact_prompt = get_compact_prompt(custom_instructions)
         summary_request = create_user_message(content=compact_prompt)
 
@@ -638,12 +634,6 @@ async def compact_conversation(
 
         compaction_usage = _get_token_usage(summary_response)
 
-        query_source_for_event = (
-            (recompaction_info or {}).get("querySource")
-            or context.options.query_source
-            or "unknown"
-        )
-
         mark_post_compaction()
 
         re_append_session_metadata()
@@ -749,12 +739,6 @@ async def partial_compact_conversation(
 
         compact_prompt = get_partial_compact_prompt(custom_instructions, direction)
         summary_request = create_user_message(content=compact_prompt)
-
-        failure_metadata = {
-            "preCompactTokenCount": pre_compact_token_count,
-            "direction": direction,
-            "messagesSummarized": len(messages_to_summarize),
-        }
 
         api_messages = (
             messages_to_summarize if direction == "up_to" else all_messages

@@ -54,6 +54,7 @@ ENTER_WORKTREE_TOOL_NAME = "EnterWorktree"  # tabvis.agent.tools.enter_worktree_
 EXIT_WORKTREE_TOOL_NAME = "ExitWorktree"  # tabvis.agent.tools.exit_worktree_tool_constants
 BROWSER_NAVIGATE_TOOL_NAME = "BrowserNavigate"  # tabvis.agent.tools.browser_navigate_tool
 BROWSER_SNAPSHOT_TOOL_NAME = "BrowserSnapshot"  # tabvis.agent.tools.browser_snapshot_tool
+BROWSER_EXTRACT_TOOL_NAME = "BrowserExtract"  # tabvis.agent.tools.browser_extract_tool
 BROWSER_CLICK_TOOL_NAME = "BrowserClick"  # tabvis.agent.tools.browser_click_tool
 BROWSER_TYPE_TOOL_NAME = "BrowserType"  # tabvis.agent.tools.browser_type_tool
 BROWSER_SCROLL_TOOL_NAME = "BrowserScroll"  # tabvis.agent.tools.browser_scroll_tool

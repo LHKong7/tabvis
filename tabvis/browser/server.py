@@ -79,7 +79,11 @@ _ELIDED = "<elided:image-bytes>"
 
 def _sse(event: str, data: Any) -> dict[str, str]:
     """One SSE frame, in the shape sse-starlette's EventSourceResponse expects."""
-    return {"event": event, "data": json.dumps(data, default=str)}
+    from tabvis.dlp.gateway import get_dlp_gateway
+
+    decision = get_dlp_gateway().scrub("api", data)
+    safe = {"error": "dlp_blocked"} if decision.blocked else decision.payload
+    return {"event": event, "data": json.dumps(safe, default=str)}
 
 
 async def _ws_pump(websocket: Any, queue: "asyncio.Queue[Any]") -> None:
@@ -325,10 +329,9 @@ def create_app(auth_required: bool = False, dev: bool = False) -> Any:
     reject unauthenticated requests and enforce per-agent isolation. The default (False) preserves the
     open loopback/dev posture — an unauthenticated caller is the local admin.
 
-    ``dev`` (``--serve --dev``) starts the Vite dev server from ``web/`` and reverse-proxies the
-    console to it (live HMR from source). Without ``--dev`` tabvis serves NO built-in UI — it is a
-    headless JSON/SSE API and ``/`` returns a pointer to the two ways to get a console. API routes
-    are unaffected; under ``--dev`` only ``/`` and unmatched frontend asset paths proxy to Vite.
+    The bundled React console is served at ``/`` by default. ``dev`` (``--serve --dev``) replaces it
+    with the Vite dev server from ``web/`` and reverse-proxies live source/HMR traffic. API routes
+    always take precedence over the console's final SPA catch-all.
     """
     from sse_starlette.sse import EventSourceResponse
     from starlette.applications import Starlette
@@ -360,26 +363,6 @@ def create_app(auth_required: bool = False, dev: bool = False) -> Any:
         if decision.get("behavior") != "allow":
             return JSONResponse({"error": decision.get("message", "forbidden")}, status_code=403)
         return None
-
-    async def console(_request: Request) -> Any:
-        """GET / — tabvis serves NO built-in web UI; this is a JSON/SSE API. Point the user at the
-        two supported ways to get a console. (Under ``--dev`` this handler is replaced by a live-Vite
-        reverse proxy; see create_app.)"""
-        from starlette.responses import JSONResponse as _JSONResponse
-
-        return _JSONResponse(
-            {
-                "service": "tabvis",
-                "ui": "none — this is a headless JSON/SSE API",
-                "get_a_console": [
-                    "run `tabvis --serve --dev` for the live React console (Vite HMR from web/)",
-                    "or build web/ (`cd web && npm run build`) and host web/dist behind your own "
-                    "server, pointing it at this API",
-                ],
-                "api": ["GET /health", "GET/POST /config", "POST /agent (SSE)", "GET /agents"],
-            },
-            status_code=404,
-        )
 
     async def health(_request: Request) -> JSONResponse:
         # Counts come from the gateway's durable Run/Agent stores (design §7 Phase 6 convergence).
@@ -541,7 +524,9 @@ def create_app(auth_required: bool = False, dev: bool = False) -> Any:
         # Cancel the active Run (if any) and close the bundled browser — the "user quit" action.
         gateway = _gateway_of(request)
         run = gateway.runs.latest_run_for_agent(agent_id) if gateway is not None else None
-        status = legacy_status(run.status) if run is not None else "cancelled"
+        # A never-run agent has nothing to cancel — report the zero-run status GET /agents/{id} also
+        # projects ("queued"), not a false "cancelled".
+        status = legacy_status(run.status) if run is not None else "queued"
         if run is not None and not run.is_terminal:
             try:
                 await gateway.orchestrator.cancel(run.run_id)
@@ -569,7 +554,17 @@ def create_app(auth_required: bool = False, dev: bool = False) -> Any:
             return denied
         if not _durable_agent_exists(request, agent_id):
             return JSONResponse({"error": "unknown agent_id"}, status_code=404)
-        session_id = _durable_agent_session(request, agent_id) or ""
+        session_id = _durable_agent_session(request, agent_id)
+        if not session_id:
+            # The agent has no Run/session yet, so it has no artifacts. Crucially, never pass an empty
+            # session id down: artifacts.py resolves "" to the process's *current* session, which would
+            # leak another agent's browsing trail (cross-agent / cross-principal disclosure).
+            if request.query_params.get("dom"):
+                return JSONResponse({"error": "unknown dom_ref"}, status_code=404)
+            return JSONResponse(
+                {"agent_id": agent_id, "summary": {"count": 0, "by_type": {}, "last_url": None},
+                 "artifacts": [], "count": 0}
+            )
 
         dom_ref = request.query_params.get("dom")
         if dom_ref:
@@ -789,6 +784,8 @@ def create_app(auth_required: bool = False, dev: bool = False) -> Any:
             if _dev_server is not None:
                 await _dev_server.start()  # fail loud if npm/web deps are missing
             _gw = getattr(_app.state, "gateway", None)
+            if _gw is not None:
+                await _gw.scheduler.start()
             if _gw is not None and getattr(_gw, "channels", None) is not None:
                 await _gw.channels.start()  # subscribe outbound delivery + start client-loop read loops
             yield
@@ -799,8 +796,18 @@ def create_app(auth_required: bool = False, dev: bool = False) -> Any:
                     await gw.channels.stop()
                 except Exception:  # noqa: BLE001 - best-effort
                     pass
+            if gw is not None:
+                try:
+                    await gw.scheduler.stop()
+                except Exception:  # noqa: BLE001 - best-effort
+                    pass
             if _dev_server is not None:
                 await _dev_server.stop()
+            if gw is not None and getattr(gw, "authentication", None) is not None:
+                try:
+                    await gw.authentication.close()
+                except Exception:  # noqa: BLE001 - best-effort
+                    pass
             # Drain the gateway (stop accepting, close its store) before the browser cleanup.
             if gw is not None:
                 try:
@@ -825,6 +832,9 @@ def create_app(auth_required: bool = False, dev: bool = False) -> Any:
     list_agents = _gw_agent["list_agents"]
     get_agent = _gw_agent["get_agent"]
     cancel_agent = _gw_agent["cancel_agent"]
+    agent_events = _gw_agent["agent_events"]
+    list_agent_interactions = _gw_agent["list_agent_interactions"]
+    respond_agent_interaction = _gw_agent["respond_agent_interaction"]
 
     # RT-1: one declarative table of API routes, each mounted at BOTH its legacy path and a ``/v1``
     # alias (same handler, byte-identical response), so the versioned Runtime API surface can grow
@@ -840,6 +850,13 @@ def create_app(auth_required: bool = False, dev: bool = False) -> Any:
         ("/agents", list_agents, ["GET"]),
         ("/agents/{agent_id}", get_agent, ["GET"]),
         ("/agents/{agent_id}/cancel", cancel_agent, ["POST"]),
+        ("/agents/{agent_id}/events", agent_events, ["GET"]),
+        ("/agents/{agent_id}/interactions", list_agent_interactions, ["GET"]),
+        (
+            "/agents/{agent_id}/interactions/{interaction_id}/responses",
+            respond_agent_interaction,
+            ["POST"],
+        ),
         ("/agents/{agent_id}/quit", quit_agent, ["POST"]),
         ("/agents/{agent_id}/browser", agent_browser, ["GET"]),
         ("/agents/{agent_id}/artifacts", agent_artifacts, ["GET"]),
@@ -861,14 +878,16 @@ def create_app(auth_required: bool = False, dev: bool = False) -> Any:
         ("/browsers/close", close_browser_route, ["POST"]),
         ("/browser/session", browser_session, ["GET"]),
     ]
-    # The console at `/`: served from the built bundle, or (--dev) reverse-proxied to Vite.
+    # The console at `/`: served from the bundled production build, or reverse-proxied to Vite.
     if dev:
         from tabvis.browser.dev_server import proxy_to_vite
 
-        console_route = Route("/", proxy_to_vite, methods=["GET", "HEAD"])
+        console_endpoint = proxy_to_vite
     else:
-        console_route = Route("/", console, methods=["GET"])
-    routes = [console_route]  # the console UI (unversioned)
+        from tabvis.browser.web_console import serve_built_console
+
+        console_endpoint = serve_built_console
+    routes = [Route("/", console_endpoint, methods=["GET", "HEAD"])]  # unversioned console UI
     for path, handler, methods in api_routes:
         routes.append(Route(path, handler, methods=methods))
         routes.append(Route("/v1" + path, handler, methods=methods))
@@ -883,7 +902,7 @@ def create_app(auth_required: bool = False, dev: bool = False) -> Any:
     # The gateway's durable Agent/Run stores back the /agents surface (design §7 Phase 6), so the
     # gateway is ALWAYS built. TABVIS_GATEWAY only gates the additional /v1 control-plane routes
     # (/v1/runs, /v1/events SSE, interactions, conversations).
-    from tabvis.gateway.access.http import gateway_routes
+    from tabvis.gateway.access.http import gateway_routes, scheduled_task_routes
     from tabvis.gateway.lifecycle import GatewayApplication
     from tabvis.gateway.runtime.agent import AgentRunLauncher
     from tabvis.gateway.runtime.context.sources import SourceCollector
@@ -907,10 +926,14 @@ def create_app(auth_required: bool = False, dev: bool = False) -> Any:
     if _gateway_enabled():
         # /agents is now gateway-backed; the standalone /v1 command surface is the additional plane.
         routes.extend(gateway_routes(health_path="/v1/gateway/health", include_compat=False))
+    else:
+        # Schedules power a first-class console page, so disabling the optional command/event surface
+        # does not make the page unusable.
+        routes.extend(scheduled_task_routes())
 
-    if dev:
-        # Catch-all LAST so API routes win; forwards Vite's module graph (/src/*, /@vite/*, …) to it.
-        routes.append(Route("/{path:path}", proxy_to_vite, methods=["GET", "HEAD"]))
+    # Catch-all LAST so API routes win. In dev it forwards Vite's module graph; in production it
+    # serves built assets and falls back to index.html for React Router locations.
+    routes.append(Route("/{path:path}", console_endpoint, methods=["GET", "HEAD"]))
 
     app = Starlette(routes=routes, lifespan=lifespan)
     # P0-2: transport hardening (security headers, body cap, default-deny CORS) — pure ASGI, so the
@@ -938,7 +961,8 @@ async def serve_async(host: str | None = None, port: int | None = None, dev: boo
     already runs inside ``asyncio.run(cli.main())`` (bootstrap_entry). So drive uvicorn's Server
     directly and await it on the loop we are already on.
 
-    ``dev`` reverse-proxies the console to a live Vite dev server started from ``web/``.
+    The bundled console is served by default. ``dev`` replaces it with a live Vite server from
+    ``web/`` for HMR.
     """
     import uvicorn
 
@@ -964,10 +988,12 @@ async def serve_async(host: str | None = None, port: int | None = None, dev: boo
     except Exception:  # noqa: BLE001
         pass
 
-    print(f"tabvis agent console -> http://{host}:{port}/", flush=True)
+    print(f"tabvis web console -> http://{host}:{port}/", flush=True)
     print(f"  POST http://{host}:{port}/agent   (SSE)   GET /agents  (manage)", flush=True)
     if dev:
         print("  --dev: console served live from web/ via Vite (HMR); edits reload in the browser", flush=True)
+    else:
+        print("  console served from the bundled production build", flush=True)
 
     config = uvicorn.Config(
         create_app(auth_required=auth_required, dev=dev), host=host, port=port, log_level="warning"
@@ -977,7 +1003,10 @@ async def serve_async(host: str | None = None, port: int | None = None, dev: boo
 
 def serve(host: str | None = None, port: int | None = None, dev: bool = False) -> None:
     """Blocking entry for contexts with no running loop (``python -m tabvis.browser.server``)."""
-    asyncio.run(serve_async(host, port, dev=dev))
+    try:
+        asyncio.run(serve_async(host, port, dev=dev))
+    except KeyboardInterrupt:
+        return
 
 
 if __name__ == "__main__":  # `python -m tabvis.browser.server`

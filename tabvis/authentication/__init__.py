@@ -1,10 +1,9 @@
 """Secure credential injection & automatic authentication (docs/CREDENTIAL_INJECTION_DESIGN.md).
 
-Phase 0 (security contract & test skeleton): the data models, stable error codes, the non-serializable
-:class:`~tabvis.authentication.secrets.SecretValue`, origin/frame policy primitives, one-time
-capabilities, the reference-only profile store and whitelist audit events. No automatic login runs yet
-(that is Phase 1+); the guarantee of this phase is that **no new interface can accept or emit a
-plaintext secret** (design §15 Phase 0 acceptance).
+The package contains the security contracts plus the Phase 6 managed runtime integration: strict
+models, stable errors, non-serializable secrets, policy/capabilities, Broker clients, Playwright
+Browser Host control, Session Vault, and DLP boundaries. Managed authentication remains feature-gated
+and production configuration fails closed unless an external L2 Broker deployment is verified.
 """
 
 from __future__ import annotations

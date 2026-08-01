@@ -154,6 +154,27 @@ async def _check_permissions_and_call_tool(
     # 4. Run the tool.
     result = await tool.call(call_input, call_context, can_use_tool, assistant_message, None)
 
+    # 5. The tool-result message is both a model-request and transcript egress surface.  Block known
+    # secret canaries/forbidden objects before a tool-specific mapper can serialize them, then apply
+    # the format redactions to the value used by both consumers.  Verbatim-content tools (Read/Edit)
+    # keep the fail-closed block but opt out of the mutating identifier/URL rewrite: masking their
+    # bytes would corrupt the model's view and break exact-match Edit.
+    from tabvis.dlp.gateway import get_dlp_gateway
+
+    dlp = get_dlp_gateway().scrub(
+        "model_request", result.data, rewrite=not getattr(tool, "dlp_verbatim_result", False)
+    )
+    if dlp.blocked:
+        return [
+            _tool_result_error_update(
+                tool_use_id,
+                "<tool_use_error>DLP blocked the tool result.</tool_use_error>",
+                "Error: dlp_blocked",
+                assistant_message,
+            )
+        ]
+    result.data = dlp.payload
+
     updates: list[MessageUpdateLazy] = []
     for new_message in result.new_messages or []:
         updates.append({"message": new_message})

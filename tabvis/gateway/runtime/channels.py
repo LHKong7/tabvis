@@ -6,9 +6,10 @@ accounts onto a :class:`ChannelGateway`, drives inbound HTTP webhooks through th
 delivers each finished Run's result back to the channel it came from.
 
 Outbound is event-driven: it subscribes to the durable log's live bus and, on ``run.completed`` /
-``run.failed`` for a Run whose conversation is bound to a channel, sends the Run's result text back.
-The result text is the ``result_preview`` the runner records on the completion event (bounded to
-~2000 chars, design §7.9), which is the final assistant message — enough for a chat reply.
+``run.failed`` for a Run whose conversation is bound to a channel, sends the Run's result back. A
+completed run delivers its **full** (DLP-scrubbed) result — persisted by the runner in ``run_results``,
+not the ~2000-char ``result_preview`` on the event (design §7.9) — split into per-platform-sized chunks
+so a long answer is never truncated. A failed run delivers its ``error`` reason.
 
 Configuration is env-driven: ``TABVIS_CHANNELS`` is a comma list of plugin ids to enable (e.g.
 ``feishu,slack,telegram``); each plugin reads its own ``TABVIS_<PLATFORM>_*`` vars via ``from_env``. A
@@ -51,7 +52,7 @@ class ChannelRuntime:
         self._plugins: dict[str, Any] = {}     # plugin_id -> plugin instance
         self._accounts: dict[str, str] = {}    # plugin_id -> channel_account_id
         self._errors: dict[str, str] = {}      # plugin_id -> config/start error
-        self._queue: asyncio.Queue[tuple[str, str, str]] = asyncio.Queue()
+        self._queue: asyncio.Queue[tuple[str, str, dict]] = asyncio.Queue()
         self._worker: asyncio.Task[None] | None = None
         self._unsubscribe = None
 
@@ -111,6 +112,12 @@ class ChannelRuntime:
             except (asyncio.CancelledError, Exception):  # noqa: BLE001
                 pass
             self._worker = None
+            # The worker is gone; deliver whatever completions it did not reach so a finished run's
+            # reply is not silently dropped at shutdown. Bounded so stop() can never hang on a slow send.
+            try:
+                await asyncio.wait_for(self._drain_queue(), timeout=10.0)
+            except (asyncio.TimeoutError, Exception):  # noqa: BLE001
+                pass
         for plugin in list(self._plugins.values()):
             try:
                 await self.gateway.registry.stop(plugin.manifest.plugin_id)
@@ -164,20 +171,29 @@ class ChannelRuntime:
     # --- outbound (run.completed -> channel) ----------------------------------------------------
 
     def _on_event(self, envelope: Any) -> None:
-        # Synchronous bus listener: enqueue the completion; the async worker does the delivery.
+        # Synchronous bus listener: enqueue the completion; the async worker does the delivery. Carry
+        # the whole event data (not just the preview) so the worker can pick the right field per outcome.
         if envelope.type in (EventType.RUN_COMPLETED, EventType.RUN_FAILED):
-            text = (envelope.data or {}).get("result_preview", "")
-            self._queue.put_nowait((envelope.aggregate_id, envelope.type, text))
+            self._queue.put_nowait((envelope.aggregate_id, envelope.type, dict(envelope.data or {})))
 
     async def _deliver_loop(self) -> None:
         while True:
-            run_id, event_type, text = await self._queue.get()
+            run_id, event_type, data = await self._queue.get()
             try:
-                await self._deliver(run_id, event_type, text)
+                await self._deliver(run_id, event_type, data)
             except Exception as exc:  # noqa: BLE001 - an outbound failure is logged, never fatal
                 log_for_debugging(f"[CHANNELS] outbound for run {run_id} failed: {exc}")
 
-    async def _deliver(self, run_id: str, event_type: str, text: str) -> None:
+    async def _drain_queue(self) -> None:
+        """Deliver everything currently queued (used at shutdown so pending replies are not lost)."""
+        while not self._queue.empty():
+            run_id, event_type, data = self._queue.get_nowait()
+            try:
+                await self._deliver(run_id, event_type, data)
+            except Exception as exc:  # noqa: BLE001
+                log_for_debugging(f"[CHANNELS] drain outbound for run {run_id} failed: {exc}")
+
+    async def _deliver(self, run_id: str, event_type: str, data: dict) -> None:
         run = self._runs.get_run(run_id)
         if run is None or not run.conversation_id:
             return
@@ -187,19 +203,57 @@ class ChannelRuntime:
         account_id = binding.get("channel_account_id")
         if not account_id:
             return
-        body = text if event_type == EventType.RUN_COMPLETED else (text or "⚠️ the run failed.")
-        if not body:
-            return
-        await self.gateway.deliver(
-            account_id,
-            OutboundMessage(
-                delivery_id=f"dlv_{run_id}",  # one delivery per run — the delivery layer is idempotent on this
-                conversation_id=run.conversation_id,
-                run_id=run_id,
-                text=body,
-                final=True,
-            ),
-        )
+
+        if event_type == EventType.RUN_COMPLETED:
+            # Deliver the FULL result (persisted out of the event), falling back to the bounded preview.
+            # An empty result still gets a completion ack so the chat isn't left hanging (#14).
+            body = self._runs.get_result(run_id) or data.get("result_preview") or "✓ done"
+        else:  # RUN_FAILED — the reason lives in data['error'] for exception failures, not result_preview.
+            reason = data.get("error") or data.get("result_preview") or "the run failed."
+            body = f"⚠️ {reason}"
+
+        chunks = self._chunk(body, self._max_chars_for(account_id))
+        for idx, chunk in enumerate(chunks):
+            await self.gateway.deliver(
+                account_id,
+                OutboundMessage(
+                    # one delivery per chunk; the delivery layer is idempotent per delivery_id.
+                    delivery_id=f"dlv_{run_id}_{idx}",
+                    conversation_id=run.conversation_id,
+                    run_id=run_id,
+                    text=chunk,
+                    final=True,  # each chunk is a complete message, never a skippable streaming partial.
+                ),
+            )
+
+    def _max_chars_for(self, account_id: str) -> int:
+        account = self.gateway.accounts.get(account_id)
+        plugin = self.gateway.registry.get(account.plugin_id) if account is not None else None
+        return getattr(getattr(plugin, "manifest", None), "max_message_chars", 3900) or 3900
+
+    @staticmethod
+    def _chunk(text: str, limit: int) -> list[str]:
+        """Split ``text`` into pieces of at most ``limit`` chars, preferring newline/space boundaries.
+
+        Lossless: every character lands in exactly one chunk (a boundary char is kept at a chunk's end).
+        """
+        text = text or ""
+        if len(text) <= limit:
+            return [text]
+        out: list[str] = []
+        i, n = 0, len(text)
+        while i < n:
+            end = min(i + limit, n)
+            if end < n:  # look for a nice boundary in the latter half of the window
+                window = text[i:end]
+                boundary = window.rfind("\n")
+                if boundary < limit // 2:
+                    boundary = window.rfind(" ")
+                if boundary >= limit // 2:
+                    end = i + boundary + 1
+            out.append(text[i:end])
+            i = end
+        return out
 
     # --- readiness ------------------------------------------------------------------------------
 

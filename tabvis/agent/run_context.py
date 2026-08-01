@@ -7,10 +7,10 @@ the transcript / browser-session / artifact / download paths from process-global
 (``switch_session``), which two concurrently-running agents can stomp on. A task-local RunContext
 lets each writer resolve its paths from *its own* Run instead.
 
-This module only establishes and carries the locator. Migrating each writer to read it (rather than
-the global session state) is incremental follow-up work; until a writer is converted, the transition
-mechanism remains ``switch_session`` with the resolver's resolved ``project_dir`` (which the Run
-context also records, so the two never disagree).
+This module establishes and carries the locator. Transcript reads/writes use it directly; migrating
+the remaining browser-session / artifact / download paths away from process-global state is
+incremental follow-up work. Until a writer is converted, the transition mechanism remains
+``switch_session`` with the resolver's resolved ``project_dir``.
 
 Pure and dependency-light: no I/O, no imports of the heavier runtime, so anything may read the
 current Run without a cycle.

@@ -12,8 +12,8 @@ from collections.abc import Iterator
 from typing import Any
 
 from tabvis.bootstrap_macro import MACRO
+from tabvis.bootstrap.state import get_session_id
 from tabvis.constants.messages import NO_CONTENT_MESSAGE
-from tabvis.agent.api.client import get_session_id
 from tabvis.tool import Tools
 
 SYNTHETIC_MESSAGES = {NO_CONTENT_MESSAGE}

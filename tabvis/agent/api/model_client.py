@@ -8,16 +8,20 @@ Implements the streaming happy path (``query_model_with_streaming``):
   ``uuid``, ``timestamp``; snake inner wire keys) and yields it;
 * at ``message_delta`` it ``update_usage``s and **mutates the last message's usage/stop_reason
   in place** (the envelope is a plain dict), then yields refusal / max_tokens / context-window
-  ``create_assistant_api_error_message`` (assistant envelopes), never the system sentinel here.
+  ``create_assistant_api_error_message`` (assistant envelopes);
+* the provider stream is drained inside the retry boundary with first-meaningful-output and
+  meaningful-progress watchdogs, so empty SSE heartbeats cannot keep a stuck Run alive.
 
 Retries go through ``with_retry`` (RetryError/RetryResult protocol). Not implemented in this
-build: non-streaming fallback recovery, idle watchdog, advisor/research, cost accounting, betas,
+build: non-streaming fallback recovery, advisor/research, cost accounting, betas,
 context-management/output-config params, ant-only paths.
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import inspect
 import os
 import uuid
 from collections.abc import AsyncGenerator, Awaitable, Callable
@@ -25,10 +29,13 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 
-import httpx
-
 from tabvis.agent.api.empty_usage import empty_usage
 from tabvis.agent.api.providers import get_model_gateway, resolve_provider_name
+from tabvis.agent.api.stream_timeout import (
+    ModelStreamTimeoutError,
+    get_first_event_timeout_seconds,
+    get_idle_timeout_seconds,
+)
 from tabvis.agent.api.errors import (
     API_ERROR_MESSAGE_PREFIX,
     get_assistant_message_from_error,
@@ -56,38 +63,36 @@ from tabvis.utils.messages import (
 from tabvis.utils.model.model import get_model_supports_vision, normalize_model_string_for_api
 from tabvis.utils.system_prompt_type import SystemPrompt
 from tabvis.utils.thinking import DISABLED_THINKING, ThinkingConfig
+from tabvis.utils.tool_search import (
+    extract_discovered_tool_names,
+    is_tool_search_enabled,
+)
 
-DEFAULT_MAX_OUTPUT_TOKENS = 8192
+DEFAULT_MAX_OUTPUT_TOKENS = 32_000
 
 
-def get_max_output_tokens() -> int:
+def get_max_output_tokens(model: str | None = None) -> int:
+    """Resolve the per-request output budget.
+
+    An explicit environment override always wins.  Otherwise use the selected model's advertised
+    default instead of the old fixed 8k budget.  The fixed budget was too small for otherwise valid
+    long tool inputs (for example, writing a research report): the provider stopped midway through
+    the streamed JSON and the agent retried the same incomplete tool call forever.
+    """
     raw = os.environ.get("TABVIS_MAX_OUTPUT_TOKENS")
     if raw:
         try:
             return int(raw)
         except ValueError:
             pass
+    if model:
+        return get_model_max_output_tokens(model)["default"]
     return DEFAULT_MAX_OUTPUT_TOKENS
 
 
-DEFAULT_STREAM_IDLE_TIMEOUT_S = 90.0
-
-
 def _stream_idle_timeout_s() -> float:
-    """Max seconds to wait for the NEXT SSE part before treating the stream as stalled.
-
-    A proxy endpoint (GLM/DeepSeek) can hold a 200 stream open under load and stop emitting bytes — a
-    silent stall that raises no transport error, so without this the drain blocks up to the full httpx
-    read timeout (~600s) per attempt. Override via ``TABVIS_STREAM_IDLE_TIMEOUT`` (seconds)."""
-    raw = os.environ.get("TABVIS_STREAM_IDLE_TIMEOUT")
-    if raw:
-        try:
-            v = float(raw)
-            if v > 0:
-                return v
-        except ValueError:
-            pass
-    return DEFAULT_STREAM_IDLE_TIMEOUT_S
+    """Backward-compatible internal accessor for the progress-aware idle deadline."""
+    return get_idle_timeout_seconds()
 
 
 def _now_iso() -> str:
@@ -422,6 +427,192 @@ class _BufferedStream:
         return _gen()
 
 
+def _estimate_chars(value: Any, *, cap: int = 400_000) -> int:
+    """Cheap bounded request-size estimate used only to select the large-context TTFT budget."""
+    if value is None:
+        return 0
+    if isinstance(value, str):
+        return min(len(value), cap)
+    if isinstance(value, dict):
+        total = 0
+        for key, item in value.items():
+            total += len(str(key)) + _estimate_chars(item, cap=max(0, cap - total))
+            if total >= cap:
+                return cap
+        return total
+    if isinstance(value, (list, tuple)):
+        total = 0
+        for item in value:
+            total += _estimate_chars(item, cap=max(0, cap - total))
+            if total >= cap:
+                return cap
+        return total
+    return min(len(str(value)), cap)
+
+
+def _is_meaningful_stream_part(part: Any) -> bool:
+    """Whether a canonical Anthropic-shaped part represents usable model progress."""
+    ptype = getattr(part, "type", None)
+    if ptype == "content_block_start":
+        block = _as_dict(getattr(part, "content_block", None))
+        return bool(
+            block.get("type") == "tool_use" and (block.get("name") or block.get("id"))
+        )
+    if ptype == "content_block_delta":
+        delta = getattr(part, "delta", None)
+        return any(
+            bool(getattr(delta, field, None))
+            for field in ("text", "partial_json", "thinking", "signature")
+        )
+    if ptype == "message_delta":
+        return bool(getattr(getattr(part, "delta", None), "stop_reason", None))
+    return ptype == "message_stop"
+
+
+async def _await_or_abort(
+    awaitable: Awaitable[Any],
+    *,
+    timeout_seconds: float,
+    signal: AbortSignal | None,
+) -> Any:
+    """Await one provider operation with both a deadline and AbortSignal cancellation."""
+    if signal is not None and signal.aborted:
+        raise APIUserAbortError()
+    task = asyncio.ensure_future(awaitable)
+    abort_task = asyncio.ensure_future(signal.wait()) if signal is not None else None
+    waiters = {task}
+    if abort_task is not None:
+        waiters.add(abort_task)
+    try:
+        done, _ = await asyncio.wait(
+            waiters,
+            timeout=max(0.0, timeout_seconds),
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if task in done:
+            return task.result()
+        if abort_task is not None and abort_task in done:
+            raise APIUserAbortError()
+        raise TimeoutError
+    finally:
+        for pending in waiters:
+            if not pending.done():
+                pending.cancel()
+        for pending in waiters:
+            if pending is not task or not task.done():
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await pending
+
+
+async def _close_model_stream(stream: Any, stream_iter: Any | None = None) -> None:
+    """Best-effort close after timeout/cancellation so provider connections are not leaked."""
+    seen: set[int] = set()
+    for target in (stream_iter, stream):
+        if target is None or id(target) in seen:
+            continue
+        seen.add(id(target))
+        closer = getattr(target, "aclose", None) or getattr(target, "close", None)
+        if not callable(closer):
+            continue
+        with contextlib.suppress(Exception):
+            result = closer()
+            if inspect.isawaitable(result):
+                await result
+
+
+async def _drain_stream_with_watchdog(
+    stream: Any,
+    *,
+    first_event_timeout_seconds: float,
+    idle_timeout_seconds: float,
+    attempt: int,
+    signal: AbortSignal | None = None,
+    started_at: float | None = None,
+) -> list[Any]:
+    """Drain a provider stream while empty chunks/heartbeats do not reset its deadline."""
+    loop = asyncio.get_running_loop()
+    started = loop.time() if started_at is None else started_at
+    deadline = started + first_event_timeout_seconds
+    meaningful_seen = False
+    stream_iter = stream.__aiter__()
+    parts: list[Any] = []
+    try:
+        while True:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                phase = "idle" if meaningful_seen else "first_event"
+                timeout = idle_timeout_seconds if meaningful_seen else first_event_timeout_seconds
+                raise ModelStreamTimeoutError(
+                    phase=phase, timeout_seconds=timeout, attempt=attempt
+                )
+            try:
+                part = await _await_or_abort(
+                    stream_iter.__anext__(),
+                    timeout_seconds=remaining,
+                    signal=signal,
+                )
+            except StopAsyncIteration:
+                break
+            except TimeoutError as exc:
+                phase = "idle" if meaningful_seen else "first_event"
+                timeout = idle_timeout_seconds if meaningful_seen else first_event_timeout_seconds
+                raise ModelStreamTimeoutError(
+                    phase=phase, timeout_seconds=timeout, attempt=attempt
+                ) from exc
+            parts.append(part)
+            if _is_meaningful_stream_part(part):
+                meaningful_seen = True
+                deadline = loop.time() + idle_timeout_seconds
+        return parts
+    except BaseException:
+        await _close_model_stream(stream, stream_iter)
+        raise
+
+
+async def select_tools_for_model_request(
+    messages: list[dict[str, Any]],
+    tools: Tools,
+    options: Options,
+) -> list[Any]:
+    """Return the schemas that should be visible to the model on this request.
+
+    Execution still receives the complete registry. Only the API schema surface is reduced:
+    core tools and ToolSearch stay visible, while deferred tools become visible after a
+    ToolSearch result (or an earlier call) recorded their names. The selected set is reconstructed
+    from durable message history, so compaction/resume do not need process-local state.
+    """
+    if not tools:
+        return []
+
+    async def _empty_permission_context() -> Any:
+        from tabvis.tool import get_empty_tool_permission_context
+
+        return get_empty_tool_permission_context()
+
+    get_permission_context = (
+        options.get_tool_permission_context or _empty_permission_context
+    )
+    enabled = await is_tool_search_enabled(
+        options.model,
+        tools,
+        get_permission_context,
+        options.agents,
+        options.query_source,
+    )
+    if not enabled:
+        return list(tools)
+
+    from tabvis.agent.tools.tool_search_tool import is_deferred_tool
+
+    discovered = extract_discovered_tool_names(messages)
+    selected = [
+        tool
+        for tool in tools
+        if not is_deferred_tool(tool) or tool.name in discovered
+    ]
+    return selected
+
+
 async def query_model_with_streaming(
     *,
     messages: list[dict[str, Any]],
@@ -448,12 +639,17 @@ async def query_model_with_streaming(
         "model": options.model,
         "get_tool_permission_context": options.get_tool_permission_context,
     }
+    request_tools = await select_tools_for_model_request(messages, tools, options)
     tool_schemas = (
-        list(await asyncio.gather(*[tool_to_api_schema(t, tool_opts) for t in tools]))
-        if tools
+        list(
+            await asyncio.gather(
+                *[tool_to_api_schema(t, tool_opts) for t in request_tools]
+            )
+        )
+        if request_tools
         else []
     )
-    max_tokens = options.max_output_tokens_override or get_max_output_tokens()
+    max_tokens = options.max_output_tokens_override or get_max_output_tokens(options.model)
     # Defensive clamp: never request more than the model's advertised output ceiling. An over-cap
     # TABVIS_MAX_OUTPUT_TOKENS would otherwise be sent verbatim and rejected as a hard, non-retryable
     # 400 (a dead, output-less turn). For an unknown model tabvis's ceiling is 64000.
@@ -479,34 +675,45 @@ async def query_model_with_streaming(
     async def get_client() -> Any:
         return await gateway.get_client()
 
-    async def operation(client: Any, _attempt: int, ctx: RetryContext) -> Any:
+    estimated_input_chars = _estimate_chars(
+        {"messages": api_messages, "system": system_blocks, "tools": tool_schemas}
+    )
+    first_event_timeout_s = get_first_event_timeout_seconds(estimated_input_chars)
+    idle_timeout_s = get_idle_timeout_seconds()
+
+    async def operation(client: Any, attempt: int, ctx: RetryContext) -> Any:
         params = params_from_context(ctx)
         # The gateway turns these Anthropic request params into an Anthropic-shaped stream — a
         # passthrough for anthropic, an adapter translation for openai/gemini. All below is unchanged.
-        stream = await gateway.open_stream(client, params)
+        started_at = asyncio.get_running_loop().time()
+        try:
+            stream = await _await_or_abort(
+                gateway.open_stream(client, params),
+                timeout_seconds=first_event_timeout_s,
+                signal=signal,
+            )
+        except TimeoutError as exc:
+            raise ModelStreamTimeoutError(
+                phase="first_event",
+                timeout_seconds=first_event_timeout_s,
+                attempt=attempt,
+            ) from exc
         # Drain the stream *inside* the retry boundary. The anthropic SDK opens the HTTP stream
         # lazily — a mid-stream disconnect (httpx.RemoteProtocolError: "peer closed connection
         # without sending complete message body" / incomplete chunked read) is only raised while
         # iterating ``response.aiter_bytes()``, i.e. while consuming this stream, NOT at create()
         # time. By materializing here we let with_retry catch that transient error and retry the
         # whole request rather than letting it propagate out of the headless turn and crash the run.
-        # Drain part-by-part with an INACTIVITY watchdog. A proxy that holds the 200 stream open but
-        # stops emitting bytes is a silent stall (no transport error) that would otherwise block up to
-        # the full httpx read timeout. On idle, raise a retryable transport error so with_retry
-        # abandons the stuck stream and retries a fresh request instead of hanging.
-        idle_s = _stream_idle_timeout_s()
-        stream_iter = stream.__aiter__()
-        parts: list[Any] = []
-        while True:
-            try:
-                part = await asyncio.wait_for(stream_iter.__anext__(), timeout=idle_s)
-            except StopAsyncIteration:
-                break
-            except TimeoutError as exc:  # asyncio.wait_for idle timeout (alias of builtin in py3.11+)
-                raise httpx.ReadTimeout(
-                    f"stream idle for >{idle_s:.0f}s (no SSE part received)"
-                ) from exc
-            parts.append(part)
+        # The first-event deadline starts BEFORE open_stream, so slow response headers cannot consume
+        # one full timeout and then receive a second full timeout for the first useful SSE delta.
+        parts = await _drain_stream_with_watchdog(
+            stream,
+            first_event_timeout_seconds=first_event_timeout_s,
+            idle_timeout_seconds=idle_timeout_s,
+            attempt=attempt,
+            signal=signal,
+            started_at=started_at,
+        )
         return _BufferedStream(parts, getattr(stream, "request_id", None))
 
     retry_options = RetryOptions(

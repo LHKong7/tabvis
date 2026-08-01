@@ -34,6 +34,17 @@ def _ctx() -> Any:
     return SimpleNamespace(agent_id="agF", tool_use_id="tu_1")
 
 
+def _ctx_with_prompts(*prompts: str) -> Any:
+    return SimpleNamespace(
+        agent_id="agF",
+        tool_use_id="tu_1",
+        messages=[
+            {"type": "user", "message": {"content": prompt}}
+            for prompt in prompts
+        ],
+    )
+
+
 # --------------------------------------------------------------------------- classification
 
 
@@ -102,6 +113,97 @@ def test_workspace_write_allowed(tmp_path, monkeypatch: pytest.MonkeyPatch) -> N
     _patch_roots(monkeypatch, str(tmp_path), str(tmp_path / ".cfg"))
     d = evaluate_path("filesystem.write", "notes/a.md", _ctx(), {"file_path": "notes/a.md"})
     assert d["behavior"] == "allow"
+
+
+def test_research_request_requires_approval_before_workspace_write(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _patch_roots(monkeypatch, str(tmp_path), str(tmp_path / ".cfg"))
+    context = _ctx_with_prompts(
+        "比较 GitHub Actions 与 GitLab CI 的缓存方法，给出 YAML 和来源链接。"
+    )
+
+    decision = evaluate_path(
+        "filesystem.write",
+        "docs/comparison.md",
+        context,
+        {"file_path": "docs/comparison.md"},
+    )
+
+    assert decision["behavior"] == "ask"
+    assert decision["decisionReason"]["rule"] == "request-intent-read-only"
+    assert "did not authorize file changes" in decision["message"]
+
+
+def test_explicit_fix_request_keeps_workspace_write_allowed(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _patch_roots(monkeypatch, str(tmp_path), str(tmp_path / ".cfg"))
+    context = _ctx_with_prompts("检查当前项目的 bugs 并修复这些问题。")
+
+    decision = evaluate_path(
+        "filesystem.write",
+        "tabvis/fix.py",
+        context,
+        {"file_path": "tabvis/fix.py"},
+    )
+
+    assert decision["behavior"] == "allow"
+
+
+@pytest.mark.parametrize(
+    "prompt",
+    [
+        "把报告写到 docs/report.md，不要修改其他文件。",
+        "Write the report to docs/report.md, but do not modify any other files.",
+    ],
+)
+def test_explicit_target_write_with_other_files_guardrail_is_allowed(
+    tmp_path, monkeypatch: pytest.MonkeyPatch, prompt: str
+) -> None:
+    _patch_roots(monkeypatch, str(tmp_path), str(tmp_path / ".cfg"))
+    context = _ctx_with_prompts(prompt)
+
+    decision = evaluate_path(
+        "filesystem.write",
+        "docs/report.md",
+        context,
+        {"file_path": "docs/report.md"},
+    )
+
+    assert decision["behavior"] == "allow"
+
+
+def test_explicit_do_not_modify_overrides_mutation_words(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _patch_roots(monkeypatch, str(tmp_path), str(tmp_path / ".cfg"))
+    context = _ctx_with_prompts("Inspect the repository, but do not modify or create files.")
+
+    decision = evaluate_path(
+        "filesystem.write",
+        "notes.md",
+        context,
+        {"file_path": "notes.md"},
+    )
+
+    assert decision["behavior"] == "ask"
+
+
+def test_short_interaction_answer_inherits_previous_research_intent(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _patch_roots(monkeypatch, str(tmp_path), str(tmp_path / ".cfg"))
+    context = _ctx_with_prompts("Research a free family attraction.", "Osaka")
+
+    decision = evaluate_path(
+        "filesystem.write",
+        "travel.md",
+        context,
+        {"file_path": "travel.md"},
+    )
+
+    assert decision["behavior"] == "ask"
 
 
 def test_config_write_denied_in_all_modes(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:

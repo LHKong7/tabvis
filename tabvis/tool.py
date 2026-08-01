@@ -117,6 +117,14 @@ class ToolUseContext:
     append_system_message: Callable[[Any], None] | None = None
     send_os_notification: Callable[[dict[str, Any]], None] | None = None
     agent_id: str | None = None
+    # Immutable, trusted run identity. These values are populated by the CLI/Gateway composition
+    # root, never from model tool input. Managed authentication uses them to enrich the Agent-visible
+    # ``credential_profile_id`` into the Broker's internal AuthenticationRequest.
+    principal_id: str | None = None
+    session_id: str | None = None
+    run_id: str | None = None
+    browser_session_id: str | None = None
+    authentication_service: Any = None
     agent_type: str | None = None
     tool_use_id: str | None = None
     user_modified: bool | None = None
@@ -207,6 +215,10 @@ class Tool:
     is_mcp: bool = False
     is_lsp: bool = False
     mcp_info: dict[str, str] | None = None
+    # When True, the DLP egress gateway keeps its fail-closed secret/canary block but skips the
+    # mutating identifier/URL redaction on this tool's result, because the model must see the bytes
+    # verbatim (e.g. Read/Edit, whose result is matched back against the real on-disk file).
+    dlp_verbatim_result: bool = False
 
     # --- required behavior ---
     async def call(

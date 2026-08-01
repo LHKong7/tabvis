@@ -84,21 +84,21 @@ SETTINGS: tuple[Setting, ...] = (
             "~/tabvis-downloads"),
 
     # Request pacing — keep the agent a polite client so a rapid navigate/click loop can't burst or
-    # DoS a server. Only navigations and clicks to a REAL remote host are paced; localhost and
-    # host-less URLs (data:, about:blank) are exempt.
+    # DoS a server. Per-host limits exempt localhost/host-less URLs; the small global action gap
+    # still keeps native pointer/keyboard operations from firing in a machine-gun burst.
     Setting("TABVIS_BROWSER_MIN_REQUEST_INTERVAL_MS", "Min request interval (ms)", "Browser", "number",
             "Minimum gap between navigations/clicks to the SAME host. 0 disables per-host pacing.",
-            "1000", default="1000"),
+            "1500", default="1500"),
     Setting("TABVIS_BROWSER_MAX_REQUESTS_PER_MINUTE", "Max requests/min per host", "Browser", "number",
-            "Hard per-host burst ceiling (a token bucket over a 60s window). 0 = no ceiling.",
-            "0", default="0"),
+            "Hard per-host rolling ceiling over 60 seconds. 0 = no ceiling.",
+            "12", default="12"),
     Setting("TABVIS_BROWSER_MIN_ACTION_INTERVAL_MS", "Min action interval (ms)", "Browser", "number",
             "Minimum gap between ANY two browser actions (navigate/click/type), across all agents. "
             "0 disables. Use this to stop machine-gun clicking regardless of host.",
-            "0", default="0"),
+            "120", default="120"),
     Setting("TABVIS_BROWSER_REQUEST_JITTER_MS", "Request jitter (ms)", "Browser", "number",
             "Random 0..N ms added to each paced slot so concurrent agents don't fire in lockstep.",
-            "0", default="0"),
+            "250", default="250"),
 
     # Stealth — read only when the engine is 'cloak'. The license key is a `secret`: like the API
     # key it is write-only, so the console can set it but no endpoint ever reads it back.
@@ -110,8 +110,8 @@ SETTINGS: tuple[Setting, ...] = (
             "password. cloak engine only.",
             "http://user:pass@host:8080"),
     Setting("TABVIS_BROWSER_HUMANIZE", "Humanize", "Stealth", "bool",
-            "Human-like mouse curves and keystroke timing. Beats behavioural detectors, but makes "
-            "every click and keypress slower. cloak engine only.",
+            "Cloak-only advanced mouse curves and keystroke timing on top of the default native "
+            "mouse/keyboard event path. Adds latency.",
             default="0"),
     Setting("TABVIS_BROWSER_GEOIP", "Match locale to proxy", "Stealth", "bool",
             "Derive timezone/locale from the proxy's exit IP, so a browser routed through Berlin "
@@ -165,7 +165,7 @@ SETTINGS: tuple[Setting, ...] = (
     Setting("TABVIS_DEFAULT_HAIKU_MODEL", "Haiku-tier model", "Model", "text",
             "Repoint the Fast/Haiku tier to your endpoint's model id.", ""),
     Setting("TABVIS_MAX_OUTPUT_TOKENS", "Max output tokens", "Model", "number",
-            "max_tokens per request. Blank = 8192.", "8192"),
+            "max_tokens per request. Blank = the selected model's default.", "32000"),
     Setting("TABVIS_OPENAI_API_KEY", "OpenAI API key", "Model", "secret",
             "OpenAI-compatible provider key (or OPENAI_API_KEY). Write-only: never sent back.", "sk-…"),
     Setting("TABVIS_OPENAI_BASE_URL", "OpenAI base URL", "Model", "text",

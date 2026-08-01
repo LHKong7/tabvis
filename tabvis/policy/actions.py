@@ -21,6 +21,7 @@ ACTIONS: tuple[str, ...] = (
     "browser.upload",
     "network.request",
     "shell.execute",
+    "environment.install",
     "credential.use",
     "clipboard.read",
     "clipboard.write",

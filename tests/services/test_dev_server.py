@@ -1,12 +1,13 @@
-"""--serve --dev wiring: web/ location, proxy target, and route table (prod path unchanged)."""
+"""Web console wiring for bundled production assets and the Vite development proxy."""
 
 from __future__ import annotations
 
 import os
+from pathlib import Path
 
 from starlette.routing import Route
 
-from tabvis.browser import dev_server
+from tabvis.browser import dev_server, server, web_console
 from tabvis.browser.server import create_app
 
 
@@ -33,24 +34,72 @@ def _paths(app) -> list[str]:
     return [r.path for r in app.routes if isinstance(r, Route)]
 
 
-def test_prod_app_no_catchall() -> None:
+def test_static_dir_defaults_to_packaged_bundle() -> None:
+    assert web_console.static_dir() == Path(server.__file__).with_name("static")
+
+
+def test_static_dir_uses_web_dir_override(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("TABVIS_WEB_DIR", str(tmp_path / "web"))
+    assert web_console.static_dir() == tmp_path / "web" / "dist"
+
+
+def _built_console(monkeypatch, tmp_path) -> Path:
+    web = tmp_path / "web"
+    dist = web / "dist"
+    assets = dist / "assets"
+    assets.mkdir(parents=True)
+    (dist / "index.html").write_text(
+        '<!doctype html><html><body><div id="root">Tabvis console</div></body></html>',
+        encoding="utf-8",
+    )
+    (assets / "app.js").write_text('globalThis.tabvisConsole = true;\n', encoding="utf-8")
+    monkeypatch.setenv("TABVIS_WEB_DIR", str(web))
+    return dist
+
+
+def test_prod_app_adds_static_spa_catchall() -> None:
     app = create_app(dev=False)
     paths = _paths(app)
     assert "/" in paths
-    assert "/{path:path}" not in paths  # no Vite catch-all in production
+    assert "/{path:path}" in paths
 
 
-def test_prod_root_is_api_pointer_not_ui() -> None:
-    """Headless: GET / returns a JSON pointer to how to get a console, not a page."""
+def test_prod_serves_root_assets_and_spa_routes(monkeypatch, tmp_path) -> None:
     from starlette.testclient import TestClient
 
+    _built_console(monkeypatch, tmp_path)
     app = create_app(dev=False)
     with TestClient(app) as client:
-        r = client.get("/")
-    assert r.status_code == 404
-    body = r.json()
-    assert body["ui"].startswith("none")
-    assert any("--dev" in s for s in body["get_a_console"])
+        root = client.get("/")
+        asset = client.get("/assets/app.js")
+        spa = client.get("/sessions/run-123")
+        missing_asset = client.get("/assets/missing.js")
+        health = client.get("/health")
+        missing_api = client.get("/v1/not-mounted")
+
+    assert root.status_code == 200
+    assert root.headers["content-type"].startswith("text/html")
+    assert "Tabvis console" in root.text
+    assert "no-cache" in root.headers["cache-control"]
+    assert asset.status_code == 200
+    assert "tabvisConsole" in asset.text
+    assert spa.status_code == 200
+    assert "Tabvis console" in spa.text
+    assert missing_asset.status_code == 404
+    assert health.status_code == 200
+    assert health.json()["status"] == "ok"  # API route wins over the SPA catch-all
+    assert missing_api.status_code == 404  # unknown API paths never receive the SPA shell
+
+
+def test_prod_reports_missing_bundle(monkeypatch, tmp_path) -> None:
+    from starlette.testclient import TestClient
+
+    monkeypatch.setenv("TABVIS_WEB_DIR", str(tmp_path / "missing-web"))
+    app = create_app(dev=False)
+    with TestClient(app) as client:
+        response = client.get("/")
+    assert response.status_code == 503
+    assert "npm run build" in response.text
 
 
 def test_dev_app_adds_vite_catchall() -> None:
@@ -63,3 +112,13 @@ def test_dev_app_adds_vite_catchall() -> None:
     assert root.endpoint is dev_server.proxy_to_vite
     # API routes still present and NOT proxied
     assert "/health" in paths and "/agent" in paths
+
+
+def test_blocking_server_treats_keyboard_interrupt_as_clean_shutdown(monkeypatch) -> None:
+    def interrupted(coroutine):
+        coroutine.close()
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(server.asyncio, "run", interrupted)
+
+    server.serve()

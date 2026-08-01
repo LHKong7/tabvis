@@ -22,6 +22,7 @@ network command falls to ``ask`` and can be granted per host.
 from __future__ import annotations
 
 import os
+import re
 import shlex
 from typing import Any
 
@@ -45,6 +46,17 @@ _TRUTHY = frozenset({"1", "true", "yes", "on"})
 _NETWORK_BINS = frozenset({"curl", "wget", "nc", "ncat", "netcat", "telnet", "ftp", "sftp", "scp", "ssh", "rsync"})
 
 _RESTRICTIVENESS = {"deny": 3, "ask": 2, "passthrough": 1, "allow": 0}
+
+_PACKAGE_INSTALL = re.compile(
+    r"(?:^|(?:&&|\|\||;|\|)\s*)"
+    r"(?:sudo\s+)?(?:"
+    r"(?:python(?:\d+(?:\.\d+)?)?\s+-m\s+)?pip(?:\d+)?\s+install\b|"
+    r"uv\s+(?:pip\s+install|add|sync|tool\s+install)\b|"
+    r"(?:npm|pnpm|yarn|bun)\s+(?:install|add|i|ci)\b|"
+    r"(?:brew|apt|apt-get|dnf|yum|pacman)\s+install\b"
+    r")",
+    re.IGNORECASE,
+)
 
 
 def is_bash_strict() -> bool:
@@ -92,6 +104,10 @@ def _checks(command: str) -> list[tuple[str, str]]:
     """The (action, resource) pairs a command must clear: shell.execute plus any network targets."""
     checks: list[tuple[str, str]] = [("shell.execute", f"shell:{_command_root(command)}")]
     checks += [("network.request", res) for res in _network_targets(command)]
+    if _PACKAGE_INSTALL.search(command.strip()):
+        # Standard mode has no allow baseline for this action, so it resolves to ask. Trusted mode
+        # remains allow and locked remains deny; settings/grants can scope an explicit decision.
+        checks.append(("environment.install", f"package:{_command_root(command) or 'unknown'}"))
     return checks
 
 
@@ -111,7 +127,7 @@ def _to_permission_decision(effect: str, rule_id: str | None, action: str, resou
             "behavior": "ask",
             "message": (
                 f"Tabvis wants to run a command requiring {action} on {resource} under the current "
-                f"permission policy. Approving is remembered for this agent (scoped grant)."
+                f"permission policy. Review the exact command before allowing it."
             ),
             "updatedInput": input,
             "decisionReason": {"type": "rule", "rule": rule_id, "action": action, "resource": resource},

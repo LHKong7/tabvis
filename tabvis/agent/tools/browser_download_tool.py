@@ -23,7 +23,10 @@ session, so cookies and logins apply.
 Usage:
  - Pass the direct file `url`. The saved path is returned; then call the Read tool on that path.
  - Ordinary browser downloads (a click that triggers a download) and navigating to a PDF are ALSO
-   captured to the workspace automatically — you only need this tool for an explicit URL."""
+   captured to the workspace automatically — you only need this tool for an explicit URL.
+ - In a non-interactive run, if this explicit download requires approval, do not retry it. For a
+   direct PDF URL already found on the page, use BrowserNavigate instead; the PDF navigation is
+   captured and its readable workspace path is announced in the returned snapshot."""
 
 
 class BrowserDownloadInput(BaseModel):

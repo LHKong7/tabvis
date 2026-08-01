@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import type { AgentSummary, HealthConfig } from '../types'
-import { api } from '../api'
+import { api, apiErrorMessage } from '../api'
 
 interface Props {
   onLaunched: (body: Record<string, unknown>, setErr: (e: string) => void) => void
@@ -53,7 +53,7 @@ export function NewRun({ onLaunched, busy, ready, agents, config, runOn, onRunOn
     setEngineBusy(true)
     const { ok, body } = await api.saveConfig({ TABVIS_BROWSER_ENGINE: next })
     setEngineBusy(false)
-    if (!ok) return setErr(body.error || 'could not switch browser')
+    if (!ok) return setErr(apiErrorMessage(body, 'could not switch browser'))
     onEngineChanged?.()
   }
 
@@ -75,7 +75,7 @@ export function NewRun({ onLaunched, busy, ready, agents, config, runOn, onRunOn
             <option value="">New agent (fresh session + browser)</option>
             {agents.map((a) => (
               <option key={a.agent_id} value={a.agent_id}>
-                Continue {a.agent_id} · {a.status} · {a.prompt.slice(0, 40)}
+                Continue {a.agent_id} · {a.status} · {(a.prompt || 'previous run').slice(0, 40)}
               </option>
             ))}
           </select>

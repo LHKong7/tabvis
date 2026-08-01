@@ -89,6 +89,60 @@ def test_to_inbound_ignores_own_and_non_text() -> None:
     assert ch._to_inbound(callback) is None
 
 
+def test_allowed_users_allowlist_is_enforced() -> None:
+    # Bug #2: when an allowlist is configured, only listed user ids may drive the bot.
+    cfg = TelegramConfig(bot_token="123:ABC", channel_account_id=ACCOUNT, allowed_users=("111",))
+    ch = TelegramChannel(cfg, client=_FakeClient())
+    assert ch._to_inbound(_update(1, 500, "hi", user_id=111)) is not None  # listed user accepted
+    assert ch._to_inbound(_update(2, 500, "hi", user_id=222)) is None       # unlisted user dropped
+
+
+def test_poll_loop_survives_a_transient_error() -> None:
+    # Bug #12: a single transient getUpdates error must not permanently kill the long-poll loop — it
+    # backs off and retries, so the channel keeps working.
+    async def scenario() -> None:
+        class _FlakyClient:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            async def get_me(self) -> dict:
+                return {"id": 999, "is_bot": True, "username": "mybot"}
+
+            async def get_updates(self, *, offset=None, timeout=30) -> list[dict]:
+                self.calls += 1
+                if self.calls == 1:
+                    raise RuntimeError("network blip")
+                if self.calls == 2:
+                    return [_update(500, 111, "after recovery")]
+                await asyncio.Event().wait()  # park so the loop stays alive for stop()
+                return []  # pragma: no cover
+
+            async def send_message(self, chat_id, text, *, reply_to_message_id=None) -> str:
+                return "1"
+
+            async def aclose(self) -> None:
+                pass
+
+        gw = ChannelGateway()
+        flaky = _FlakyClient()
+        ch = TelegramChannel(_config(), client=flaky)  # live path (no source) → the real poll loop runs
+        gw.register_plugin(ch)
+        gw.register_account(ChannelAccount(channel_account_id=ACCOUNT, plugin_id="telegram"))
+        await gw.start_plugin("telegram")
+
+        received: list = []
+        for _ in range(300):
+            await asyncio.sleep(0.02)
+            received = [e for e in get_event_store().read() if e.type == EventType.CONVERSATION_MESSAGE_RECEIVED]
+            if received:
+                break
+        assert len(received) == 1  # recovered from the blip and ingested the next update
+        assert flaky.calls >= 2    # it retried after the transient error
+        await gw.registry.stop("telegram")
+
+    asyncio.run(scenario())
+
+
 # --- end to end through the gateway ------------------------------------------------------------
 
 

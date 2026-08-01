@@ -19,6 +19,7 @@ what actually keeps secrets out. A regex pass is not a licence to relax that iso
 
 from __future__ import annotations
 
+import threading
 from collections.abc import Callable
 from datetime import datetime, timezone
 
@@ -69,7 +70,7 @@ class DLPGateway:
     def __init__(self, *, on_secret_blocked: Callable[[DLPBlockEvent], None] | None = None) -> None:
         self._on_blocked = on_secret_blocked
 
-    def scrub(self, surface: str, payload: object) -> DLPDecision:
+    def scrub(self, surface: str, payload: object, *, rewrite: bool = True) -> DLPDecision:
         # 1. forbidden-object check: a secret-bearing object must never be serialized outward (§11.2).
         if _contains_forbidden_object(payload):
             return self._block(surface, fingerprint="forbidden-object")
@@ -80,8 +81,13 @@ class DLPGateway:
             if fp is not None:
                 return self._block(surface, fingerprint=fp)
 
-        # 3. format-based redaction.
-        return DLPDecision(surface=surface, blocked=False, payload=_deep_clean(payload))
+        # 3. format-based redaction.  The fail-closed secret defense above (steps 1-2) always runs;
+        # ``rewrite=False`` skips only the *mutating* identifier/URL/header rewrite for surfaces that
+        # must round-trip bytes verbatim — e.g. a file Read/Edit tool result whose content the model
+        # has to reproduce exactly to build a matching ``old_string``.  Masking that content would
+        # corrupt the model's view and silently break the Read->Edit workflow.
+        payload_out = _deep_clean(payload) if rewrite else payload
+        return DLPDecision(surface=surface, blocked=False, payload=payload_out)
 
     def _block(self, surface: str, *, fingerprint: str) -> DLPDecision:
         if self._on_blocked is not None:
@@ -110,6 +116,8 @@ def _contains_forbidden_object(payload: object) -> bool:
         )
     if isinstance(payload, (list, tuple, set)):
         return any(_contains_forbidden_object(v) for v in payload)
+    if isinstance(payload, BaseModel):
+        return _contains_forbidden_object(payload.model_dump())
     return False
 
 
@@ -124,14 +132,21 @@ def _iter_strings(payload: object):
     elif isinstance(payload, (list, tuple, set)):
         for v in payload:
             yield from _iter_strings(v)
+    elif isinstance(payload, BaseModel):
+        yield from _iter_strings(payload.model_dump())
 
 
 def _deep_clean(payload: object) -> object:
+    if isinstance(payload, BaseModel):
+        return _deep_clean(payload.model_dump())
     if isinstance(payload, str):
         return mask_identifiers(payload)
     if isinstance(payload, dict):
-        # header-shaped dicts: redact credential headers by name
-        cleaned = redact_headers(payload) if _looks_like_headers(payload) else redact_mapping(payload)
+        # Always apply sensitive-key redaction. Header-shaped payloads need the header allowlist too:
+        # choosing one or the other allowed ``x-api-key`` through in mixed dictionaries.
+        cleaned = redact_mapping(payload)
+        if _looks_like_headers(payload):
+            cleaned = redact_headers(cleaned)
         out: dict = {}
         for key, value in cleaned.items():
             if isinstance(key, str) and key.lower() in _URL_KEYS and isinstance(value, str):
@@ -148,4 +163,24 @@ def _deep_clean(payload: object) -> object:
 
 def _looks_like_headers(payload: dict) -> bool:
     keys = {k.lower() for k in payload.keys() if isinstance(k, str)}
-    return bool(keys & {"cookie", "set-cookie", "authorization", "proxy-authorization"})
+    return bool(keys & {"cookie", "set-cookie", "authorization", "proxy-authorization", "x-api-key"})
+
+
+_gateway_lock = threading.RLock()
+_gateway: DLPGateway | None = None
+
+
+def get_dlp_gateway() -> DLPGateway:
+    """Process-wide egress gateway used by model/transcript/audit integration points."""
+    global _gateway
+    with _gateway_lock:
+        if _gateway is None:
+            _gateway = DLPGateway()
+        return _gateway
+
+
+def set_dlp_gateway(gateway: DLPGateway | None) -> None:
+    """Replace/reset the process-wide gateway (tests and managed deployments)."""
+    global _gateway
+    with _gateway_lock:
+        _gateway = gateway

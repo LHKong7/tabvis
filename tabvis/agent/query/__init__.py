@@ -23,6 +23,7 @@ from tabvis.agent.query.deps import QueryDeps, production_deps
 from tabvis.agent.tool_services.tool_orchestration import run_tools
 from tabvis.tool import ToolUseContext
 from tabvis.types.can_use_tool import CanUseToolFn
+from tabvis.utils.messages import create_user_message
 from tabvis.utils.system_prompt_type import SystemPrompt
 
 __all__ = ["Terminal", "production_deps", "query"]
@@ -64,6 +65,39 @@ def _is_api_error_turn(assistant_messages: list[dict[str, Any]]) -> bool:
     return any(isinstance(m, dict) and m.get("isApiErrorMessage") for m in assistant_messages)
 
 
+def _is_terminal_api_error_turn(assistant_messages: list[dict[str, Any]]) -> bool:
+    """Errors whose retry budget was already exhausted below the Agent loop."""
+    return any(
+        isinstance(message, dict)
+        and (
+            message.get("apiError") == "model_stream_timeout"
+            or message.get("error") == "model_stream_timeout"
+        )
+        for message in assistant_messages
+    )
+
+
+def _restore_research_evidence_after_compaction(
+    messages: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Re-inject durable BrowserExtract checkpoints after a lossy model summary.
+
+    Compaction intentionally replaces the live message list. Exact source URLs, dates, and numbers
+    must not depend on the summary model remembering them, so append a low-privilege user context
+    block rebuilt from the append-only browser artifact log.
+    """
+    try:
+        from tabvis.bootstrap.state import get_session_id
+        from tabvis.browser.artifacts import render_research_evidence_context
+
+        evidence = render_research_evidence_context(str(get_session_id()))
+        if evidence:
+            return [*messages, create_user_message(content=evidence, is_meta=True)]
+    except Exception:  # noqa: BLE001 - evidence recovery must never break compaction
+        pass
+    return messages
+
+
 async def query(params: QueryParams) -> AsyncGenerator[Any, None]:
     """Run the agent loop, yielding stream events + messages, ending with a :class:`Terminal`."""
     messages = list(params.messages)
@@ -102,7 +136,9 @@ async def query(params: QueryParams) -> AsyncGenerator[Any, None]:
             if "consecutiveFailures" in ac_result:
                 auto_compact_tracking["consecutiveFailures"] = ac_result["consecutiveFailures"]
             if ac_result.get("wasCompacted") and ac_result.get("compactionResult"):
-                messages = build_post_compact_messages(ac_result["compactionResult"])
+                messages = _restore_research_evidence_after_compaction(
+                    build_post_compact_messages(ac_result["compactionResult"])
+                )
                 auto_compact_tracking["compacted"] = True
         except Exception:  # noqa: BLE001 — fail-open: compaction must never crash the headless run
             from tabvis.utils.debug import log_for_debugging
@@ -110,6 +146,13 @@ async def query(params: QueryParams) -> AsyncGenerator[Any, None]:
             log_for_debugging(
                 "query(): auto-compaction failed; continuing with un-compacted messages"
             )
+
+        # Keep the tool context attached to the authoritative conversation list. ``ask`` builds the
+        # context before it seeds the first user message, and compaction may replace ``messages``
+        # with a new list later. Without this synchronization permission adapters see the context's
+        # initial empty list, so request-level constraints such as "do not modify files" cannot be
+        # enforced when the model calls a tool.
+        tool_use_context.messages = messages
 
         assistant_messages: list[dict[str, Any]] = []
         tool_use_blocks: list[dict[str, Any]] = []
@@ -135,7 +178,11 @@ async def query(params: QueryParams) -> AsyncGenerator[Any, None]:
             # api-error assistant message, no tool calls) is not the model choosing to stop. Give
             # such turns their own small budget: drop the internal sentinel and retry the model turn;
             # once that budget is exhausted, terminate normally.
-            if _is_api_error_turn(assistant_messages) and api_error_turns < _API_ERROR_TURN_LIMIT:
+            if (
+                _is_api_error_turn(assistant_messages)
+                and not _is_terminal_api_error_turn(assistant_messages)
+                and api_error_turns < _API_ERROR_TURN_LIMIT
+            ):
                 api_error_turns += 1
                 _drop = {id(m) for m in assistant_messages}
                 messages = [m for m in messages if id(m) not in _drop]

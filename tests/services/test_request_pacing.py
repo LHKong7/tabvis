@@ -11,7 +11,20 @@ import time
 
 import pytest
 
-from tabvis.browser.rate_limiter import RequestPacer, host_of
+from tabvis.browser.rate_limiter import (
+    DEFAULT_MAX_REQUESTS_PER_MINUTE,
+    DEFAULT_MIN_ACTION_INTERVAL_MS,
+    DEFAULT_MIN_REQUEST_INTERVAL_MS,
+    DEFAULT_REQUEST_JITTER_MS,
+    RequestPacer,
+    RequestPacingError,
+    host_of,
+)
+
+
+@pytest.fixture(autouse=True)
+def _deterministic_jitter(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("TABVIS_BROWSER_REQUEST_JITTER_MS", "0")
 
 
 @pytest.mark.parametrize(
@@ -103,20 +116,66 @@ def test_global_action_interval_applies_to_all(monkeypatch) -> None:
     assert _elapsed(two_actions) >= 0.18
 
 
-def test_requests_per_minute_ceiling(monkeypatch) -> None:
+def test_requests_per_minute_ceiling_fails_closed_above_wait_budget(monkeypatch) -> None:
     monkeypatch.setenv("TABVIS_BROWSER_MIN_REQUEST_INTERVAL_MS", "0")
     monkeypatch.setenv("TABVIS_BROWSER_MAX_REQUESTS_PER_MINUTE", "2")
-    monkeypatch.setenv("TABVIS_BROWSER_MAX_PACING_WAIT_MS", "300")  # cap the wait so the test is fast
+    monkeypatch.setenv("TABVIS_BROWSER_MAX_PACING_WAIT_MS", "300")
 
-    async def three_hits() -> float:
+    async def three_hits() -> None:
         p = RequestPacer()
         await p.pace("example.com", counts_as_request=True)  # 1
         await p.pace("example.com", counts_as_request=True)  # 2
-        t0 = time.monotonic()
-        await p.pace("example.com", counts_as_request=True)  # 3 -> over ceiling, waits (capped)
-        return time.monotonic() - t0
+        with pytest.raises(RequestPacingError, match="action was not sent"):
+            await p.pace("example.com", counts_as_request=True)
 
-    assert asyncio.run(three_hits()) >= 0.28  # hit the 300ms-capped ceiling wait
+    asyncio.run(three_hits())
+
+
+def test_future_reservations_do_not_pile_up_at_window_boundary(monkeypatch) -> None:
+    monkeypatch.setenv("TABVIS_BROWSER_MIN_REQUEST_INTERVAL_MS", "0")
+    monkeypatch.setenv("TABVIS_BROWSER_MIN_ACTION_INTERVAL_MS", "0")
+    monkeypatch.setenv("TABVIS_BROWSER_MAX_REQUESTS_PER_MINUTE", "2")
+    monkeypatch.setenv("TABVIS_BROWSER_MAX_PACING_WAIT_MS", "180000")
+
+    async def reserve_five() -> list[float]:
+        p = RequestPacer()
+
+        async def no_sleep(_seconds: float) -> None:
+            return None
+
+        monkeypatch.setattr(asyncio, "sleep", no_sleep)
+        for _ in range(5):
+            await p.pace("example.com", counts_as_request=True)
+        return list(p._host_hits["example.com"])
+
+    slots = asyncio.run(reserve_five())
+    assert slots[0] == pytest.approx(slots[1], abs=0.01)
+    assert slots[2] == pytest.approx(slots[0] + 60, abs=0.01)
+    assert slots[3] == pytest.approx(slots[1] + 60, abs=0.01)
+    assert slots[4] == pytest.approx(slots[2] + 60, abs=0.01)
+
+
+def test_safe_defaults_are_enabled() -> None:
+    assert DEFAULT_MIN_REQUEST_INTERVAL_MS == 1_500
+    assert DEFAULT_MAX_REQUESTS_PER_MINUTE == 12
+    assert DEFAULT_MIN_ACTION_INTERVAL_MS == 120
+    assert DEFAULT_REQUEST_JITTER_MS == 250
+
+
+def test_server_throttle_creates_shared_fail_closed_cooldown(monkeypatch) -> None:
+    monkeypatch.setenv("TABVIS_BROWSER_MIN_REQUEST_INTERVAL_MS", "1")
+    monkeypatch.setenv("TABVIS_BROWSER_MIN_ACTION_INTERVAL_MS", "0")
+    monkeypatch.setenv("TABVIS_BROWSER_MAX_REQUESTS_PER_MINUTE", "0")
+    monkeypatch.setenv("TABVIS_BROWSER_MAX_PACING_WAIT_MS", "100")
+
+    async def throttled() -> None:
+        p = RequestPacer()
+        assert await p.note_response("example.com", 429, "90") == 90
+        with pytest.raises(RequestPacingError, match="action was not sent"):
+            await p.pace("example.com", counts_as_request=True)
+        assert await p.note_response("example.com", 200) == 0
+
+    asyncio.run(throttled())
 
 
 def test_disabled_is_fast(monkeypatch) -> None:

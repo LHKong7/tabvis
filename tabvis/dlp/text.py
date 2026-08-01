@@ -30,7 +30,30 @@ _SENSITIVE_KEYS = re.compile(
     re.IGNORECASE,
 )
 _EMAIL = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
-_PHONE = re.compile(r"(?<!\d)(\+?\d[\d\-\s]{7,}\d)(?!\d)")
+# Do not start a phone match in a URL/path/query token.  The old digit-only boundary treated
+# opaque web identifiers as phone numbers, so paths such as ``/document-1991237455038119936`` and
+# ``/Archives/edgar/data/1577551/...`` were rewritten to ``[redacted]`` before the browser result
+# reached the model.  A later digit cannot become a partial match because the preceding character
+# is itself a digit.  Natural-language phone numbers (including the formatted form covered by the
+# policy) still match.
+_PHONE = re.compile(
+    r"(?<![\w/=?#&.\-])"
+    # ISO calendar dates are public facts, not identifiers. Keep this guard adjacent to the phone
+    # pattern so a date at the start of a sentence is not redacted merely because it has ten digits.
+    r"(?!\d{4}-\d{2}-\d{2}(?!\d))"
+    r"(\+?\d[\d\-\s]{7,}\d)"
+    # Trailing boundary: reject a digit run that continues into a URL/path token, but NOT one that
+    # merely ends a sentence.  ``.`` is deliberately excluded here — the leading lookbehind already
+    # prevents starting a match inside a path, so a period after a number is sentence punctuation, and
+    # keeping it in this class silently let sentence-final phone numbers escape redaction.
+    r"(?![\w/?#&\-])"
+)
+_PUBLIC_TIMESTAMP_PREFIX = re.compile(
+    r"(?:(?:\"|'|`)?(?:[A-Za-z_][\w-]*\.)*"
+    r"(?:time|timestamp|generated|updated|created(?:_at)?|published(?:_at)?)"
+    r"(?:\"|'|`)?(?:\s*\([^)\n]{0,40}\))?(?:\"|'|`)?\s*[:=]\s*)$",
+    re.IGNORECASE,
+)
 
 REDACTED = "[redacted]"
 
@@ -48,7 +71,26 @@ def mask_identifiers(text: str) -> str:
     if not text:
         return text
     text = _EMAIL.sub(REDACTED, text)
-    text = _PHONE.sub(REDACTED, text)
+
+    def _mask_phone(match: re.Match[str]) -> str:
+        raw = match.group(0)
+        digits = re.sub(r"\D", "", raw)
+        # Browser tools often return rendered JSON as a text snapshot. A bare Unix timestamp under
+        # an explicit time-like key is public page data, not a telephone number. The model can render
+        # the same field as Markdown (for example ``properties.time (first feature): 178…``), so the
+        # narrowly-scoped prefix also accepts dotted field paths, backticks, and a short qualifier.
+        # The same digits under ``phone`` or without a time-field label remain redacted.
+        if raw == digits and len(digits) in {10, 13}:
+            prefix = match.string[max(0, match.start() - 64) : match.start()]
+            # Accessibility snapshots quote a JSON document as one string, so its inner quotes are
+            # escaped (``{\"time\":178…}``). Normalize only those quote escapes for the contextual
+            # key check; the returned text itself remains byte-for-byte unchanged.
+            normalized_prefix = prefix.replace('\\"', '"').replace("\\'", "'")
+            if _PUBLIC_TIMESTAMP_PREFIX.search(normalized_prefix):
+                return raw
+        return REDACTED
+
+    text = _PHONE.sub(_mask_phone, text)
     return text
 
 

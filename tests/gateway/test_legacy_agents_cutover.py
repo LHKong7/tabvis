@@ -59,6 +59,43 @@ def test_post_agent_streams_legacy_frames_from_a_gateway_run() -> None:
     assert "event: result" in text and "event: done" in text
 
 
+def test_model_retry_uses_existing_agent_sse_frame() -> None:
+    messages = [
+        {
+            "type": "model_retry",
+            "reason": "model_stream_timeout",
+            "retry_attempt": 1,
+            "max_retries": 1,
+            "retry_in_ms": 500,
+        },
+        *_msgs(),
+    ]
+    app, _ = _app_with_fake_launcher(messages)
+    response = TestClient(app).post("/agent", json={"prompt": "do it"})
+    assert response.status_code == 200
+    assert "event: agent" in response.text
+    assert "Model stream stalled" in response.text
+    assert '"status": "retrying"' in response.text
+
+
+def test_consecutive_model_retries_advance_the_attempt_label() -> None:
+    # Bug #4: while the run is already RETRYING, later model_retry sentinels were dropped, freezing the
+    # label at "1/M". Consecutive stalls (no assistant message between) must each surface their attempt.
+    messages = [
+        {"type": "model_retry", "reason": "model_stream_timeout",
+         "retry_attempt": 1, "max_retries": 3, "retry_in_ms": 500},
+        {"type": "model_retry", "reason": "model_stream_timeout",
+         "retry_attempt": 2, "max_retries": 3, "retry_in_ms": 500},
+        *_msgs(),
+    ]
+    app, _ = _app_with_fake_launcher(messages)
+    response = TestClient(app).post("/agent", json={"prompt": "do it"})
+    assert response.status_code == 200
+    assert "retrying 1/3" in response.text
+    assert "retrying 2/3" in response.text  # the second attempt is no longer dropped
+    assert "event: result" in response.text  # and the run still terminalizes normally
+
+
 def test_post_agent_then_list_and_read_from_gateway() -> None:
     app, gw = _app_with_fake_launcher(_msgs())
     client = TestClient(app)
@@ -66,9 +103,12 @@ def test_post_agent_then_list_and_read_from_gateway() -> None:
 
     listing = client.get("/agents").json()
     assert listing["count"] == 1 and listing["agents"][0]["agent_id"] == agent_id
+    assert listing["agents"][0]["prompt"] == "go"
+    assert listing["agents"][0]["result"] == "all done"
     detail = client.get(f"/agents/{agent_id}")
     assert detail.status_code == 200 and detail.json()["agent_id"] == agent_id
     assert detail.json()["status"] == "completed"
+    assert detail.json()["prompt"] == "go" and detail.json()["result"] == "all done"
 
 
 def test_post_agent_requires_prompt() -> None:
@@ -81,6 +121,38 @@ def test_reuse_unknown_agent_id_is_404() -> None:
     app, _ = _app_with_fake_launcher(_msgs())
     resp = TestClient(app).post("/agent", json={"prompt": "go", "agent_id": "ag_nope"})
     assert resp.status_code == 404
+
+
+def test_registered_zero_run_agent_can_start_its_first_run() -> None:
+    # Bug #1: existence is a property of the durable Agent, not of a prior Run. A registered agent that
+    # has never run must be able to start its first run instead of 404'ing (the register→run flow).
+    from tabvis.gateway.runtime.agents import get_agent_store
+
+    app, _ = _app_with_fake_launcher(_msgs())
+    get_agent_store().register("ag_zero", principal_id="ag_zero", model="m")
+    client = TestClient(app)
+    resp = client.post("/agent", json={"prompt": "first run", "agent_id": "ag_zero"})
+    assert resp.status_code == 200 and resp.headers["x-agent-id"] == "ag_zero"
+    # it actually ran (a fresh run, not a resume of nothing) → the projection reports completed.
+    assert client.get("/agents/ag_zero").json()["status"] == "completed"
+
+
+def test_completed_agent_continue_reuses_the_previous_session() -> None:
+    app, gw = _app_with_fake_launcher(_msgs())
+    client = TestClient(app)
+    first = client.post("/agent", json={"prompt": "first"})
+    assert first.status_code == 200
+    agent_id = first.headers["x-agent-id"]
+    first_run = gw.runs.latest_run_for_agent(agent_id)
+
+    continued = client.post("/agent", json={"prompt": "continue", "agent_id": agent_id})
+    assert continued.status_code == 200
+    second_run = gw.runs.latest_run_for_agent(agent_id)
+
+    assert first_run is not None and second_run is not None
+    assert second_run.run_id != first_run.run_id
+    assert second_run.session_id == first_run.session_id
+    assert second_run.prompt == "continue"
 
 
 def test_capacity_returns_429(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -99,6 +171,43 @@ def test_cancel_agent_through_the_gateway() -> None:
     RunStore().create_run(agent_id="ag_c", session_id="ses_c", command_id="cmd_c")
     resp = TestClient(app).post("/agents/ag_c/cancel")
     assert resp.status_code == 200 and resp.json()["status"] == "cancelled"
+
+
+def test_web_console_can_list_and_answer_an_agent_interaction() -> None:
+    app, gw = _app_with_fake_launcher(_msgs())
+    run = gw.runs.create_run(
+        agent_id="ag_question",
+        session_id="ses_question",
+        command_id="cmd_question",
+    )
+    gw.runs.transition(run.run_id, runs.PREPARING)
+    gw.runs.transition(run.run_id, runs.RUNNING)
+    interaction = gw.interactions.request(
+        run.run_id,
+        "question",
+        {
+            "tool": "AskUserQuestion",
+            "questions": [
+                {
+                    "question": "Which environment?",
+                    "options": [{"label": "Production"}, {"label": "Staging"}],
+                }
+            ],
+        },
+    )
+
+    client = TestClient(app)
+    pending = client.get("/agents/ag_question/interactions")
+    assert pending.status_code == 200
+    assert pending.json()["interactions"][0]["interaction_id"] == interaction.interaction_id
+
+    answered = client.post(
+        f"/agents/ag_question/interactions/{interaction.interaction_id}/responses",
+        json={"answers": {"Which environment?": "Staging"}},
+    )
+    assert answered.status_code == 200
+    assert answered.json()["interaction"]["status"] == "answered"
+    assert gw.runs.get_run(run.run_id).status == runs.RUNNING
 
 
 # --- real server, flag on: the read path is gateway-backed -------------------------------------
@@ -120,6 +229,48 @@ def test_server_flag_routes_agents_to_the_gateway(monkeypatch: pytest.MonkeyPatc
     assert any(a["agent_id"] == "ag_gw" for a in body["agents"])   # served from gateway Run data
     detail = client.get("/v1/agents/ag_gw").json()
     assert detail["status"] == "completed" and detail["run_id"] == run.run_id
+
+
+def test_zero_run_agent_artifacts_do_not_leak_the_default_session(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Bug #7: a zero-run agent has no session, so its artifacts endpoint must return empty — never fall
+    # back to the process's current session and disclose another agent's browsing trail.
+    monkeypatch.delenv("TABVIS_GATEWAY_AGENTS", raising=False)
+    from tabvis.bootstrap.state import get_session_id
+    from tabvis.browser import artifacts
+    from tabvis.browser.server import create_app
+    from tabvis.gateway.runtime.agents import get_agent_store
+
+    sid = str(get_session_id())  # the process's current/default session
+    artifacts._append_event_sync(
+        artifacts.get_artifacts_dir(sid),
+        {"type": "navigation", "url": "https://secret.example/dashboard"},
+    )
+    get_agent_store().register("ag_noart", principal_id="ag_noart")
+    client = TestClient(create_app(auth_required=False))
+    body = client.get("/agents/ag_noart/artifacts").json()
+    assert body["count"] == 0 and body["artifacts"] == []  # not the seeded default-session trail
+    # and a DOM fetch on the zero-run agent is a 404, not a peek into the default session's blobs.
+    assert client.get("/agents/ag_noart/artifacts?dom=dom/whatever.html").status_code == 404
+
+
+def test_quit_never_run_agent_reports_queued(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Bugs #16/#17: quit of a never-run agent must not falsely claim "cancelled" — it reports the same
+    # zero-run status GET /agents/{id} projects ("queued"), so the two endpoints agree.
+    monkeypatch.delenv("TABVIS_GATEWAY_AGENTS", raising=False)
+    from tabvis.browser import manager
+    from tabvis.browser.server import create_app
+    from tabvis.gateway.runtime.agents import get_agent_store
+
+    async def _quit(_agent_id: str) -> bool:
+        return False  # a never-run agent holds no browser
+
+    monkeypatch.setattr(manager, "quit_agent_browser", _quit)
+    get_agent_store().register("ag_neverran", principal_id="ag_neverran")
+    client = TestClient(create_app(auth_required=False))
+    quit_resp = client.post("/agents/ag_neverran/quit")
+    assert quit_resp.status_code == 200
+    assert quit_resp.json()["status"] == "queued"  # not a false "cancelled"
+    assert client.get("/agents/ag_neverran").json()["status"] == "queued"  # and GET agrees
 
 
 def test_registry_only_agent_is_invisible_after_retirement(monkeypatch: pytest.MonkeyPatch) -> None:

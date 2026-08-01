@@ -52,3 +52,26 @@ def test_toggles_are_independent() -> None:
     only_mem = _prompt(include_project_instructions=False)
     assert "PROJECT_INSTRUCTIONS_SENTINEL" not in only_mem
     assert "MEMORY_SENTINEL" in only_mem
+
+
+def test_information_requests_are_read_only_and_self_contained() -> None:
+    text = _prompt()
+    assert "Treat explain, answer, research, compare" in text
+    assert "Do not create a report file merely because the answer is long" in text
+    assert "put the complete core answer in your response" in text
+
+
+def test_browser_research_requires_field_and_year_grounding() -> None:
+    sections = asyncio.run(
+        prompts.get_system_prompt([_Tool("BrowserNavigate")], "m", None, None)
+    )
+    text = "\n".join(s for s in sections if s)
+    assert "explicit in the source, inferred, or not found" in text
+    assert "free admission does not by itself prove" in text
+    assert "recurring seasonal range with no year is not proof" in text
+    assert "an abstract page is discovery only" in text
+    assert "methods, data/experimental setup, results, limitations" in text
+    assert "pageCount, coverage status, and nextPages" in text
+    assert "native mouse/keyboard events" in text
+    assert "Research like a considerate human, not a crawler" in text
+    assert "After HTTP 403/429, a CAPTCHA" in text

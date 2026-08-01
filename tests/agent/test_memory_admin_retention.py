@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -56,9 +57,8 @@ def test_erase_is_physical() -> None:
     tid = snap.topics[0].id
     rev = store.commit(snap)
     MA.forget("principal_local", "ag_1", "topic", tid, erase=True)
-    import os
 
-    content = open(os.path.join(store._revision_dir(rev), "content.json"), encoding="utf-8").read()
+    content = Path(store._revision_dir(rev), "content.json").read_text(encoding="utf-8")
     assert "sensitive detail" not in content
 
 

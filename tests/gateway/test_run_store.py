@@ -19,9 +19,17 @@ def _finish(store: RunStore, run_id: str) -> None:
 
 def test_create_run_persists_and_emits_run_created() -> None:
     store = RunStore()
-    run = store.create_run(agent_id="ag_1", session_id="ses_1", command_id="cmd_1", model="m")
+    run = store.create_run(
+        agent_id="ag_1",
+        session_id="ses_1",
+        command_id="cmd_1",
+        model="m",
+        prompt="获取最新财报",
+    )
     assert run.run_id.startswith("run_")
-    assert store.get_run(run.run_id).status == runs.QUEUED
+    persisted = store.get_run(run.run_id)
+    assert persisted.status == runs.QUEUED
+    assert persisted.prompt == "获取最新财报"
     events = get_event_store().read(aggregate_id=run.run_id)
     assert [e.type for e in events] == [EventType.RUN_CREATED]
     assert events[0].scope.agent_id == "ag_1"

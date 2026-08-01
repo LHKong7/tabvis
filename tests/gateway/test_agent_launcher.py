@@ -20,7 +20,15 @@ from tabvis.gateway.runtime.run_store import RunStore
 
 def _assistant(text: str, tool_uses: int = 0) -> dict:
     content = [{"type": "text", "text": text}]
-    content += [{"type": "tool_use", "name": "click", "id": f"t{i}"} for i in range(tool_uses)]
+    content += [
+        {
+            "type": "tool_use",
+            "name": "BrowserExtract",
+            "id": f"t{i}",
+            "input": {"url": "https://example.test/document-1991237455038119936"},
+        }
+        for i in range(tool_uses)
+    ]
     return {"type": "assistant", "message": {"content": content}}
 
 
@@ -57,6 +65,105 @@ def test_launch_drives_run_to_completed_with_counters() -> None:
         assert "assistant.message.completed" in types
         assert "tool.completed" in types
         assert types[-1] == "run.completed"
+        tool_event = next(
+            e for e in get_event_store().read(aggregate_id=run.run_id)
+            if e.type == "tool.completed"
+        )
+        assert tool_event.data["name"] == "BrowserExtract"
+        assert tool_event.data["input"]["url"].endswith("1991237455038119936")
+
+    asyncio.run(scenario())
+
+
+def test_running_run_persists_live_counters_before_terminal() -> None:
+    async def scenario() -> None:
+        rs = RunStore()
+        observed = asyncio.Event()
+        release = asyncio.Event()
+
+        async def stream(run, context):
+            yield _assistant("working", tool_uses=2)
+            observed.set()
+            await release.wait()
+            yield _result("done")
+
+        launcher = AgentRunLauncher(run_store=rs, stream_fn=stream)
+        orch = RunOrchestrator(rs, launcher=launcher)
+        run = await orch.create_and_start(
+            agent_id="ag_live", session_id="ses_live", command_id="cmd_live", prompt="x"
+        )
+        await observed.wait()
+        await asyncio.sleep(0)
+        current = rs.get_run(run.run_id)
+        assert current.status == runs.RUNNING
+        assert current.turns == 1 and current.tool_calls == 2
+        release.set()
+        await launcher.join(run.run_id)
+
+    asyncio.run(scenario())
+
+
+def test_web_permission_gate_pauses_for_ask_user_question_and_resumes() -> None:
+    async def scenario() -> None:
+        from tabvis.agent.tools.ask_user_question_tool import (
+            AskUserQuestionInput,
+            ask_user_question_tool,
+        )
+        from tabvis.gateway.runtime.interaction_service import InteractionService
+        from tabvis.tool import ToolUseContext
+
+        rs = RunStore()
+        run = rs.create_run(
+            agent_id="ag_question",
+            session_id="ses_question",
+            command_id="cmd_question",
+        )
+        rs.transition(run.run_id, runs.PREPARING)
+        rs.transition(run.run_id, runs.RUNNING)
+        launcher = AgentRunLauncher(run_store=rs)
+        gate = launcher._interactive_can_use_tool(run)
+        tool_input = AskUserQuestionInput.model_validate(
+            {
+                "questions": [
+                    {
+                        "question": "Which environment?",
+                        "header": "Environment",
+                        "options": [
+                            {"label": "Production", "description": "Use production"},
+                            {"label": "Staging", "description": "Use staging"},
+                        ],
+                    }
+                ]
+            }
+        )
+
+        task = asyncio.create_task(
+            gate(
+                ask_user_question_tool,
+                tool_input,
+                ToolUseContext(),
+                {"type": "assistant"},
+                "tool_1",
+            )
+        )
+        service = InteractionService(run_store=rs)
+        for _ in range(20):
+            pending = service.list_pending()
+            if pending:
+                break
+            await asyncio.sleep(0)
+        assert pending and rs.get_run(run.run_id).status == runs.WAITING_FOR_INPUT
+        service.respond(
+            pending[0].interaction_id,
+            {"Which environment?": "Staging"},
+            response_command_id="cmd_answer",
+        )
+        decision = await task
+        assert decision["behavior"] == "allow"
+        assert decision["updatedInput"]["answers"] == {
+            "Which environment?": "Staging"
+        }
+        assert rs.get_run(run.run_id).status == runs.RUNNING
 
     asyncio.run(scenario())
 
@@ -70,6 +177,81 @@ def test_launch_records_a_failed_run_on_error_result() -> None:
         await launcher.join(run.run_id)
         final = rs.get_run(run.run_id)
         assert final.status == runs.FAILED and final.error_code == "agent_error"
+
+    asyncio.run(scenario())
+
+
+def test_model_timeout_retry_is_visible_and_preserves_specific_error_code() -> None:
+    async def scenario() -> None:
+        rs = RunStore()
+        messages = [
+            {
+                "type": "model_retry",
+                "reason": "model_stream_timeout",
+                "retry_attempt": 1,
+                "max_retries": 1,
+                "retry_in_ms": 500,
+            },
+            _assistant("Model response timed out."),
+            {
+                "type": "result",
+                "result": "Model response timed out.",
+                "is_error": True,
+                "error_code": "model_stream_timeout",
+            },
+        ]
+        launcher = _launcher(messages, rs)
+        orch = RunOrchestrator(rs, launcher=launcher)
+        run = await orch.create_and_start(
+            agent_id="ag_timeout",
+            session_id="ses_timeout",
+            command_id="cmd_timeout",
+            prompt="continue",
+        )
+        await launcher.join(run.run_id)
+
+        final = rs.get_run(run.run_id)
+        assert final.status == runs.FAILED
+        assert final.error_code == "model_stream_timeout"
+        events = get_event_store().read(aggregate_id=run.run_id)
+        retry = next(event for event in events if event.type == "run.retrying")
+        assert retry.data["retry_attempt"] == 1
+        assert "retrying 1/1" in retry.data["message"]
+        assert any(event.type == "run.resumed" for event in events)
+
+    asyncio.run(scenario())
+
+
+def test_retrying_run_can_be_cancelled() -> None:
+    async def scenario() -> None:
+        rs = RunStore()
+        retrying = asyncio.Event()
+        release = asyncio.Event()
+
+        async def stream(_run, _context):
+            yield {
+                "type": "model_retry",
+                "reason": "model_stream_timeout",
+                "retry_attempt": 1,
+                "max_retries": 1,
+                "retry_in_ms": 500,
+            }
+            retrying.set()
+            await release.wait()
+
+        launcher = AgentRunLauncher(run_store=rs, stream_fn=stream)
+        orch = RunOrchestrator(rs, launcher=launcher)
+        run = await orch.create_and_start(
+            agent_id="ag_retry_cancel",
+            session_id="ses_retry_cancel",
+            command_id="cmd_retry_cancel",
+            prompt="continue",
+        )
+        await retrying.wait()
+        await asyncio.sleep(0)
+        assert rs.get_run(run.run_id).status == runs.RETRYING
+        cancelled = await orch.cancel(run.run_id)
+        assert cancelled.status == runs.CANCELLED
 
     asyncio.run(scenario())
 

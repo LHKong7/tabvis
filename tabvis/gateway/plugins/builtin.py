@@ -12,8 +12,7 @@ proves is that heterogeneous mechanisms validate and run under one registry.
 
 from __future__ import annotations
 
-from tabvis import __version__ as TABVIS_VERSION
-from tabvis.gateway.plugins.contract import Plugin, PluginCandidate, PluginHealth
+from tabvis.gateway.plugins.contract import PluginCandidate, PluginHealth
 from tabvis.gateway.plugins.manifest import (
     KIND_BROWSER_ENGINE,
     KIND_CHANNEL,

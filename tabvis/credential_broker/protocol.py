@@ -14,6 +14,9 @@ import struct
 
 _LEN = struct.Struct(">I")
 _MAX_FRAME = 1 << 20  # 1 MiB — an authentication request/response is tiny; anything larger is rejected.
+# sockaddr_un commonly allows 104 bytes on macOS and 108 on Linux. Keeping the configured path at
+# or below 100 encoded bytes leaves room for the terminating NUL and remains portable.
+MAX_UNIX_SOCKET_PATH_BYTES = 100
 
 
 async def read_frame(reader: asyncio.StreamReader) -> bytes:

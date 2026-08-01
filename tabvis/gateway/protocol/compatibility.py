@@ -68,13 +68,19 @@ def _merge_durable_agent(view: dict[str, Any], agent: dict[str, Any] | None) -> 
     return view
 
 
-def project_run_as_agent(run: RunRecord, agent: dict[str, Any] | None = None) -> dict[str, Any]:
+def project_run_as_agent(
+    run: RunRecord,
+    agent: dict[str, Any] | None = None,
+    *,
+    result: str | None = None,
+) -> dict[str, Any]:
     """A legacy agent view = the durable Agent merged over its latest Run (design §9.8, §7.2)."""
     status = legacy_status(run.status)
     view = {
         "agent_id": run.agent_id,
         "session_id": run.session_id,
         "status": status,
+        "prompt": run.prompt,
         "model": run.model,
         "max_turns": run.max_turns,
         "turns": run.turns,
@@ -83,8 +89,7 @@ def project_run_as_agent(run: RunRecord, agent: dict[str, Any] | None = None) ->
         "started_at": run.started_at,
         "ended_at": run.ended_at,
         "duration_ms": _duration_ms(run),
-        # execution fields that moved onto the Run; text lives in messages/events now.
-        "result": None,
+        "result": result,
         "result_message_id": run.result_message_id,
         "error": run.error_code,
         "is_error": run.status in (runs.FAILED, runs.INTERRUPTED),
@@ -107,6 +112,7 @@ def project_agent_only(agent: dict[str, Any]) -> dict[str, Any]:
         "agent_id": agent.get("agent_id"),
         "session_id": None,
         "status": "queued",
+        "prompt": "",
         "model": agent.get("default_model"),
         "max_turns": agent.get("default_max_turns"),
         "turns": 0,
@@ -132,15 +138,20 @@ def project_agent_list(
     latest_runs: list[RunRecord],
     *,
     agents_by_id: dict[str, dict[str, Any]] | None = None,
+    results_by_run_id: dict[str, str | None] | None = None,
     status: str | None = None,
     limit: int | None = None,
 ) -> dict[str, Any]:
     """The legacy ``GET /agents`` envelope: each agent's latest Run merged with its durable Agent."""
     by_id = agents_by_id or {}
-    agents = [project_run_as_agent(r, by_id.get(r.agent_id)) for r in latest_runs]
+    by_run = results_by_run_id or {}
+    agents = [
+        project_run_as_agent(r, by_id.get(r.agent_id), result=by_run.get(r.run_id))
+        for r in latest_runs
+    ]
     if status:
         agents = [a for a in agents if a["status"] == status]
-    if limit:
+    if limit is not None and limit > 0:  # a 0 or negative limit is meaningless — return all
         agents = agents[:limit]
     return {"agents": agents, "count": len(agents)}
 
@@ -156,10 +167,38 @@ def legacy_frames_for(event: EventEnvelope) -> list[dict[str, Any]]:
 
     if et == EventType.RUN_CREATED:
         return [{"event": "agent", "data": {"agent_id": data.get("agent_id"), "run_id": run_id}}]
+    if et == EventType.RUN_RETRYING:
+        return [{
+            "event": "agent",
+            "data": {
+                "agent_id": event.scope.agent_id,
+                "run_id": run_id,
+                "status": "retrying",
+                "message": data.get("message") or "Model stalled · retrying",
+                "retry_attempt": data.get("retry_attempt"),
+                "max_retries": data.get("max_retries"),
+                "retry_in_ms": data.get("retry_in_ms"),
+            },
+        }]
     if et == EventType.ASSISTANT_MESSAGE_COMPLETED:
-        return [{"event": "assistant", "data": {"text": data.get("text_preview", ""), "turn": data.get("turn")}}]
+        text = data.get("text_preview", "")
+        return [{
+            "event": "assistant",
+            "data": {
+                "text": text,
+                "message": {"content": [{"type": "text", "text": text}]} if text else {"content": []},
+                "turn": data.get("turn"),
+            },
+        }]
     if et == EventType.TOOL_COMPLETED:
-        return [{"event": "tool_use", "data": {"turn": data.get("turn")}}]
+        return [{
+            "event": "tool_use",
+            "data": {
+                "turn": data.get("turn"),
+                "name": data.get("name") or "tool",
+                "input": data.get("input") or {},
+            },
+        }]
     if et == EventType.RUN_COMPLETED:
         return [
             {"event": "result", "data": {"result": data.get("result_preview", ""), "is_error": False}},

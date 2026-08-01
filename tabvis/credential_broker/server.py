@@ -22,7 +22,13 @@ import struct
 
 from tabvis.authentication.models import AuthenticationRequest, AuthenticationResult
 from tabvis.credential_broker.broker import CredentialBroker
-from tabvis.credential_broker.protocol import decode, encode, read_frame, write_frame
+from tabvis.credential_broker.protocol import (
+    MAX_UNIX_SOCKET_PATH_BYTES,
+    decode,
+    encode,
+    read_frame,
+    write_frame,
+)
 from tabvis.utils.debug import log_for_debugging
 
 
@@ -51,6 +57,11 @@ class BrokerServer:
         self._server: asyncio.AbstractServer | None = None
 
     async def start(self) -> None:
+        if len(os.fsencode(self._socket_path)) > MAX_UNIX_SOCKET_PATH_BYTES:
+            raise ValueError(
+                f"Credential Broker socket path exceeds the portable "
+                f"{MAX_UNIX_SOCKET_PATH_BYTES}-byte limit"
+            )
         if os.path.exists(self._socket_path):
             os.unlink(self._socket_path)
         self._server = await asyncio.start_unix_server(self._handle, path=self._socket_path)

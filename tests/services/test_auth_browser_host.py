@@ -166,3 +166,28 @@ def test_begin_authentication_marks_destroy_on_clear_failure() -> None:
     session = _run(scenario())
     assert session.must_destroy_context is True
     assert not auth_lease.is_authentication_locked("b2")  # lease still released
+
+
+def test_begin_authentication_heartbeats_short_lease(monkeypatch) -> None:
+    controller = FakePageController()
+    real_acquire = auth_lease.acquire
+
+    def short_acquire(browser_session_id, *, task_id, request_id):
+        return real_acquire(
+            browser_session_id,
+            task_id=task_id,
+            request_id=request_id,
+            ttl=0.12,
+        )
+
+    monkeypatch.setattr(auth_lease, "acquire", short_acquire)
+
+    async def scenario():
+        async with host.begin_authentication(
+            controller, browser_session_id="heartbeat", task_id="t1", request_id="r1"
+        ):
+            await asyncio.sleep(0.3)
+            assert auth_lease.is_authentication_locked("heartbeat")
+
+    _run(scenario())
+    assert not auth_lease.is_authentication_locked("heartbeat")

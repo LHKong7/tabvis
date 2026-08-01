@@ -56,7 +56,7 @@ _TRANSITIONS: Final[dict[str, frozenset[str]]] = {
     ),
     WAITING_FOR_INPUT: frozenset({RUNNING, CANCELLING, CANCELLED}),
     WAITING_FOR_APPROVAL: frozenset({RUNNING, FAILED, CANCELLING, CANCELLED}),
-    RETRYING: frozenset({RUNNING, FAILED}),
+    RETRYING: frozenset({RUNNING, FAILED, CANCELLING, CANCELLED}),
     CANCELLING: frozenset({CANCELLED}),
     COMPLETED: frozenset(),
     FAILED: frozenset(),
@@ -97,6 +97,9 @@ class RunRecord:
     session_id: str
     command_id: str
     prompt_message_id: str = ""
+    # Kept in the Run's lossless JSON blob so compatibility clients and the Web console can show
+    # what launched this immutable execution. No schema migration is needed.
+    prompt: str = ""
     conversation_id: str | None = None
     workspace_id: str | None = None
     attempt: int = 1

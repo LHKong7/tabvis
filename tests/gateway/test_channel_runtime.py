@@ -136,6 +136,84 @@ def test_webhook_http_route_returns_challenge() -> None:
         assert client.post("/v1/channels/nope/webhook", content=b"{}").status_code == 404
 
 
+def test_full_result_is_delivered_in_chunks_without_truncation() -> None:
+    # Bug #4: a long answer must be delivered in full (persisted result), split into platform-sized
+    # chunks — never silently cut to the ~2000-char preview.
+    async def scenario() -> None:
+        fake = _FakeFeishuClient()
+        runtime = _runtime_with_feishu(fake)
+        await runtime.start()
+        run_id = (await runtime.ingest_webhook("feishu", {}, _text_event("e1", "oc_chat", "q")))["results"][0]["run_id"]
+
+        long_text = "\n".join(f"line {i} " + "x" * 80 for i in range(120))  # well over feishu's 3900
+        runtime._runs.record_result(run_id, long_text)
+        get_event_store().append(
+            AGGREGATE_RUN, run_id, EventType.RUN_COMPLETED, scope=EventScope(run_id=run_id),
+            data={"result_preview": long_text[:2000]},  # the event still only carries the bounded preview
+        )
+        await asyncio.sleep(0.05)
+
+        assert {chat for chat, _ in fake.sent} == {"oc_chat"}
+        assert len(fake.sent) > 1  # actually chunked
+        assert "".join(text for _, text in fake.sent) == long_text  # lossless: nothing dropped/truncated
+        assert all(len(text) <= 3900 for _, text in fake.sent)
+        await runtime.stop()
+
+    asyncio.run(scenario())
+
+
+def test_failed_run_delivers_the_error_reason() -> None:
+    # Bug #5: an exception failure stores its reason in data['error'], not result_preview.
+    async def scenario() -> None:
+        fake = _FakeFeishuClient()
+        runtime = _runtime_with_feishu(fake)
+        await runtime.start()
+        run_id = (await runtime.ingest_webhook("feishu", {}, _text_event("e1", "oc_chat", "q")))["results"][0]["run_id"]
+        get_event_store().append(
+            AGGREGATE_RUN, run_id, EventType.RUN_FAILED, scope=EventScope(run_id=run_id),
+            data={"error": "RuntimeError: boom"},
+        )
+        await asyncio.sleep(0.05)
+        assert fake.sent == [("oc_chat", "⚠️ RuntimeError: boom")]
+        await runtime.stop()
+
+    asyncio.run(scenario())
+
+
+def test_completed_run_with_empty_result_still_acks() -> None:
+    # Bug #14: an empty result must not leave the chat hanging with no reply.
+    async def scenario() -> None:
+        fake = _FakeFeishuClient()
+        runtime = _runtime_with_feishu(fake)
+        await runtime.start()
+        run_id = (await runtime.ingest_webhook("feishu", {}, _text_event("e1", "oc_chat", "q")))["results"][0]["run_id"]
+        get_event_store().append(
+            AGGREGATE_RUN, run_id, EventType.RUN_COMPLETED, scope=EventScope(run_id=run_id),
+            data={"result_preview": ""},
+        )
+        await asyncio.sleep(0.05)
+        assert fake.sent == [("oc_chat", "✓ done")]
+        await runtime.stop()
+
+    asyncio.run(scenario())
+
+
+def test_stop_drains_a_pending_completion() -> None:
+    # Bug #3: a completion queued at shutdown is delivered by stop()'s drain, not dropped.
+    async def scenario() -> None:
+        fake = _FakeFeishuClient()
+        runtime = _runtime_with_feishu(fake)
+        await runtime.start()
+        run_id = (await runtime.ingest_webhook("feishu", {}, _text_event("e1", "oc_chat", "q")))["results"][0]["run_id"]
+        # Enqueue directly, then stop immediately — stop cancels the worker before it can run, so the
+        # drain (not the live worker) is what delivers this reply.
+        runtime._queue.put_nowait((run_id, EventType.RUN_COMPLETED, {"result_preview": "drained reply"}))
+        await runtime.stop()
+        assert ("oc_chat", "drained reply") in fake.sent
+
+    asyncio.run(scenario())
+
+
 def test_completion_for_non_channel_run_is_ignored() -> None:
     async def scenario() -> None:
         fake = _FakeFeishuClient()

@@ -34,6 +34,7 @@ from typing import Any
 from tabvis.constants.tools import (
     BROWSER_CLICK_TOOL_NAME,
     BROWSER_DOWNLOAD_TOOL_NAME,
+    BROWSER_EXTRACT_TOOL_NAME,
     BROWSER_KEYS_TOOL_NAME,
     BROWSER_NAVIGATE_TOOL_NAME,
     BROWSER_SCROLL_TOOL_NAME,
@@ -138,6 +139,7 @@ def _action_and_resource(tool_name: str, input: Any) -> tuple[str, str]:
         return "browser.download", f"url:{get_field(input, 'url') or ''}"
     if tool_name in (
         BROWSER_CLICK_TOOL_NAME,
+        BROWSER_EXTRACT_TOOL_NAME,
         BROWSER_KEYS_TOOL_NAME,
         BROWSER_SCROLL_TOOL_NAME,
         BROWSER_TYPE_TOOL_NAME,

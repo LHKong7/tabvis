@@ -33,7 +33,9 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
+import math
 import os
+import random
 import re
 import sys
 from dataclasses import replace
@@ -74,6 +76,10 @@ _TEXT_BUDGET = 22_000
 # Small on purpose: it is a *reasoning aid* alongside the screenshot, not the primary observation,
 # and the sparse-aria case leaves plenty of the result budget free anyway.
 _HTML_BUDGET = 12_000
+# Structured page extraction is requested explicitly, so it can spend most of one tool-result
+# budget while still leaving room for the URL/title envelope.
+_EXTRACT_TEXT_BUDGET = 18_000
+_EXTRACT_CHAR_BUDGET = 44_000
 
 # When is the accessibility snapshot "not enough"? A canvas game / maps / whiteboard / image-only
 # page yields an aria tree with almost no named nodes and almost no text — below both thresholds we
@@ -81,13 +87,46 @@ _HTML_BUDGET = 12_000
 _ARIA_THIN_MAX_REFS = 3
 _ARIA_THIN_MAX_CHARS = 400
 
-# Native input timings mirror the deterministic sequencing described in the browser-operation
-# design.  They are deliberately small and fixed: their purpose is to preserve browser event order,
-# not to pretend that deterministic automation has a human biometric signature.
+# Native input uses the same event classes as a person: several mouseMoved events, a held
+# mousePressed/mouseReleased pair, wheel events, and keydown/keypress/input/keyup. The small bounded
+# timing variation avoids machine-gun event bursts; it is not a claim of biometric indistinguishability.
 _SCROLL_INTO_VIEW_DELAY = 0.05
-_MOUSE_MOVE_DELAY = 0.05
-_MOUSE_HOLD_DELAY = 0.08
+_MOUSE_HOLD_DELAY_MIN = 0.06
+_MOUSE_HOLD_DELAY_MAX = 0.12
 _SCROLL_STEP_DELAY = 0.15
+# A target=_blank popup is not guaranteed to appear in the same event-loop tick as the click.
+# Ordinary clicks retain the fast path; only links that advertise a new browsing context wait.
+_POPUP_WAIT_SECONDS = 1.5
+
+
+def _download_workspace_reminder(downloads: list[dict[str, Any]]) -> str:
+    """Tell the model exactly what a saved browser artifact does and does not prove."""
+    lines = [
+        f"<system-reminder>Saved {len(downloads)} file(s) to the download workspace."
+    ]
+    for item in downloads:
+        path = str(item.get("path") or "")
+        if item.get("kind") != "pdf":
+            lines.append(f"- {path}: use Read to evaluate its contents.")
+            continue
+        page_count = item.get("page_count")
+        page_total = f"{page_count} pages" if isinstance(page_count, int) else "page count unknown"
+        first_end = max(1, min(page_count, 20)) if isinstance(page_count, int) else 10
+        lines.extend(
+            [
+                f"- {path}: captured PDF ({page_total}); status=captured_not_read.",
+                "  Chromium's PDF viewer/accessibility snapshot and an abstract landing page are "
+                "NOT the PDF body and do not count as reading the paper.",
+                f'  For research, call Read(file_path="{path}", pages="1-{first_end}") now, then '
+                "continue with non-overlapping page ranges until the methods, data, results, "
+                "limitations, and any relevant appendices have been examined.",
+                "  Cite the PDF page ranges actually read. If full-text extraction fails, label "
+                "the source abstract-only instead of claiming the paper was read.",
+            ]
+        )
+    lines.append("</system-reminder>")
+    return "\n".join(lines)
+
 
 # One pass to lift a trimmed copy of the page HTML: drop non-content/heavy nodes and defuse inline
 # data: URIs (base64 images blow the budget and say nothing). Operates on a clone — no DOM mutation.
@@ -104,6 +143,134 @@ _HTML_EXTRACT_JS = r"""
     }
   });
   return clone.outerHTML || '';
+}
+"""
+
+# Extract the parts of a rendered page that matter for research and navigation while keeping URLs
+# as dedicated ``href`` fields.  Structured URL fields are important: the DLP gateway can safely
+# clean their credentials/query values without confusing opaque numeric path identifiers for phone
+# numbers.  The model gets useful document candidates, dates and table data without receiving a
+# noisy full-DOM dump.
+_PAGE_EXTRACT_JS = r"""
+(args) => {
+  const clean = (value, limit = 1000) =>
+    String(value || '').replace(/\s+/g, ' ').trim().slice(0, limit);
+  const visible = (el) => {
+    const style = window.getComputedStyle(el);
+    const rect = el.getBoundingClientRect();
+    return style.display !== 'none' && style.visibility !== 'hidden' &&
+      style.opacity !== '0' && (rect.width > 0 || rect.height > 0);
+  };
+  let root;
+  let scopeMatched = true;
+  try {
+    root = args.scope ? document.querySelector(args.scope) : null;
+    if (args.scope && !root) scopeMatched = false;
+    root = root || document.querySelector('main, article, [role="main"]') ||
+      document.body || document.documentElement;
+  } catch (error) {
+    return {error: `Invalid CSS scope: ${String(error && error.message || error)}`};
+  }
+  if (!root) return {error: 'The page has no readable document root.'};
+
+  const selectorHint = (el) => {
+    const tag = (el.tagName || 'div').toLocaleLowerCase();
+    if (el.id) return `${tag}#${CSS.escape(el.id)}`;
+    const role = el.getAttribute('role');
+    if (role) return `${tag}[role="${role}"]`;
+    const cls = Array.from(el.classList || []).filter(Boolean).slice(0, 2);
+    return cls.length ? `${tag}.${cls.map((x) => CSS.escape(x)).join('.')}` : tag;
+  };
+  const candidateScopes = scopeMatched ? [] :
+    Array.from(document.querySelectorAll('main, article, section, [role="main"], [role="region"]'))
+      .filter(visible)
+      .map((el) => ({selector: selectorHint(el), text: clean(el.innerText || el.textContent, 160)}))
+      .filter((item) => item.text)
+      .slice(0, 8);
+
+  const maxItems = Math.max(1, Math.min(Number(args.max_items) || 100, 200));
+  const query = clean(args.query || '', 200).toLocaleLowerCase();
+  const contextFor = (el) => {
+    const holder = el.closest('article, li, tr, section, [role="listitem"], div') || el.parentElement;
+    return clean(holder ? holder.innerText || holder.textContent : '', 500);
+  };
+  const links = Array.from(root.querySelectorAll('a[href]'))
+    .filter(visible)
+    .map((el) => ({
+      text: clean(el.innerText || el.textContent || el.getAttribute('aria-label') ||
+        el.getAttribute('title'), 300),
+      href: el.href,
+      title: clean(el.getAttribute('title'), 200),
+      target: clean(el.getAttribute('target'), 30),
+      kind: /\.pdf(?:$|[?#])/i.test(el.href) ? 'pdf' :
+        (el.hasAttribute('download') ? 'download' : 'page'),
+      context: contextFor(el),
+    }))
+    .filter((item) => item.text || item.title || item.context)
+    .filter((item) => !query ||
+      `${item.text} ${item.title} ${item.context} ${item.href}`.toLocaleLowerCase().includes(query))
+    .slice(0, maxItems);
+
+  const headings = Array.from(root.querySelectorAll('h1,h2,h3,h4,h5,h6,[role="heading"]'))
+    .filter(visible)
+    .map((el) => ({
+      level: Number((el.tagName || '').slice(1)) || Number(el.getAttribute('aria-level')) || null,
+      text: clean(el.innerText || el.textContent, 500),
+    }))
+    .filter((item) => item.text && (!query || item.text.toLocaleLowerCase().includes(query)))
+    .slice(0, Math.min(maxItems, 80));
+
+  const dates = [];
+  for (const el of root.querySelectorAll('time, [itemprop="datePublished"], [itemprop="dateModified"]')) {
+    const value = clean(el.getAttribute('datetime') || el.getAttribute('content') ||
+      el.innerText || el.textContent, 200);
+    if (value && !dates.includes(value)) dates.push(value);
+    if (dates.length >= 50) break;
+  }
+  for (const selector of [
+    'meta[property="article:published_time"]',
+    'meta[property="article:modified_time"]',
+    'meta[name="date"]',
+    'meta[name="pubdate"]',
+  ]) {
+    const value = clean(document.querySelector(selector)?.getAttribute('content'), 200);
+    if (value && !dates.includes(value)) dates.push(value);
+  }
+
+  const tables = Array.from(root.querySelectorAll('table')).filter(visible).slice(0, 12).map((table) => ({
+    caption: clean(table.querySelector('caption')?.innerText, 300),
+    rows: Array.from(table.querySelectorAll('tr')).slice(0, 40).map((row) =>
+      Array.from(row.querySelectorAll('th,td')).slice(0, 16).map((cell) =>
+        clean(cell.innerText || cell.textContent, 500)
+      )
+    ).filter((row) => row.some(Boolean)),
+  })).filter((table) => table.caption || table.rows.length);
+
+  const text = clean(root.innerText || root.textContent, Number(args.max_text_chars) || 18000);
+  const matches = [];
+  if (query && text) {
+    const lower = text.toLocaleLowerCase();
+    let offset = 0;
+    while (matches.length < 20) {
+      const index = lower.indexOf(query, offset);
+      if (index < 0) break;
+      matches.push(text.slice(Math.max(0, index - 240), Math.min(text.length, index + query.length + 360)));
+      offset = index + Math.max(1, query.length);
+    }
+  }
+  return {
+    scope: args.scope || 'main/article/body',
+    scope_matched: scopeMatched,
+    scope_fallback: scopeMatched ? null : 'main, article, [role="main"], body',
+    candidate_scopes: candidateScopes,
+    query: args.query || null,
+    text: query ? matches.join('\n...\n') : text,
+    matches,
+    headings,
+    dates,
+    links,
+    tables,
+  };
 }
 """
 
@@ -231,6 +398,9 @@ class BrowserService:
         self._ref_mode = "data"  # "aria" | "data"
         self._snapshot_page: Page | None = None
         self._snapshot_gen = 0
+        # Last native cursor location, used to emit an actual movement path instead of teleporting
+        # straight to each target before mousePressed.
+        self._last_mouse_position: tuple[float, float] | None = None
         # Identity, for the session record.
         self.launched_at: str | None = None
         self._driver_pid: int | None = None
@@ -243,6 +413,7 @@ class BrowserService:
         # have already been announced so each is reported once.
         self._downloads: list[dict[str, Any]] = []
         self._downloads_reported = 0
+        self._post_auth_redaction_pending = False
 
     # ------------------------------------------------------------------ lifecycle
 
@@ -638,6 +809,22 @@ class BrowserService:
         self._active_page = None
         self._snapshot_page = None
 
+    @contextlib.asynccontextmanager
+    async def authentication_control(self):
+        """Reserve the browser action lane for one managed-authentication transaction.
+
+        Ordinary actions already serialize on ``_action_lock``. Holding the same lock from before the
+        authentication lease is acquired until fields are cleared closes the policy-check/action race:
+        an Agent action can finish before authentication starts or wait until it ends, but cannot
+        interleave with secret injection.
+        """
+        async with self._action_lock:
+            yield
+
+    def arm_post_auth_redaction(self) -> None:
+        """Mask sensitive inputs in the first screenshot emitted after managed authentication."""
+        self._post_auth_redaction_pending = True
+
     def is_alive(self) -> bool:
         return self._context is not None and not self._closed
 
@@ -672,6 +859,7 @@ class BrowserService:
         policy_rule_id: str | None = None,
         quarantined: bool = False,
         expose: bool = True,
+        extra: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Record a saved file: surface it to the agent (unless quarantined) and log a download
         artifact (issue #5) so the fetch is auditable alongside navigation/click/policy events."""
@@ -683,6 +871,8 @@ class BrowserService:
         }
         if quarantined:
             entry["quarantined"] = True
+        if extra:
+            entry.update(extra)
         # A quarantined file is deliberately NOT added to _downloads: observe() reports that list to
         # the agent, and a file policy did not clear must not be handed to the model.
         if expose and not quarantined:
@@ -697,6 +887,7 @@ class BrowserService:
             policy_effect=policy_effect,
             policy_rule_id=policy_rule_id,
             quarantined=quarantined,
+            extra=extra,
         )
         return entry
 
@@ -767,7 +958,7 @@ class BrowserService:
         except Exception as e:  # noqa: BLE001 - a failed download must never break the run
             log_for_debugging(f"[BROWSER] download save failed: {e}")
 
-    async def _capture_pdf_navigation(self, response: Any, url: str) -> None:
+    async def _capture_pdf_navigation(self, response: Any, url: str) -> dict[str, Any] | None:
         """If a navigation landed on a PDF, save its bytes to the workspace (Chromium would only
         render it in the built-in viewer, which the accessibility snapshot can't read).
 
@@ -775,21 +966,56 @@ class BrowserService:
         deliberately navigated to is workspace-visible; it is still logged as a ``pdf_navigation``
         download artifact for the audit trail."""
         if response is None:
-            return
+            return None
         try:
-            ctype = (response.headers or {}).get("content-type", "") if hasattr(response, "headers") else ""
+            headers = dict(response.headers or {}) if hasattr(response, "headers") else {}
+            ctype = headers.get("content-type", "")
             is_pdf = "application/pdf" in ctype.lower() or urlparse(url).path.lower().endswith(".pdf")
             if not is_pdf:
-                return
+                return None
             body = await response.body()
-            from tabvis.browser.downloads import filename_from_url, get_workspace_dir, unique_path
+            # Chromium's built-in PDF viewer can make page.goto() resolve to its extension HTML
+            # shell even though the requested URL is a PDF. Never persist that shell as *.pdf:
+            # retry the original URL through the same browser context (cookies/auth preserved) and
+            # require the PDF magic bytes before exposing the file to the agent.
+            if not body.startswith(b"%PDF-") and self._context is not None:
+                direct = await self._context.request.get(url)
+                if direct.ok:
+                    body = await direct.body()
+                    headers = dict(getattr(direct, "headers", {}) or headers)
+            if not body.startswith(b"%PDF-"):
+                log_for_debugging(
+                    f"[BROWSER] pdf capture rejected non-PDF response for {url}"
+                )
+                return None
+            from tabvis.browser.downloads import filename_from_response, get_workspace_dir, unique_path
 
-            dest = unique_path(get_workspace_dir(), filename_from_url(url, "page.pdf"))
+            # Trust the bytes as the final MIME signal even when a dynamic endpoint omitted its
+            # Content-Type. This also ensures script-looking URLs such as get_pdf.cfm become *.pdf.
+            headers["content-type"] = "application/pdf"
+            dest = unique_path(
+                get_workspace_dir(),
+                filename_from_response(url, headers, "page.pdf"),
+            )
             with open(dest, "wb") as fh:
                 fh.write(body)
-            self._record_download(dest, url, "pdf", action="pdf_navigation", policy_effect="allow")
+            from tabvis.utils.pdf import get_pdf_page_count
+
+            page_count = await get_pdf_page_count(dest)
+            metadata: dict[str, Any] = {"read_status": "captured_not_read"}
+            if page_count is not None:
+                metadata["page_count"] = page_count
+            return self._record_download(
+                dest,
+                url,
+                "pdf",
+                action="pdf_navigation",
+                policy_effect="allow",
+                extra=metadata,
+            )
         except Exception as e:  # noqa: BLE001 - best-effort; the page still rendered
             log_for_debugging(f"[BROWSER] pdf capture failed: {e}")
+            return None
 
     async def clear_origin_data(self, origin: str) -> dict[str, Any]:
         """Clear one origin's cookies + storage on the live context (issue #4). Browser must be up."""
@@ -806,17 +1032,30 @@ class BrowserService:
         This is the *explicit* BrowserDownload path — the tool already cleared ``browser.download``
         via ``check_permissions`` before we get here, so the file is agent-visible; it is recorded as
         an ``explicit_download`` artifact."""
-        from tabvis.browser.downloads import filename_from_url, get_workspace_dir, unique_path
+        from tabvis.browser.downloads import filename_from_response, get_workspace_dir, unique_path
 
         async with self._action_lock:
             if self._context is None:
                 raise BrowserError("Browser is not running.")
-            await get_request_pacer().pace(host_of(url), counts_as_request=True)
+            download_host = host_of(url)
+            pacer = get_request_pacer()
+            await pacer.pace(download_host, counts_as_request=True)
             resp = await self._context.request.get(url)
+            await pacer.note_response(
+                download_host,
+                getattr(resp, "status", None),
+                dict(getattr(resp, "headers", {}) or {}).get("retry-after"),
+            )
             if not resp.ok:
                 raise BrowserError(f"Download failed: HTTP {resp.status} for {url}")
             body = await resp.body()
-            dest = unique_path(get_workspace_dir(), filename or filename_from_url(url))
+            response_headers = dict(getattr(resp, "headers", {}) or {})
+            derived = filename or filename_from_response(url, response_headers)
+            # A server can omit/mislabel Content-Type; magic bytes are authoritative for naming.
+            if body.startswith(b"%PDF-") and not filename:
+                response_headers["content-type"] = "application/pdf"
+                derived = filename_from_response(url, response_headers)
+            dest = unique_path(get_workspace_dir(), derived)
             with open(dest, "wb") as fh:
                 fh.write(body)
             entry = self._record_download(
@@ -906,10 +1145,9 @@ class BrowserService:
         if new_downloads:
             self._downloads_reported = len(self._downloads)
             data["downloads"] = new_downloads
-            lines = "\n".join(f"  - {d['path']}" for d in new_downloads)
             data["snapshot"] = (
-                f"<system-reminder>Saved {len(new_downloads)} file(s) to the download workspace. "
-                f"Use the Read tool on a path to evaluate its contents:\n{lines}</system-reminder>\n"
+                _download_workspace_reminder(new_downloads)
+                + "\n"
                 + text
             )
 
@@ -926,10 +1164,18 @@ class BrowserService:
 
         if attach_visual:
             with contextlib.suppress(Exception):
+                mask = []
+                if self._post_auth_redaction_pending:
+                    selectors = (
+                        "input[type='password'], input[autocomplete='one-time-code'], "
+                        "input[autocomplete='username'], input[type='email']"
+                    )
+                    mask = [frame.locator(selectors) for frame in page.frames]
                 png = await asyncio.wait_for(
-                    page.screenshot(type="png"), timeout=self._timeout_s()
+                    page.screenshot(type="png", mask=mask), timeout=self._timeout_s()
                 )
                 data["screenshot_b64"] = base64.b64encode(png).decode("ascii")
+                self._post_auth_redaction_pending = False
         return data
 
     async def _build_snapshot(self, page: Page, *, boxes: bool = False) -> str:
@@ -1021,6 +1267,57 @@ class BrowserService:
             html = html[:_HTML_BUDGET] + " …[html truncated]"
         return html
 
+    async def extract_page(
+        self,
+        *,
+        query: str | None = None,
+        scope: str | None = None,
+        max_items: int = 100,
+    ) -> dict[str, Any]:
+        """Return rendered page content as bounded, structured research data.
+
+        This is deliberately separate from :meth:`observe`: ordinary browser actions stay compact
+        and ref-driven, while a research task can explicitly request stable absolute links, dates,
+        headings, readable text and tables.  It is not a full HTML dump.
+        """
+        async with self._action_lock:
+            page = self.active_page
+            args = {
+                "query": (query or "").strip(),
+                "scope": (scope or "").strip() or None,
+                "max_items": max(1, min(int(max_items), 200)),
+                "max_text_chars": _EXTRACT_TEXT_BUDGET,
+            }
+            try:
+                extracted = await asyncio.wait_for(
+                    page.evaluate(_PAGE_EXTRACT_JS, args), timeout=self._timeout_s()
+                )
+            except Exception as e:  # noqa: BLE001 - expose a recoverable browser error
+                raise BrowserError(f"Page extraction failed: {e}") from e
+            if not isinstance(extracted, dict):
+                raise BrowserError("Page extraction returned an invalid result.")
+            if extracted.get("error"):
+                raise BrowserError(str(extracted["error"]))
+
+            data: dict[str, Any] = {
+                "url": page.url,
+                "title": await _safe_title(page),
+                "tab_count": len([p for p in self._pages() if not p.is_closed()]),
+                **extracted,
+            }
+            # The JavaScript caps every collection, but table-heavy pages can still exceed the
+            # persisted tool-result limit.  Reduce the lossy fields in a deterministic order.
+            import json
+
+            if len(json.dumps(data, ensure_ascii=False, default=str)) > _EXTRACT_CHAR_BUDGET:
+                data["tables"] = (data.get("tables") or [])[:4]
+            if len(json.dumps(data, ensure_ascii=False, default=str)) > _EXTRACT_CHAR_BUDGET:
+                data["links"] = (data.get("links") or [])[:50]
+            if len(json.dumps(data, ensure_ascii=False, default=str)) > _EXTRACT_CHAR_BUDGET:
+                text = str(data.get("text") or "")
+                data["text"] = text[:8_000] + " …[structured extraction truncated]"
+            return data
+
     async def _evaluate_snapshot(self, page: Page) -> dict[str, Any]:
         """Run the snapshot JS, tolerating a navigation that lands mid-evaluate.
 
@@ -1090,8 +1387,10 @@ class BrowserService:
             page = self.active_page
             # Pace requests so a rapid navigation loop can't burst / DoS a host.
             nav_host = host_of(url) if action == "goto" else host_of(page.url)
-            await get_request_pacer().pace(nav_host, counts_as_request=True)
+            pacer = get_request_pacer()
+            pacing_wait = await pacer.pace(nav_host, counts_as_request=True)
             timeout = self._timeout_s()
+            response: Any = None
             if action == "goto":
                 response = await asyncio.wait_for(
                     page.goto(url, wait_until=wait_until), timeout=timeout
@@ -1099,18 +1398,35 @@ class BrowserService:
                 # A PDF renders in Chromium's viewer (unreadable via aria) — grab it to the workspace.
                 await self._capture_pdf_navigation(response, url)
             elif action == "back":
-                await asyncio.wait_for(page.go_back(wait_until=wait_until), timeout=timeout)
+                response = await asyncio.wait_for(
+                    page.go_back(wait_until=wait_until), timeout=timeout
+                )
             elif action == "forward":
-                await asyncio.wait_for(
+                response = await asyncio.wait_for(
                     page.go_forward(wait_until=wait_until), timeout=timeout
                 )
             elif action == "reload":
-                await asyncio.wait_for(page.reload(wait_until=wait_until), timeout=timeout)
+                response = await asyncio.wait_for(
+                    page.reload(wait_until=wait_until), timeout=timeout
+                )
             else:
                 raise BrowserError(f"Unknown navigate action '{action}'.")
+            if response is not None:
+                await pacer.note_response(
+                    nav_host,
+                    getattr(response, "status", None),
+                    dict(getattr(response, "headers", {}) or {}).get("retry-after"),
+                )
             # Let the page finish building itself before we look at it (SPAs, interstitials).
             await self._settle(page)
-            return await self.observe()
+            data = await self.observe()
+            data["action_result"] = {
+                "action": action,
+                "executed_via": "browser-navigation",
+                "pacing_wait_ms": round(pacing_wait * 1000),
+                "verified": True,
+            }
+            return data
 
     async def wait_for(
         self,
@@ -1248,14 +1564,36 @@ class BrowserService:
     async def _native_click(
         self, page: Page, x: float, y: float, *, double: bool
     ) -> str:
-        """Dispatch an ordered native click and return the mechanism used."""
+        """Move the pointer through native events, click, and return the mechanism used."""
+        start_x, start_y = self._last_mouse_position or (
+            max(0.0, x - 80.0),
+            max(0.0, y - 45.0),
+        )
+        distance = math.hypot(x - start_x, y - start_y)
+        steps = max(4, min(14, int(distance / 70.0) + 4))
+        curve = min(18.0, distance * 0.06)
+        curve *= -1.0 if int(x + y) % 2 else 1.0
+
+        async def move_with_cdp(session: Any) -> None:
+            for index in range(1, steps + 1):
+                progress = index / steps
+                eased = progress * progress * (3.0 - 2.0 * progress)
+                # A shallow arc keeps the path continuous while the final event lands exactly on
+                # the verified element centre.
+                move_x = start_x + (x - start_x) * eased
+                move_y = start_y + (y - start_y) * eased
+                if index < steps:
+                    move_y += math.sin(math.pi * progress) * curve
+                await session.send(
+                    "Input.dispatchMouseEvent",
+                    {"type": "mouseMoved", "x": move_x, "y": move_y},
+                )
+                await asyncio.sleep(random.uniform(0.006, 0.016))
+
         session: Any = None
         try:
             session = await page.context.new_cdp_session(page)
-            await session.send(
-                "Input.dispatchMouseEvent", {"type": "mouseMoved", "x": x, "y": y}
-            )
-            await asyncio.sleep(_MOUSE_MOVE_DELAY)
+            await move_with_cdp(session)
             for count in range(1, (2 if double else 1) + 1):
                 await session.send(
                     "Input.dispatchMouseEvent",
@@ -1267,7 +1605,9 @@ class BrowserService:
                         "clickCount": count,
                     },
                 )
-                await asyncio.sleep(_MOUSE_HOLD_DELAY)
+                await asyncio.sleep(
+                    random.uniform(_MOUSE_HOLD_DELAY_MIN, _MOUSE_HOLD_DELAY_MAX)
+                )
                 await session.send(
                     "Input.dispatchMouseEvent",
                     {
@@ -1278,6 +1618,7 @@ class BrowserService:
                         "clickCount": count,
                     },
                 )
+            self._last_mouse_position = (x, y)
             return "cdp"
         except Exception as e:  # noqa: BLE001 - expected on non-Chromium engines
             log_for_debugging(f"[BROWSER] CDP click unavailable ({e}); using fallback.")
@@ -1287,14 +1628,25 @@ class BrowserService:
                     await session.detach()
 
         try:
-            await page.mouse.move(x, y)
-            await asyncio.sleep(_MOUSE_MOVE_DELAY)
+            await page.mouse.move(x, y, steps=steps)
             if double:
-                await page.mouse.dblclick(x, y, delay=int(_MOUSE_HOLD_DELAY * 1000))
+                await page.mouse.dblclick(
+                    x,
+                    y,
+                    delay=int(
+                        random.uniform(
+                            _MOUSE_HOLD_DELAY_MIN, _MOUSE_HOLD_DELAY_MAX
+                        )
+                        * 1000
+                    ),
+                )
             else:
                 await page.mouse.down(button="left")
-                await asyncio.sleep(_MOUSE_HOLD_DELAY)
+                await asyncio.sleep(
+                    random.uniform(_MOUSE_HOLD_DELAY_MIN, _MOUSE_HOLD_DELAY_MAX)
+                )
                 await page.mouse.up(button="left")
+            self._last_mouse_position = (x, y)
             return "playwright-native"
         except Exception as e:  # noqa: BLE001
             raise BrowserError(f"Native click failed: {e}") from e
@@ -1309,19 +1661,43 @@ class BrowserService:
             return None
 
     @staticmethod
-    async def _javascript_click(locator: Locator) -> None:
+    async def _opens_new_page(locator: Locator) -> bool:
+        """Best-effort hint that clicking ``locator`` should create a popup/new tab."""
         try:
-            await locator.evaluate("el => el.click()")
-        except Exception as e:  # noqa: BLE001
-            raise BrowserError(f"JavaScript click fallback failed: {e}") from e
+            return bool(
+                await locator.evaluate(
+                    """el => {
+                      const link = el.closest && el.closest('a[href]');
+                      if (link && String(link.target || '').toLowerCase() === '_blank') return true;
+                      const onclick = String(el.getAttribute && el.getAttribute('onclick') || '');
+                      return /window\\.open\\s*\\(/i.test(onclick);
+                    }"""
+                )
+            )
+        except Exception:  # noqa: BLE001 - absence of the hint keeps the ordinary fast path
+            return False
 
     async def _observe_action_change(
-        self, page: Page, before_url: str, before_pages: set[int]
+        self,
+        page: Page,
+        before_url: str,
+        before_pages: set[int],
+        *,
+        expect_new_page: bool = False,
     ) -> tuple[dict[str, Any], bool, bool]:
         """Switch to a newly opened tab, settle navigation, and return a fresh observation."""
-        await asyncio.sleep(0.1)
-        open_pages = [p for p in self._pages() if not p.is_closed()]
-        new_pages = [p for p in open_pages if id(p) not in before_pages]
+        deadline = asyncio.get_running_loop().time() + (
+            _POPUP_WAIT_SECONDS if expect_new_page else 0.1
+        )
+        new_pages: list[Page] = []
+        while True:
+            await asyncio.sleep(0.05)
+            open_pages = [p for p in self._pages() if not p.is_closed()]
+            new_pages = [p for p in open_pages if id(p) not in before_pages]
+            if new_pages or page.url != before_url:
+                break
+            if asyncio.get_running_loop().time() >= deadline:
+                break
         new_tab = bool(new_pages)
         if new_pages:
             self._active_page = new_pages[-1]
@@ -1341,9 +1717,9 @@ class BrowserService:
     ) -> dict[str, Any]:
         """Click a ref or viewport coordinate using native browser input.
 
-        Ref clicks scroll into view, reject an occluded centre, and fall back to ``element.click``
-        when a usable native coordinate is unavailable.  Coordinate clicks exist for canvas and
-        other visual-only pages and intentionally cannot use the element fallback.
+        Ref clicks scroll into view and reject an occluded centre. They never fall back to
+        ``element.click()``: if a human pointer cannot reach the target, the agent must re-observe,
+        scroll, or dismiss the obstruction. Coordinate clicks support canvas/visual-only pages.
         """
         async with self._action_lock:
             has_coordinates = coordinate_x is not None or coordinate_y is not None
@@ -1354,8 +1730,13 @@ class BrowserService:
 
             page = self.active_page
             locator = await self._resolve_visible(ref) if ref else None
+            expect_new_page = (
+                await self._opens_new_page(locator) if locator is not None else False
+            )
             # A click frequently triggers a request (link/submit/XHR); pace it per host too.
-            await get_request_pacer().pace(host_of(self._current_url()), counts_as_request=True)
+            pacing_wait = await get_request_pacer().pace(
+                host_of(self._current_url()), counts_as_request=True
+            )
             before_url = page.url
             before_pages = {id(p) for p in self._pages() if not p.is_closed()}
             checked_before = await self._checked_state(locator) if locator else None
@@ -1371,10 +1752,11 @@ class BrowserService:
                         timeout=self._action_timeout_s(),
                     )
                 else:
-                    await asyncio.wait_for(
-                        self._javascript_click(locator), timeout=self._action_timeout_s()
+                    raise BrowserError(
+                        f"Ref '{ref}' is not a visible, unobscured mouse target. "
+                        "Take a fresh snapshot, scroll it into view, or dismiss the overlay; "
+                        "no JavaScript click was sent."
                     )
-                    executed_via = "javascript"
             else:
                 width, height = await self._viewport_size(page)
                 assert coordinate_x is not None and coordinate_y is not None
@@ -1389,20 +1771,40 @@ class BrowserService:
                     timeout=self._action_timeout_s(),
                 )
 
-            # A checkbox/radio native click that did not toggle is not a successful interaction.
-            # Retry it with DOM click, exactly once, as the documented compatibility fallback.
+            # A checkbox/radio single native click that did not toggle is not a successful
+            # interaction. Retry once with another native pointer sequence; never bypass the page
+            # with element.click().
             checked_after = await self._checked_state(locator) if locator else None
-            if locator is not None and checked_before is not None and checked_after == checked_before:
-                await self._javascript_click(locator)
+            if (
+                locator is not None
+                and not double
+                and checked_before is not None
+                and checked_after == checked_before
+            ):
+                point = await self._visible_center(locator, page)
+                if not point or not await self._point_hits_element(
+                    locator, point[0], point[1]
+                ):
+                    raise BrowserError(
+                        f"Ref '{ref}' stopped being a reachable mouse target during verification."
+                    )
+                retry_via = await asyncio.wait_for(
+                    self._native_click(page, point[0], point[1], double=False),
+                    timeout=self._action_timeout_s(),
+                )
                 checked_after = await self._checked_state(locator)
-                executed_via += "+javascript-retry"
+                executed_via += f"+{retry_via}-retry"
 
             data, page_changed, new_tab = await self._observe_action_change(
-                page, before_url, before_pages
+                page,
+                before_url,
+                before_pages,
+                expect_new_page=expect_new_page,
             )
             data["action_result"] = {
                 "action": "double_click" if double else "click",
                 "executed_via": executed_via,
+                "pacing_wait_ms": round(pacing_wait * 1000),
                 "coordinates": {"x": round(point[0], 2), "y": round(point[1], 2)},
                 "page_changed": page_changed,
                 "new_tab": new_tab,
@@ -1423,36 +1825,14 @@ class BrowserService:
             return None
 
     async def _clear_input(self, locator: Locator, page: Page) -> None:
-        """Clear standard, controlled, and contenteditable inputs using layered strategies."""
-        clear_js = r"""
-        el => {
-          if ('value' in el) {
-            const proto = Object.getPrototypeOf(el);
-            const descriptor = Object.getOwnPropertyDescriptor(proto, 'value');
-            if (descriptor && descriptor.set) descriptor.set.call(el, '');
-            else el.value = '';
-          } else if (el.isContentEditable) {
-            el.textContent = '';
-          }
-          el.dispatchEvent(new InputEvent('input', {bubbles: true, inputType: 'deleteContentBackward'}));
-          el.dispatchEvent(new Event('change', {bubbles: true}));
-        }
-        """
-        with contextlib.suppress(Exception):
-            await locator.evaluate(clear_js)
-        if (await self._read_input_value(locator)) in (None, ""):
-            return
-
-        # Rich editors and Web Components may ignore the value setter.  Select visually first.
-        with contextlib.suppress(Exception):
-            await locator.click(click_count=3)
-            await page.keyboard.press("Backspace")
-        if (await self._read_input_value(locator)) in (None, ""):
-            return
-
+        """Clear a focused input through the same keyboard shortcut a person would use."""
         modifier = "Meta" if sys.platform == "darwin" else "Control"
         await page.keyboard.press(f"{modifier}+A")
         await page.keyboard.press("Backspace")
+        if (await self._read_input_value(locator)) not in (None, ""):
+            raise BrowserError(
+                "The focused field did not clear after the native select-all/backspace sequence."
+            )
 
     @staticmethod
     async def _type_native(page: Page, text: str) -> None:
@@ -1465,17 +1845,7 @@ class BrowserService:
                 await page.keyboard.press("Enter")
             else:
                 # Playwright keyboard.type emits keydown/keypress/input/keyup for every character.
-                await page.keyboard.type(part, delay=1)
-
-    @staticmethod
-    async def _dispatch_framework_input_events(locator: Locator) -> None:
-        with contextlib.suppress(Exception):
-            await locator.evaluate(
-                """el => {
-                  el.dispatchEvent(new Event('input', {bubbles: true}));
-                  el.dispatchEvent(new Event('change', {bubbles: true}));
-                }"""
-            )
+                await page.keyboard.type(part, delay=random.randint(8, 24))
 
     async def type_text(
         self, ref: str, text: str, *, clear: bool = True, submit: bool = False
@@ -1483,7 +1853,9 @@ class BrowserService:
         async with self._action_lock:
             locator = await self._resolve_visible(ref)
             # Typing itself is no request; submitting (Enter) navigates, so pace that per host.
-            await get_request_pacer().pace(host_of(self._current_url()), counts_as_request=submit)
+            pacing_wait = await get_request_pacer().pace(
+                host_of(self._current_url()), counts_as_request=submit
+            )
             # Scales with len(text) — a humanized keystroke-by-keystroke fill takes far longer than
             # a plain one, and a flat cap would cancel it mid-word (see _action_timeout_s).
             timeout = self._action_timeout_s(len(text))
@@ -1495,18 +1867,19 @@ class BrowserService:
             with contextlib.suppress(Exception):
                 await locator.scroll_into_view_if_needed()
             await asyncio.sleep(_SCROLL_INTO_VIEW_DELAY)
-            try:
-                await asyncio.wait_for(locator.focus(), timeout=timeout)
-            except Exception:  # noqa: BLE001 - a centre click is the focus fallback
-                point = await self._visible_center(locator, page)
-                if not point:
-                    raise BrowserError(f"Could not focus ref '{ref}'.")
-                await self._native_click(page, point[0], point[1], double=False)
+            point = await self._visible_center(locator, page)
+            if not point or not await self._point_hits_element(locator, point[0], point[1]):
+                raise BrowserError(
+                    f"Ref '{ref}' is not a visible, unobscured mouse target; no text was sent."
+                )
+            focused_via = await asyncio.wait_for(
+                self._native_click(page, point[0], point[1], double=False),
+                timeout=timeout,
+            )
 
             if clear:
                 await asyncio.wait_for(self._clear_input(locator, page), timeout=timeout)
             await asyncio.wait_for(self._type_native(page, text), timeout=timeout)
-            await self._dispatch_framework_input_events(locator)
 
             actual_value = await self._read_input_value(locator)
             expected_value = text if clear or previous_value is None else previous_value + text
@@ -1538,7 +1911,8 @@ class BrowserService:
             )
             data["action_result"] = {
                 "action": "type",
-                "executed_via": "native-keyboard",
+                "executed_via": f"{focused_via}+native-keyboard",
+                "pacing_wait_ms": round(pacing_wait * 1000),
                 "characters": len(text),
                 "clear": clear,
                 "submit": submit,
@@ -1556,18 +1930,25 @@ class BrowserService:
             page = self.active_page
             before_url = page.url
             before_pages = {id(p) for p in self._pages() if not p.is_closed()}
+            pacing_wait = await get_request_pacer().pace(
+                host_of(self._current_url()),
+                counts_as_request=sequence.endswith("Enter"),
+            )
+            focused_via: str | None = None
             if ref:
                 locator = await self._resolve_visible(ref)
                 with contextlib.suppress(Exception):
                     await locator.scroll_into_view_if_needed()
-                try:
-                    await locator.focus()
-                except Exception as e:  # noqa: BLE001
-                    raise BrowserError(f"Could not focus ref '{ref}' before sending keys: {e}") from e
-            await get_request_pacer().pace(
-                host_of(self._current_url()),
-                counts_as_request=sequence.endswith("Enter"),
-            )
+                point = await self._visible_center(locator, page)
+                if not point or not await self._point_hits_element(
+                    locator, point[0], point[1]
+                ):
+                    raise BrowserError(
+                        f"Ref '{ref}' is not a reachable mouse target; no keys were sent."
+                    )
+                focused_via = await self._native_click(
+                    page, point[0], point[1], double=False
+                )
             try:
                 await asyncio.wait_for(
                     page.keyboard.press(sequence), timeout=self._action_timeout_s()
@@ -1580,6 +1961,12 @@ class BrowserService:
             data["action_result"] = {
                 "action": "keys",
                 "keys": sequence,
+                "executed_via": (
+                    f"{focused_via}+native-keyboard"
+                    if focused_via
+                    else "native-keyboard"
+                ),
+                "pacing_wait_ms": round(pacing_wait * 1000),
                 "page_changed": page_changed,
                 "new_tab": new_tab,
                 "verified": True,
@@ -1602,7 +1989,7 @@ class BrowserService:
         point: tuple[float, float],
         locator: Locator | None,
     ) -> str:
-        """Perform one native scroll step, with the documented JavaScript fallback."""
+        """Perform one native scroll step; never mutate scroll position through JavaScript."""
         x, y = point
         if locator is None:
             native = await self._dispatch_cdp(
@@ -1640,20 +2027,14 @@ class BrowserService:
             return "cdp"
 
         try:
-            await page.mouse.move(x, y)
+            await page.mouse.move(x, y, steps=6)
             await page.mouse.wheel(0, pixels)
+            self._last_mouse_position = (x, y)
             return "playwright-native"
-        except Exception as e:  # noqa: BLE001 - JavaScript is the final compatibility fallback
-            log_for_debugging(f"[BROWSER] native scroll failed ({e}); using JavaScript.")
-
-        try:
-            if locator is not None:
-                await locator.evaluate("(el, dy) => el.scrollBy({top: dy, behavior: 'instant'})", pixels)
-            else:
-                await page.evaluate("dy => window.scrollBy({top: dy, behavior: 'instant'})", pixels)
-            return "javascript"
         except Exception as e:  # noqa: BLE001
-            raise BrowserError(f"Scroll failed: {e}") from e
+            raise BrowserError(
+                f"Native mouse-wheel scroll failed: {e}; no JavaScript scroll was sent."
+            ) from e
 
     async def scroll(
         self, *, down: bool = True, pages: float = 1.0, ref: str | None = None
@@ -1663,6 +2044,9 @@ class BrowserService:
             raise BrowserError("pages must be greater than 0 and no more than 100.")
         async with self._action_lock:
             page = self.active_page
+            pacing_wait = await get_request_pacer().pace(
+                host_of(self._current_url()), counts_as_request=False
+            )
             locator = await self._resolve_visible(ref) if ref else None
             width, height = await self._viewport_size(page)
             if locator is not None:
@@ -1700,6 +2084,7 @@ class BrowserService:
                 "pages": pages,
                 "target": ref or "page",
                 "executed_via": "+".join(dict.fromkeys(mechanisms)),
+                "pacing_wait_ms": round(pacing_wait * 1000),
                 "position_changed": (
                     after != before if before is not None and after is not None else None
                 ),

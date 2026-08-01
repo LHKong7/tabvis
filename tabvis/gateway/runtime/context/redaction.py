@@ -7,7 +7,7 @@ sensitive and secret-ref content is replaced with a marker while all provenance 
 
 from __future__ import annotations
 
-from tabvis.gateway.runtime.context.pack import PUBLIC, SECRET_REF, SENSITIVE, WORKSPACE
+from tabvis.gateway.runtime.context.pack import PUBLIC, WORKSPACE
 
 _VISIBLE = {PUBLIC, WORKSPACE}
 

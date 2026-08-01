@@ -111,6 +111,7 @@ def _run_from_legacy(record: dict[str, Any]) -> RunRecord:
         agent_id=record["agent_id"],
         session_id=record.get("session_id") or "",
         command_id="cmd_migrated_" + (record.get("run_id") or record["agent_id"]),
+        prompt=record.get("prompt") or "",
         model=record.get("model") or "",
         max_turns=record.get("max_turns"),
         turns=int(record.get("turns") or 0),
@@ -163,6 +164,8 @@ def migrate_legacy_agents(events: EventStore | None = None) -> dict[str, Any]:
                     ))
             for envelope in envelopes:
                 event_store.notify_live(envelope)
+            if record.get("result"):
+                db.put_run_result(run.run_id, str(record["result"]), created_at=now)
             migrated.append(agent_id)
         except Exception as exc:  # noqa: BLE001 - one bad record must not abort the whole migration
             log_for_debugging(f"[GATEWAY] legacy migration failed for {agent_id}: {exc}")

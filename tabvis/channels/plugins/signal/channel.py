@@ -11,6 +11,7 @@ success means the request was written without error.
 
 from __future__ import annotations
 
+import re
 from typing import AsyncIterable, Mapping
 
 from tabvis.channels.core.contract import (
@@ -25,6 +26,10 @@ from tabvis.channels.plugins._platform.loop import ClientLoopChannel
 from tabvis.channels.plugins.signal.client import SignalConfig, SignalConnection
 
 PLUGIN_ID = "signal"
+
+# An E.164 number is '+' followed by digits only. A signal-cli group id is base64 (its alphabet
+# includes '+'), so keying DM-vs-group on a leading '+' misroutes group ids that start with '+'.
+_E164 = re.compile(r"^\+\d+$")
 
 
 class SignalChannel(ClientLoopChannel):
@@ -106,8 +111,9 @@ class SignalChannel(ClientLoopChannel):
         )
         if not conversation:
             return DeliveryReceipt(outbound.delivery_id, status="failed", detail="no recipient for conversation")
-        # A +E.164 target is a 1:1 recipient; anything else is a group id.
-        if str(conversation).startswith("+"):
+        # A 1:1 recipient is an E.164 number ('+' + digits); anything else (incl. a base64 group id that
+        # happens to start with '+') is a group id. Keying on a bare leading '+' misroutes such groups.
+        if _E164.match(str(conversation)):
             params = {"recipient": [conversation], "message": outbound.text}
         else:
             params = {"groupId": conversation, "message": outbound.text}

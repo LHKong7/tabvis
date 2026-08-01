@@ -256,8 +256,6 @@ async def maybe_resize_and_downsample_image_buffer(
         raise
     except Exception as error:  # noqa: BLE001 — faithful to the TS catch-all fallback
         log_error(error)
-        error_type = _classify_image_error(error)
-        error_msg = get_error_message(error)
 
         # Detect actual format from magic bytes instead of trusting the extension.
         detected = detect_image_format_from_buffer(image_buffer)
@@ -391,8 +389,6 @@ async def compress_image_buffer(
         return await _create_ultra_compressed_jpeg(context, sharp)
     except Exception as error:  # noqa: BLE001 — faithful fallback
         log_error(error)
-        error_type = _classify_image_error(error)
-        error_msg = get_error_message(error)
 
         if len(image_buffer) <= max_bytes:
             detected = detect_image_format_from_buffer(image_buffer)

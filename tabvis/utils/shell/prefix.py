@@ -31,7 +31,6 @@ from __future__ import annotations
 import asyncio
 import os
 import sys
-import time
 from collections.abc import Awaitable, Callable
 from typing import Any, TypedDict
 
@@ -91,10 +90,6 @@ class PrefixExtractorConfig(TypedDict, total=False):
 def _chalk_yellow(text: str) -> str:
     """Local stand-in for ``chalk.yellow`` (SGR yellow foreground)."""
     return f"\x1b[33m{text}\x1b[39m"
-
-
-def _now_ms() -> int:
-    return int(time.time() * 1000)
 
 
 class _LazyTask:
@@ -248,7 +243,6 @@ async def _get_command_prefix_impl(
             return pre_check_result
 
     preflight_timer: asyncio.TimerHandle | None = None
-    start_time = _now_ms()
     result: CommandPrefixResult | None = None
 
     def _warn_slow_preflight() -> None:
@@ -308,7 +302,6 @@ async def _get_command_prefix_impl(
         # Clear the timeout since the query completed.
         if preflight_timer is not None:
             preflight_timer.cancel()
-        duration_ms = _now_ms() - start_time
 
         content = response["message"]["content"]
         if isinstance(content, str):

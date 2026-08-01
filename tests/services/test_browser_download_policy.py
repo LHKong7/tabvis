@@ -16,6 +16,7 @@ import pytest
 
 from tabvis.agent.tools.browser_download_tool import browser_download_tool
 from tabvis.browser import identity_store, policy_guard
+from tabvis.browser.browser_service import BrowserService, _download_workspace_reminder
 from tabvis.constants.tools import BROWSER_DOWNLOAD_TOOL_NAME
 from tabvis.policy import grants
 from tabvis.utils.settings.settings import reset_settings_cache
@@ -105,3 +106,81 @@ def test_evaluate_download_helper(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("TABVIS_PERMISSION_MODE", "trusted")
     effect, _ = policy_guard.evaluate_download("https://x.test/f.zip", "ag_h")
     assert effect == "allow"
+
+
+# --------------------------------------------------------------------------- PDF navigation capture
+
+
+class _NavigationResponse:
+    headers = {"content-type": "application/pdf"}
+
+    async def body(self) -> bytes:
+        # Chromium's PDF extension viewer shell, not the requested document.
+        return b"<html><body><embed type='application/pdf'></body></html>"
+
+
+class _DirectPdfResponse:
+    ok = True
+    headers = {"content-type": "application/pdf"}
+
+    async def body(self) -> bytes:
+        return b"%PDF-1.7\nreal report bytes"
+
+
+class _RequestContext:
+    async def get(self, url: str) -> _DirectPdfResponse:
+        assert url.endswith("report.pdf")
+        return _DirectPdfResponse()
+
+
+def test_pdf_navigation_refetches_when_chromium_returns_viewer_html() -> None:
+    async def scenario() -> tuple[BrowserService, bytes]:
+        service = BrowserService()
+        service._context = SimpleNamespace(request=_RequestContext())  # type: ignore[assignment]
+        await service._capture_pdf_navigation(
+            _NavigationResponse(),
+            "https://example.test/report.pdf",
+        )
+        assert len(service._downloads) == 1
+        path = service._downloads[0]["path"]
+        with open(path, "rb") as fh:
+            saved = fh.read()
+        for task in list(getattr(service, "_download_tasks", set())):
+            await task
+        return service, saved
+
+    service, saved = asyncio.run(scenario())
+    assert saved.startswith(b"%PDF-")
+    assert service._downloads[0]["kind"] == "pdf"
+    assert service._downloads[0]["read_status"] == "captured_not_read"
+
+
+def test_dynamic_pdf_navigation_gets_a_pdf_suffix() -> None:
+    async def scenario() -> str:
+        service = BrowserService()
+        await service._capture_pdf_navigation(
+            _DirectPdfResponse(),
+            "https://example.test/get_pdf.cfm?pub_id=936225",
+        )
+        return service._downloads[0]["filename"]
+
+    assert asyncio.run(scenario()) == "get_pdf.cfm.pdf"
+
+
+def test_pdf_download_notice_requires_full_text_page_ranges() -> None:
+    notice = _download_workspace_reminder(
+        [
+            {
+                "path": "/workspace/paper.pdf",
+                "kind": "pdf",
+                "page_count": 37,
+                "read_status": "captured_not_read",
+            }
+        ]
+    )
+
+    assert "status=captured_not_read" in notice
+    assert "abstract landing page" in notice
+    assert 'pages="1-20"' in notice
+    assert "methods, data, results, limitations" in notice
+    assert "Cite the PDF page ranges actually read" in notice

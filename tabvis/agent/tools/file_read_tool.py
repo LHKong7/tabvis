@@ -3,11 +3,10 @@
 Reads a file from the local filesystem. Supports an optional line ``offset``/``limit`` window
 and a ``pages`` parameter for PDFs. Text reads are the primary path and are fully implemented
 (dedup against ``read_file_state`` + ``read_file_in_range`` + line-numbered
-serialization + cyber-risk reminder + empty/short-file system-reminder). Image, PDF and notebook
-reads require heavy native deps (sharp/poppler/nbformat) that are not supported in this build;
-those branches are stubbed and raise a clear error while keeping the wire shapes
-(`data['type']` discriminants) intact so ``map_tool_result_to_tool_result_block_param`` stays
-well-formed.
+serialization + cyber-risk reminder + empty/short-file system-reminder). PDF reads prefer
+provider-independent text extraction, add page markers and cumulative coverage, and fall back to
+native document/image/OCR paths. Image reads use model vision or OCR. Notebook editing has its own
+tool; notebook reading remains an explicit unsupported branch in this module.
 
 ``max_result_size_chars`` is unbounded — output is bounded by ``maxTokens``
 (``validate_content_tokens``); persisting a Read result to a file the model reads back is circular.
@@ -305,7 +304,7 @@ async def _read_image_data(resolved_file_path: str) -> dict[str, Any]:
     return {"type": "image_unavailable", "file": {"filePath": resolved_file_path}}
 
 
-async def _read_pdf_data(resolved_file_path: str, pages: str | None) -> dict[str, Any]:  # noqa: ARG001
+async def _read_pdf_data(resolved_file_path: str, pages: str | None) -> dict[str, Any]:
     """Read a PDF for the active model.
 
     - Anthropic vision model → the PDF as a native ``document`` block (best fidelity; no poppler).
@@ -318,14 +317,86 @@ async def _read_pdf_data(resolved_file_path: str, pages: str | None) -> dict[str
 
     from tabvis.agent.api.providers import resolve_provider_name
     from tabvis.utils.model.model import get_main_loop_model, get_model_supports_vision
-    from tabvis.utils.pdf import extract_pdf_pages, read_pdf
+    from tabvis.utils.pdf import (
+        extract_pdf_pages,
+        extract_pdf_text,
+        get_pdf_page_count,
+        read_pdf,
+    )
 
     model = get_main_loop_model()
     provider = resolve_provider_name(model)
     vision = get_model_supports_vision(model, provider)
+    options = parse_pdf_page_range(pages) if pages else None
+
+    page_count = await get_pdf_page_count(resolved_file_path)
+    if pages is None and page_count is not None and page_count > PDF_AT_MENTION_INLINE_THRESHOLD:
+        return {
+            "type": "pdf_unavailable",
+            "file": {
+                "filePath": resolved_file_path,
+                "reason": (
+                    f"the PDF has {page_count} pages. Read it in ranges of at most "
+                    f"{PDF_MAX_PAGES_PER_READ} pages using the pages parameter, for example "
+                    'pages: "1-10". Do not repeat the same unpaged Read request'
+                ),
+            },
+        }
+
+    # Prefer selectable text. It works across model providers and avoids installing a Python PDF
+    # package just to inspect a document. Image/native fallbacks remain for scanned PDFs.
+    text_result = await extract_pdf_text(resolved_file_path, options)
+    if text_result.get("success"):
+        text = str(text_result["data"]["file"].get("text") or "")
+        if text.strip():
+            first_page = int((options or {}).get("firstPage") or 1)
+            requested_last = (options or {}).get("lastPage")
+            if requested_last and requested_last != math.inf:
+                last_page = int(requested_last)
+            elif page_count is not None:
+                last_page = page_count
+            else:
+                last_page = first_page + max(0, len(text.rstrip("\f").split("\f")) - 1)
+            if page_count is not None:
+                last_page = min(last_page, page_count)
+            page_chunks = text.rstrip("\f").split("\f")
+            marked_text = "\n\n".join(
+                f"--- PDF page {first_page + index} ---\n{chunk.strip()}"
+                for index, chunk in enumerate(page_chunks)
+                if chunk.strip()
+            )
+            bounded_text = marked_text[:120_000]
+            text_truncated = len(marked_text) > len(bounded_text)
+            has_more = page_count is not None and last_page < page_count
+            next_pages = None
+            if has_more:
+                next_first = last_page + 1
+                next_pages = f"{next_first}-{min(page_count, next_first + PDF_MAX_PAGES_PER_READ - 1)}"
+            coverage_complete = (
+                page_count is not None
+                and first_page == 1
+                and last_page >= page_count
+                and not text_truncated
+            )
+            return {
+                "type": "pdf_text",
+                "file": {
+                    "filePath": resolved_file_path,
+                    "pages": pages or f"{first_page}-{last_page}",
+                    "pageCount": page_count,
+                    "firstPage": first_page,
+                    "lastPage": last_page,
+                    "coverageComplete": coverage_complete,
+                    "hasMore": has_more,
+                    "nextPages": next_pages,
+                    "textTruncated": text_truncated,
+                    "text": bounded_text
+                    + ("\n…[PDF text truncated; retry with a smaller page range]" if text_truncated else ""),
+                },
+            }
 
     # Anthropic vision + native PDF support → send the validated PDF as a document block (no poppler).
-    if vision and provider == "anthropic" and is_pdf_supported():
+    if pages is None and vision and provider == "anthropic" and is_pdf_supported():
         res = await read_pdf(resolved_file_path)
         if res.get("success"):
             return {"type": "pdf_document", "file": res["data"]["file"]}
@@ -335,16 +406,45 @@ async def _read_pdf_data(resolved_file_path: str, pages: str | None) -> dict[str
         # else (e.g. transient) fall through to rasterization
 
     # Rasterize the pages to JPEGs (needs poppler pdftoppm).
-    res = await extract_pdf_pages(resolved_file_path, None)
+    res = await extract_pdf_pages(resolved_file_path, options)
     if res.get("success"):
         out = res["data"]["file"]
         page_paths = sorted(_glob.glob(os.path.join(out["outputDir"], "*.jpg")))
+        first_page = int((options or {}).get("firstPage") or 1)
+        last_page = first_page + max(0, len(page_paths) - 1)
+        if page_count is not None:
+            last_page = min(last_page, page_count)
+        has_more = page_count is not None and last_page < page_count
+        next_pages = None
+        if has_more:
+            next_first = last_page + 1
+            next_pages = f"{next_first}-{min(page_count, next_first + PDF_MAX_PAGES_PER_READ - 1)}"
+        page_metadata = {
+            "pages": pages or f"{first_page}-{last_page}",
+            "pageCount": page_count,
+            "firstPage": first_page,
+            "lastPage": last_page,
+            "coverageComplete": (
+                page_count is not None and first_page == 1 and last_page >= page_count
+            ),
+            "hasMore": has_more,
+            "nextPages": next_pages,
+            "textTruncated": False,
+        }
         if vision:
             images = []
             for p in page_paths:
                 with open(p, "rb") as fh:
                     images.append({"data": _b64.b64encode(fh.read()).decode("ascii"), "media_type": "image/jpeg"})
-            return {"type": "pdf_images", "file": {"filePath": resolved_file_path, "count": out["count"], "images": images}}
+            return {
+                "type": "pdf_images",
+                "file": {
+                    "filePath": resolved_file_path,
+                    "count": out["count"],
+                    "images": images,
+                    **page_metadata,
+                },
+            }
         from tabvis.utils import ocr
 
         if ocr.ocr_enabled() and ocr.ocr_available():
@@ -353,7 +453,15 @@ async def _read_pdf_data(resolved_file_path: str, pages: str | None) -> dict[str
                 with open(p, "rb") as fh:
                     txt = await asyncio.to_thread(ocr.ocr_image_bytes, fh.read(), "image/jpeg")
                 chunks.append(f"--- page {i} ---\n{(txt or '').strip()}")
-            return {"type": "pdf_ocr", "file": {"filePath": resolved_file_path, "count": out["count"], "text": "\n\n".join(chunks)}}
+            return {
+                "type": "pdf_ocr",
+                "file": {
+                    "filePath": resolved_file_path,
+                    "count": out["count"],
+                    "text": "\n\n".join(chunks),
+                    **page_metadata,
+                },
+            }
         return {
             "type": "pdf_unavailable",
             "file": {
@@ -511,7 +619,9 @@ class FileReadInput(BaseModel):
         default=None,
         description=(
             f'Page range for PDF files (e.g., "1-5", "3", "10-20"). Only applicable to PDF '
-            f"files. Maximum {PDF_MAX_PAGES_PER_READ} pages per request."
+            f"files. Maximum {PDF_MAX_PAGES_PER_READ} pages per request. For paper research, "
+            "continue through non-overlapping ranges and use the returned nextPages/coverage status; "
+            "an abstract page is not a substitute for PDF full text."
         ),
     )
 
@@ -533,7 +643,11 @@ def render_prompt_template(
     pdf_line = (
         "\n- This tool can read PDF files (.pdf). For large PDFs (more than 10 pages), you "
         "MUST provide the pages parameter to read specific page ranges (e.g., pages: \"1-5\"). "
-        "Reading a large PDF without the pages parameter will fail. Maximum 20 pages per request."
+        "Reading a large PDF without the pages parameter will fail. Maximum 20 pages per request. "
+        "PDF text includes explicit page markers, coverage status, and nextPages. In research, an "
+        "abstract/landing page is discovery only: read the PDF ranges covering methods, data, "
+        "results, limitations, and relevant appendices before calling the paper fully read. Continue "
+        "until coverage is sufficient for the user's claims, and cite the page ranges actually read."
         if is_pdf_supported()
         else ""
     )
@@ -577,6 +691,10 @@ class FileReadTool(Tool):
     max_result_size_chars = float("inf")
     strict = True
     input_schema = FileReadInput
+    # The model must see file bytes verbatim to reason about them and to build exact-match Edit
+    # old_strings; DLP identifier/URL masking would corrupt that view. The fail-closed secret/canary
+    # block still applies — only the mutating rewrite is skipped for this result.
+    dlp_verbatim_result = True
 
     # --- discovery / classification ---
     def is_concurrency_safe(self, input: Any) -> bool:  # noqa: ARG002
@@ -750,6 +868,18 @@ class FileReadTool(Tool):
         dot = file_path.rfind(".")
         ext = file_path[dot + 1 :].lower() if dot != -1 else ""
         full_file_path = expand_path(file_path)
+        if not is_pdf_extension(ext):
+            def _has_pdf_magic() -> bool:
+                with open(full_file_path, "rb") as fh:
+                    return fh.read(5).startswith(b"%PDF-")
+
+            try:
+                if await asyncio.to_thread(_has_pdf_magic):
+                    # Dynamic endpoints used to be saved as ``get_pdf.cfm``. Content sniffing keeps
+                    # those existing workspace files on the native PDF path too.
+                    ext = "pdf"
+            except OSError:
+                pass  # the normal read path below produces the established missing-file error
 
         # Dedup: same exact range, file unchanged on disk → return a stub.
         existing_state = _state_get(read_file_state, full_file_path)
@@ -915,7 +1045,13 @@ class FileReadTool(Tool):
         if data_type == "pdf_images":
             file = data["file"]
             blocks: list[dict[str, Any]] = [
-                {"type": "text", "text": f"[PDF {file['filePath']} — {file['count']} page(s) rendered to images]"}
+                {
+                    "type": "text",
+                    "text": (
+                        f"[PDF {file['filePath']} — pages {file.get('pages') or 'unknown'} "
+                        f"of {file.get('pageCount') or 'unknown'} rendered to images]"
+                    ),
+                }
             ]
             for img in file["images"]:
                 blocks.append(
@@ -923,15 +1059,53 @@ class FileReadTool(Tool):
                 )
             return {"tool_use_id": tool_use_id, "type": "tool_result", "content": blocks}
 
+        if data_type == "pdf_text":
+            file = data["file"]
+            page_label = f" pages {file['pages']}" if file.get("pages") else ""
+            if file.get("coverageComplete"):
+                coverage = "Full PDF text coverage is complete for this document."
+            elif file.get("hasMore") and file.get("nextPages"):
+                coverage = (
+                    "This is partial PDF coverage. For research, continue with "
+                    f'Read(file_path="{file["filePath"]}", pages="{file["nextPages"]}") and do not '
+                    "claim the full paper was read yet."
+                )
+            else:
+                coverage = (
+                    "This page range alone does not prove full-document coverage. Confirm the other "
+                    "substantive PDF sections before claiming the paper was fully read."
+                )
+            if file.get("textTruncated"):
+                coverage += " The extracted text was truncated; retry this range in smaller chunks."
+            return {
+                "tool_use_id": tool_use_id,
+                "type": "tool_result",
+                "content": (
+                    f"[PDF full-text extraction from {file['filePath']}{page_label}; "
+                    f"pageCount={file.get('pageCount') or 'unknown'}]\n\n"
+                    f"{(file.get('text') or '').strip()}\n\n"
+                    f"<system-reminder>{coverage} Cite only PDF pages actually read. "
+                    "The abstract/landing page is not a substitute for methods, results, or "
+                    "limitations.</system-reminder>"
+                ),
+            }
+
         if data_type == "pdf_ocr":
             file = data["file"]
             body = (file.get("text") or "").strip()
             content_str = (
-                f"[PDF {file['filePath']} — {file['count']} page(s), OCR'd because the active model "
-                f"has no vision]\n\n{body}"
+                f"[PDF {file['filePath']} — pages {file.get('pages') or 'unknown'} of "
+                f"{file.get('pageCount') or 'unknown'}, OCR'd because the active model has no "
+                f"vision]\n\n{body}"
                 if body
                 else f"[PDF {file['filePath']} — OCR found no machine-readable text.]"
             )
+            if file.get("hasMore") and file.get("nextPages"):
+                content_str += (
+                    "\n\n<system-reminder>This is partial PDF coverage. Continue with "
+                    f'Read(file_path="{file["filePath"]}", pages="{file["nextPages"]}"). '
+                    "Do not claim the full paper was read yet.</system-reminder>"
+                )
             return {"tool_use_id": tool_use_id, "type": "tool_result", "content": content_str}
 
         if data_type == "pdf_unavailable":
@@ -939,11 +1113,7 @@ class FileReadTool(Tool):
             return {
                 "tool_use_id": tool_use_id,
                 "type": "tool_result",
-                "content": (
-                    f"Cannot read PDF {file['filePath']}: {file.get('reason', '')}. Use an Anthropic "
-                    f"vision model, or install poppler (`brew install poppler` / `apt install "
-                    f"poppler-utils`) to render pages for image/OCR reading."
-                ),
+                "content": f"Cannot read PDF {file['filePath']}: {file.get('reason', '')}.",
             }
 
         if data_type == "pdf":
@@ -981,10 +1151,24 @@ class FileReadTool(Tool):
                     _format_file_lines(file)
                     + (CYBER_RISK_MITIGATION_REMINDER if should_include_file_read_mitigation() else "")
                 )
+                if file.get("hasMore"):
+                    content_str += (
+                        "\n\n<system-reminder>"
+                        f"Showing lines {file['startLine']}-{file['endLine']} of "
+                        f"{file['totalLines']}. Continue with Read offset="
+                        f"{file['nextOffset']} limit={file['windowSize']}."
+                        "</system-reminder>"
+                    )
             elif file["totalLines"] == 0:
                 content_str = (
                     "<system-reminder>Warning: the file exists but the contents are empty."
                     "</system-reminder>"
+                )
+            elif file.get("truncatedByBytes"):
+                content_str = (
+                    "<system-reminder>The selected line is larger than the bounded Read output "
+                    "window, so no complete line could be returned. Use Grep to locate a smaller "
+                    "target or Bash to inspect a bounded byte range.</system-reminder>"
                 )
             else:
                 content_str = (
@@ -1030,16 +1214,46 @@ async def _call_inner(
 
     # --- PDF ---
     if is_pdf_extension(ext):
-        return ToolResult(data=await _read_pdf_data(resolved_file_path, pages))
+        data = await _read_pdf_data(resolved_file_path, pages)
+        if data.get("type") in {"pdf_text", "pdf_ocr"}:
+            file = data.get("file") or {}
+            _update_pdf_coverage(read_file_state, full_file_path, file)
+            try:
+                from tabvis.browser.artifacts import record_pdf_research_artifact
+
+                await record_pdf_research_artifact(
+                    {
+                        "file_path": file.get("filePath"),
+                        "pages": file.get("pages"),
+                        "page_count": file.get("pageCount"),
+                        "first_page": file.get("firstPage"),
+                        "last_page": file.get("lastPage"),
+                        "coverage_complete": file.get("coverageComplete"),
+                        "cumulative_page_ranges": file.get("cumulativePageRanges"),
+                        "cumulative_text_truncated": file.get("cumulativeTextTruncated"),
+                        "next_pages": file.get("nextPages"),
+                        "text_truncated": file.get("textTruncated"),
+                        "text": file.get("text"),
+                    },
+                    session_id=context.session_id,
+                )
+            except Exception:
+                pass  # evidence persistence is best-effort and must never break PDF reading
+        return ToolResult(data=data)
 
     # --- Text file (single async read via read_file_in_range) ---
     line_offset = 0 if offset == 0 else offset - 1
+    # Progressive disclosure is the default: an omitted limit means the documented 2,000-line
+    # window, not an attempt to inject the whole file. Explicit windows behave the same way.
+    effective_limit = limit if limit is not None else MAX_LINES_TO_READ
+    output_byte_limit = min(max_size_bytes, max_tokens * 4)
     result = await read_file_in_range(
         resolved_file_path,
         line_offset,
-        limit,
-        max_size_bytes if limit is None else None,
+        effective_limit,
+        output_byte_limit,
         context.abort_controller.signal,
+        truncate_on_byte_limit=True,
     )
     content = result["content"]
     line_count = result["lineCount"]
@@ -1059,14 +1273,22 @@ async def _call_inner(
         },
     )
 
+    start_line = line_offset + 1
+    end_line = start_line + line_count - 1 if line_count else start_line - 1
+    has_more = end_line < total_lines
     data = {
         "type": "text",
         "file": {
             "filePath": file_path,
             "content": content,
             "numLines": line_count,
-            "startLine": offset,
+            "startLine": start_line,
+            "endLine": end_line,
             "totalLines": total_lines,
+            "hasMore": has_more,
+            "nextOffset": end_line + 1 if has_more else None,
+            "windowSize": effective_limit,
+            "truncatedByBytes": bool(result.get("truncatedByBytes")),
         },
     }
 
@@ -1092,6 +1314,89 @@ async def _validate_content_tokens(content: str, ext: str, max_tokens: int) -> N
 # ---------------------------------------------------------------------------
 # read_file_state accessors (works with FileStateCache or a plain dict)
 # ---------------------------------------------------------------------------
+
+
+def _merge_pdf_page_ranges(ranges: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    merged: list[tuple[int, int]] = []
+    for first, last in sorted(ranges):
+        if not merged or first > merged[-1][1] + 1:
+            merged.append((first, last))
+        else:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], last))
+    return merged
+
+
+def _update_pdf_coverage(state: Any, key: str, file: dict[str, Any]) -> None:
+    """Merge page ranges across Read calls and expose deterministic full-document coverage."""
+    first = file.get("firstPage")
+    last = file.get("lastPage")
+    if not isinstance(first, int) or not isinstance(last, int):
+        return
+    existing = _state_get(state, key) or {}
+    ranges: list[tuple[int, int]] = []
+    for item in existing.get("pdfPageRanges") or []:
+        if (
+            isinstance(item, (list, tuple))
+            and len(item) == 2
+            and isinstance(item[0], int)
+            and isinstance(item[1], int)
+        ):
+            ranges.append((item[0], item[1]))
+    ranges = _merge_pdf_page_ranges([*ranges, (first, last)])
+
+    truncated_ranges: list[tuple[int, int]] = []
+    for item in existing.get("pdfTruncatedRanges") or []:
+        if (
+            isinstance(item, (list, tuple))
+            and len(item) == 2
+            and isinstance(item[0], int)
+            and isinstance(item[1], int)
+        ):
+            truncated_ranges.append((item[0], item[1]))
+    if file.get("textTruncated"):
+        truncated_ranges = _merge_pdf_page_ranges([*truncated_ranges, (first, last)])
+    else:
+        truncated_ranges = [
+            (start, end)
+            for start, end in truncated_ranges
+            if not (first <= start and end <= last)
+        ]
+
+    page_count = file.get("pageCount")
+    next_pages = None
+    if isinstance(page_count, int) and page_count > 0:
+        next_first = 1
+        for start, end in ranges:
+            if start > next_first:
+                break
+            next_first = max(next_first, end + 1)
+        if next_first <= page_count:
+            next_pages = (
+                f"{next_first}-{min(page_count, next_first + PDF_MAX_PAGES_PER_READ - 1)}"
+            )
+    complete = (
+        isinstance(page_count, int)
+        and page_count > 0
+        and len(ranges) == 1
+        and ranges[0][0] == 1
+        and ranges[0][1] >= page_count
+        and not truncated_ranges
+    )
+    file["rangeCoverageComplete"] = bool(file.get("coverageComplete"))
+    file["coverageComplete"] = complete
+    file["cumulativePageRanges"] = [f"{start}-{end}" for start, end in ranges]
+    file["cumulativeTextTruncated"] = bool(truncated_ranges)
+    file["nextPages"] = next_pages
+    file["hasMore"] = next_pages is not None
+    _state_set(
+        state,
+        key,
+        {
+            **existing,
+            "pdfPageRanges": [list(item) for item in ranges],
+            "pdfTruncatedRanges": [list(item) for item in truncated_ranges],
+        },
+    )
 
 
 def _state_get(state: Any, key: str) -> dict[str, Any] | None:

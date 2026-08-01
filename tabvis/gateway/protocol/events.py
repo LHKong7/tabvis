@@ -48,6 +48,7 @@ class EventType:
     RUN_CREATED = "run.created"
     RUN_QUEUED = "run.queued"
     RUN_STARTED = "run.started"
+    RUN_RESUMED = "run.resumed"
     RUN_WAITING = "run.waiting"
     RUN_RETRYING = "run.retrying"
     RUN_COMPLETED = "run.completed"

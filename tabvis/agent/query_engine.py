@@ -4,8 +4,10 @@ Wraps the agent loop (:func:`tabvis.agent.query.query`) and converts its yielded
 SDKMessage stream: ``system/init`` → ``assistant``/``user`` (via ``normalize_message``) →
 ``result``. Usage is accumulated from ``stream_event`` parts (message_start/delta/stop).
 
-Session persistence: the completed turn is recorded to the on-disk ``<sessionId>.jsonl`` via
-:func:`_persist_session_transcript` (``record_transcript``) at the Terminal boundary.
+Session persistence: the completed or interrupted turn is recorded to the on-disk
+``<sessionId>.jsonl`` via :func:`_persist_session_transcript` (``record_transcript``). Persisting
+from ``finally`` is important for Web runs: cancellation must not discard the research/tool
+evidence accumulated before the user stopped a stalled run.
 
 Not supported: multi-turn session state (each call runs a single turn), incremental per-message
 recording, attachments, stop hooks, structured-output, partial-message replay, cost/modelUsage.
@@ -19,6 +21,7 @@ from collections.abc import AsyncGenerator
 from typing import Any
 
 from tabvis.constants.messages import NO_CONTENT_MESSAGE
+from tabvis.agent.api.errors import classify_api_error
 from tabvis.agent.query import QueryParams, Terminal, query
 from tabvis.agent.query.deps import QueryDeps, production_deps
 from tabvis.agent.api.empty_usage import empty_usage
@@ -141,45 +144,76 @@ async def ask(
     last_stop_reason: str | None = None
     turn_count = 0
 
-    async for item in query(params):
-        if isinstance(item, Terminal):
-            await _persist_session_transcript(mutable)
-            yield _build_result(item, mutable, turn_count, last_stop_reason, total_usage, session_id, start)
-            return
+    persisted = False
+    try:
+        async for item in query(params):
+            if isinstance(item, Terminal):
+                await _persist_session_transcript(mutable)
+                persisted = True
+                yield _build_result(
+                    item,
+                    mutable,
+                    turn_count,
+                    last_stop_reason,
+                    total_usage,
+                    session_id,
+                    start,
+                )
+                return
 
-        t = item.get("type") if isinstance(item, dict) else None
-        if t == "assistant":
-            if item["message"].get("stop_reason") is not None:
-                last_stop_reason = item["message"]["stop_reason"]
-            mutable.append(item)
-            for sdk in normalize_message(item):
-                yield sdk
-        elif t == "user":
-            mutable.append(item)
-            for sdk in normalize_message(item):
-                yield sdk
-        elif t == "stream_event":
-            ev = item["event"]
-            etype = _ev(ev, "type")
-            if etype == "message_start":
-                turn_count += 1
-                current_usage = update_usage(empty_usage(), _as_dict(_ev_path(ev, "message", "usage")))
-            elif etype == "message_delta":
-                current_usage = update_usage(current_usage, _as_dict(_ev(ev, "usage")))
-                stop_reason = _ev_path(ev, "delta", "stop_reason")
-                if stop_reason is not None:
-                    last_stop_reason = stop_reason
-            elif etype == "message_stop":
-                total_usage = accumulate_usage(total_usage, current_usage)
-            if include_partial_messages:
-                yield {
-                    "type": "stream_event",
-                    "event": ev,
-                    "session_id": session_id,
-                    "parent_tool_use_id": None,
-                    "uuid": str(uuid.uuid4()),
-                }
-        # system sentinel: dropped at the SDK boundary.
+            t = item.get("type") if isinstance(item, dict) else None
+            if t == "assistant":
+                if item["message"].get("stop_reason") is not None:
+                    last_stop_reason = item["message"]["stop_reason"]
+                mutable.append(item)
+                for sdk in normalize_message(item):
+                    yield sdk
+            elif t == "user":
+                mutable.append(item)
+                for sdk in normalize_message(item):
+                    yield sdk
+            elif t == "stream_event":
+                ev = item["event"]
+                etype = _ev(ev, "type")
+                if etype == "message_start":
+                    turn_count += 1
+                    current_usage = update_usage(
+                        empty_usage(), _as_dict(_ev_path(ev, "message", "usage"))
+                    )
+                elif etype == "message_delta":
+                    current_usage = update_usage(current_usage, _as_dict(_ev(ev, "usage")))
+                    stop_reason = _ev_path(ev, "delta", "stop_reason")
+                    if stop_reason is not None:
+                        last_stop_reason = stop_reason
+                elif etype == "message_stop":
+                    total_usage = accumulate_usage(total_usage, current_usage)
+                if include_partial_messages:
+                    yield {
+                        "type": "stream_event",
+                        "event": ev,
+                        "session_id": session_id,
+                        "parent_tool_use_id": None,
+                        "uuid": str(uuid.uuid4()),
+                    }
+            elif t == "system" and item.get("subtype") == "api_error":
+                # Retry sentinels normally remain internal. A model-stream timeout is different:
+                # the Web run would otherwise appear silently frozen during its bounded retry.
+                error = item.get("error")
+                if classify_api_error(error) == "model_stream_timeout":
+                    yield {
+                        "type": "model_retry",
+                        "reason": "model_stream_timeout",
+                        "message": str(error),
+                        "retry_in_ms": int(item.get("retryInMs") or 0),
+                        "retry_attempt": int(item.get("retryAttempt") or 0),
+                        "max_retries": int(item.get("maxRetries") or 0),
+                        "session_id": session_id,
+                        "uuid": str(uuid.uuid4()),
+                    }
+            # Other system sentinels stay internal.
+    finally:
+        if not persisted:
+            await _persist_session_transcript(mutable)
 
 
 async def _persist_session_transcript(messages: list[dict[str, Any]]) -> None:
@@ -285,6 +319,11 @@ def _build_result(
         "subtype": "success",
         "is_error": is_api_error,
         "result": text_result,
+        "error_code": (
+            result_msg.get("error")
+            if is_api_error and isinstance(result_msg, dict)
+            else None
+        ),
         "structured_output": None,
         **base,
     }

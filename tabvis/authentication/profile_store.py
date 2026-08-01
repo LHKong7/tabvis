@@ -50,6 +50,10 @@ def put(profile: CredentialProfile) -> None:
         with open(tmp, "w", encoding="utf-8") as fh:
             json.dump(profile.model_dump(mode="json"), fh, indent=2)
         os.replace(tmp, path)
+    if not profile.enabled:
+        from tabvis.authentication.runtime import revoke_profile_sessions
+
+        revoke_profile_sessions(profile.id)
 
 
 def get(profile_id: str) -> CredentialProfile | None:
@@ -85,6 +89,10 @@ def delete(profile_id: str) -> bool:
     with _lock:
         try:
             os.remove(_path(profile_id))
-            return True
+            deleted = True
         except OSError:
             return False
+    from tabvis.authentication.runtime import revoke_profile_sessions
+
+    revoke_profile_sessions(profile_id)
+    return deleted

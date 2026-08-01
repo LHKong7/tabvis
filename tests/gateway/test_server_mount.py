@@ -13,6 +13,7 @@ import pytest
 from starlette.testclient import TestClient
 
 from tabvis.browser.server import create_app
+from tabvis.gateway.runtime import runs
 
 
 @pytest.fixture()
@@ -38,6 +39,34 @@ def test_legacy_health_is_untouched(client: TestClient) -> None:
 
 def test_legacy_agents_endpoint_still_works(client: TestClient) -> None:
     assert client.get("/v1/agents").status_code == 200
+
+
+def test_legacy_agent_events_replay_is_mounted(client: TestClient) -> None:
+    store = client.app.state.gateway.runs
+    run = store.create_run(agent_id="ag_history", session_id="ses_history", command_id="cmd_history")
+    store.transition(run.run_id, runs.PREPARING)
+    store.transition(run.run_id, runs.RUNNING)
+    client.app.state.gateway.events.append(
+        "run",
+        run.run_id,
+        "assistant.message.completed",
+        data={"turn": 1, "text_preview": "durable history"},
+    )
+    store.transition(
+        run.run_id,
+        runs.COMPLETED,
+        data={"result_preview": "finished"},
+        turns=1,
+    )
+
+    response = client.get("/agents/ag_history/events")
+
+    assert response.status_code == 200
+    assert "text/event-stream" in response.headers["content-type"]
+    assert "event: assistant" in response.text
+    assert "durable history" in response.text
+    assert "event: result" in response.text
+    assert "event: done" in response.text
 
 
 def test_gateway_run_routes_answer_through_the_mounted_app(client: TestClient) -> None:

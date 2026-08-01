@@ -115,7 +115,10 @@ class AgentStore:
             return [envelope]
 
         record = AgentRecord.from_dict(existing)
-        record.updated_at = now
+        before = (
+            record.default_model, record.default_max_turns, record.profile,
+            record.cwd, record.principal_id,
+        )
         if model:
             record.default_model = model
         if max_turns is not None:
@@ -126,6 +129,15 @@ class AgentStore:
             record.cwd = cwd
         if principal_id and not record.principal_id:
             record.principal_id = principal_id
+        after = (
+            record.default_model, record.default_max_turns, record.profile,
+            record.cwd, record.principal_id,
+        )
+        if before == after:
+            # A refresh that changes nothing durable (the common case: same agent, same config, next
+            # run) must not churn the row or fan out an agent.updated event.
+            return []
+        record.updated_at = now
         db.upsert_agent_in(conn, record.to_dict())
         envelope = self._events.append(
             AGGREGATE_AGENT, agent_id, EventType.AGENT_UPDATED, scope=agg_scope,

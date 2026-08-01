@@ -30,7 +30,7 @@ export function Setup({ config, open }: { config?: HealthConfig; open: boolean }
             <p>
               Serves this console at <code>/</code> and the JSON/SSE API alongside it.
             </p>
-            <Code>uv run tabvis --serve</Code>
+            <Code>{`uv run tabvis                 # Web console + API\nuv run tabvis --serve         # explicit equivalent`}</Code>
             <Code>uv run tabvis --serve --host 0.0.0.0 --port 9000</Code>
             <p className="hint" style={{ marginTop: '7px' }}>
               🔒 No authentication — anyone who can reach the port can run an agent with full shell, file and

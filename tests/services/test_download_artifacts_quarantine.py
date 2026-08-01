@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -52,7 +53,7 @@ def test_download_artifact_records_reference_hash_not_content(tmp_path: Any) -> 
     assert ev["sha256"] and len(ev["sha256"]) == 64
     assert ev["policy_effect"] == "allow" and ev["policy_rule_id"] == "grant-1"
     # The file's bytes must never be embedded in the event log.
-    assert "hello" not in open(A.events_path(), encoding="utf-8").read()
+    assert "hello" not in Path(A.events_path()).read_text(encoding="utf-8")
 
 
 def test_download_artifact_marks_quarantine(tmp_path: Any) -> None:

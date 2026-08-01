@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import os
 import re
-from urllib.parse import unquote, urlparse
+from urllib.parse import unquote, unquote_to_bytes, urlparse
 
 _UNSAFE = re.compile(r"[^A-Za-z0-9._ ()\-]+")
 
@@ -69,6 +69,53 @@ def filename_from_url(url: str | None, default: str = "download") -> str:
     except (ValueError, TypeError):
         name = ""
     return _safe_name(name or default, default)
+
+
+def filename_from_response(
+    url: str | None,
+    headers: dict[str, str] | None,
+    default: str = "download",
+) -> str:
+    """Derive a safe filename from response metadata, falling back to the URL.
+
+    ``Content-Disposition`` wins because dynamic download endpoints often end in ``.cfm``/``.php``
+    while serving a named PDF. If the response says it is a PDF and neither source supplies a PDF
+    suffix, append ``.pdf`` so the Read tool takes its native PDF path instead of treating the bytes
+    as an oversized text file.
+    """
+    normalized = {str(k).lower(): str(v) for k, v in (headers or {}).items()}
+    disposition = normalized.get("content-disposition", "")
+    name = _filename_from_disposition(disposition)
+    filename = _safe_name(name, default) if name else filename_from_url(url, default)
+    if "application/pdf" in normalized.get("content-type", "").lower():
+        filename = ensure_pdf_filename(filename)
+    return filename
+
+
+def ensure_pdf_filename(filename: str | None, default: str = "page.pdf") -> str:
+    """Return a safe filename whose final suffix is ``.pdf``."""
+    safe = _safe_name(filename, default)
+    return safe if safe.lower().endswith(".pdf") else f"{safe}.pdf"
+
+
+def _filename_from_disposition(value: str) -> str | None:
+    """Small RFC 5987/Content-Disposition filename parser (basename sanitizing happens later)."""
+    if not value:
+        return None
+    extended = re.search(r"(?:^|;)\s*filename\*\s*=\s*([^;]+)", value, re.IGNORECASE)
+    if extended:
+        raw = extended.group(1).strip().strip('"')
+        if "''" in raw:
+            charset, encoded = raw.split("''", 1)
+            try:
+                return unquote_to_bytes(encoded).decode(charset or "utf-8", errors="replace")
+            except (LookupError, UnicodeDecodeError):
+                return unquote(encoded)
+        return unquote(raw)
+    plain = re.search(r'(?:^|;)\s*filename\s*=\s*(?:"([^"]*)"|([^;]+))', value, re.IGNORECASE)
+    if plain:
+        return (plain.group(1) or plain.group(2) or "").strip()
+    return None
 
 
 def unique_path(dir_path: str, filename: str | None) -> str:

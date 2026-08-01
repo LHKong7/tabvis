@@ -56,6 +56,7 @@ import time
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
+from tabvis.agent.run_context import get_run_context
 from tabvis.bootstrap.state import (
     get_original_cwd,
     get_plan_slug_cache,
@@ -275,6 +276,10 @@ def get_project_dir(project_dir: str) -> str:
 
 def get_transcript_path() -> str:
     """The current session's JSONL path."""
+    run_context = get_run_context()
+    if run_context is not None:
+        project_dir = run_context.project_dir or get_project_dir(run_context.cwd)
+        return os.path.join(project_dir, f"{run_context.session_id}.jsonl")
     project_dir = get_session_project_dir() or get_project_dir(get_original_cwd())
     return os.path.join(project_dir, f"{get_session_id()}.jsonl")
 
@@ -285,6 +290,10 @@ def get_transcript_path_for_session(session_id: str) -> str:
     For the CURRENT session, honor ``getSessionProjectDir`` like :func:`get_transcript_path`. For
     other sessions we can only guess via ``originalCwd``.
     """
+    run_context = get_run_context()
+    if run_context is not None and session_id == run_context.session_id:
+        project_dir = run_context.project_dir or get_project_dir(run_context.cwd)
+        return os.path.join(project_dir, f"{session_id}.jsonl")
     if session_id == get_session_id():
         return get_transcript_path()
     project_dir = get_project_dir(get_original_cwd())
@@ -307,8 +316,13 @@ def clear_agent_transcript_subdir(agent_id: str) -> None:
 
 def get_agent_transcript_path(agent_id: str) -> str:
     """A subagent transcript path under the session dir."""
-    project_dir = get_session_project_dir() or get_project_dir(get_original_cwd())
-    session_id = get_session_id()
+    run_context = get_run_context()
+    if run_context is not None:
+        project_dir = run_context.project_dir or get_project_dir(run_context.cwd)
+        session_id = run_context.session_id
+    else:
+        project_dir = get_session_project_dir() or get_project_dir(get_original_cwd())
+        session_id = get_session_id()
     subdir = _agent_transcript_subdirs.get(agent_id)
     if subdir:
         base = os.path.join(project_dir, session_id, "subagents", subdir)
@@ -894,7 +908,20 @@ class Project:
     ) -> None:
         parent_uuid: str | None = starting_parent_uuid
 
-        if self.session_file is None and any(
+        run_context = get_run_context()
+        session_id = (
+            run_context.session_id if run_context is not None else str(get_session_id())
+        )
+        # Gateway runs share one process, so Project.session_file cannot safely identify a Run.
+        # Route task-local runs directly to their immutable SessionLocator. The legacy singleton
+        # path remains for CLI/storage callers that do not have a RunContext.
+        run_session_file = (
+            get_transcript_path_for_session(session_id)
+            if run_context is not None
+            else None
+        )
+
+        if run_session_file is None and self.session_file is None and any(
             m.get("type") in ("user", "assistant") for m in messages
         ):
             await self._materialize_session_file()
@@ -904,7 +931,6 @@ class Project:
         except Exception:  # noqa: BLE001
             git_branch = None
 
-        session_id = get_session_id()
         slug = get_plan_slug_cache().get(session_id)
 
         for message in messages:
@@ -936,7 +962,11 @@ class Project:
                 "gitBranch": git_branch,
                 "slug": slug,
             }
-            await self.append_entry(transcript_message)
+            await self.append_entry(
+                transcript_message,
+                session_id=session_id,
+                session_file=run_session_file,
+            )
             if is_chain_participant(message):
                 parent_uuid = message.get("uuid")
 
@@ -990,7 +1020,10 @@ class Project:
         return await self._track_write(_do())
 
     async def append_entry(
-        self, entry: dict[str, Any], session_id: str | None = None
+        self,
+        entry: dict[str, Any],
+        session_id: str | None = None,
+        session_file: str | None = None,
     ) -> None:
         """Append an entry to the right session file (current or other).
 
@@ -1000,26 +1033,41 @@ class Project:
         if self._should_skip_persistence():
             return
 
+        run_context = get_run_context()
         if session_id is None:
-            session_id = get_session_id()
-        current_session_id = get_session_id()
-        is_current_session = session_id == current_session_id
+            session_id = (
+                run_context.session_id
+                if run_context is not None
+                else str(get_session_id())
+            )
+        if (
+            session_file is None
+            and run_context is not None
+            and session_id == run_context.session_id
+        ):
+            session_file = get_transcript_path_for_session(session_id)
 
-        if is_current_session:
-            if self.session_file is None:
-                self._pending_entries.append(entry)
-                return
-            session_file = self.session_file
-        else:
-            existing = await self._get_existing_session_file(session_id)
-            if not existing:
-                log_error(
-                    Exception(
-                        f"appendEntry: session file not found for other session {session_id}"
+        if session_file is None:
+            current_session_id = get_session_id()
+            is_current_session = session_id == current_session_id
+
+            if is_current_session:
+                if self.session_file is None:
+                    self._pending_entries.append(entry)
+                    return
+                session_file = self.session_file
+            else:
+                existing = await self._get_existing_session_file(session_id)
+                if not existing:
+                    log_error(
+                        Exception(
+                            f"appendEntry: session file not found for other session {session_id}"
+                        )
                     )
-                )
-                return
-            session_file = existing
+                    return
+                session_file = existing
+        # A task-local RunContext is authoritative. _enqueue_write is already keyed by path, so
+        # writes from concurrent Runs remain independently batched.
 
         entry_type = entry.get("type")
         always_append = {
@@ -1317,7 +1365,17 @@ async def record_transcript(
     Returns the last actually-recorded chain participant's UUID, or the prefix-tracked UUID.
     """
     cleaned_messages = clean_messages_for_logging(messages, all_messages)
-    session_id = get_session_id()
+    from tabvis.dlp.gateway import get_dlp_gateway
+
+    dlp = get_dlp_gateway().scrub("transcript", cleaned_messages)
+    if dlp.blocked or not isinstance(dlp.payload, list):
+        log_for_debugging("[DLP] blocked transcript persistence")
+        return starting_parent_uuid_hint
+    cleaned_messages = dlp.payload
+    run_context = get_run_context()
+    session_id = (
+        run_context.session_id if run_context is not None else str(get_session_id())
+    )
     message_set = await get_session_messages(session_id)
     new_messages: list[dict[str, Any]] = []
     starting_parent_uuid = starting_parent_uuid_hint
@@ -1345,8 +1403,15 @@ async def record_sidechain_transcript(
     starting_parent_uuid: str | None = None,
 ) -> None:
     """Record the sidechain transcript."""
+    from tabvis.dlp.gateway import get_dlp_gateway
+
+    cleaned = clean_messages_for_logging(messages)
+    dlp = get_dlp_gateway().scrub("transcript", cleaned)
+    if dlp.blocked or not isinstance(dlp.payload, list):
+        log_for_debugging("[DLP] blocked sidechain transcript persistence")
+        return
     await get_project().insert_message_chain(
-        clean_messages_for_logging(messages), True, agent_id, starting_parent_uuid
+        dlp.payload, True, agent_id, starting_parent_uuid
     )
 
 
@@ -1846,6 +1911,11 @@ def check_resume_consistency(chain: list[dict[str, Any]]) -> None:
         if expected is None:
             return
         actual = i
+        if actual != expected:
+            log_for_debugging(
+                f"Resume consistency drift: expected {expected} messages before turn-duration "
+                f"record, found {actual}"
+            )
         return
 
 
@@ -2673,10 +2743,7 @@ def _compute_leaf_uuids(
 
 async def _load_session_file(session_id: str) -> dict[str, Any]:
     """Load the session file."""
-    session_file = os.path.join(
-        get_session_project_dir() or get_project_dir(get_original_cwd()),
-        f"{session_id}.jsonl",
-    )
+    session_file = get_transcript_path_for_session(session_id)
     return await load_transcript_file(session_file)
 
 
